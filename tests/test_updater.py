@@ -3,6 +3,7 @@
 import hashlib
 import json
 import multiprocessing
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -405,6 +406,21 @@ def test_authoritative_cache_reconstructs_missing_payload_and_discards_bad_pendi
     assert not (paths.hotwords_file.parent / "pending.json").exists()
 
 
+def test_pointerless_corrupt_cache_falls_back_to_builtin_lexicon(tmp_path):
+    paths = paths_for(tmp_path)
+    paths.hotwords_file.parent.mkdir(parents=True)
+    paths.hotwords_file.write_text("not-jsonl\n", encoding="utf-8")
+    builtins = tmp_path / "builtins"
+    (builtins / "base-zh.jsonl").parent.mkdir(parents=True)
+    (builtins / "base-zh.jsonl").write_bytes(
+        hotword_data(scope="base", canonical="Builtin")
+    )
+
+    loaded = LexiconSet.load(paths, builtins)
+
+    assert [entry.canonical for entry in loaded.entries] == ["Builtin"]
+
+
 def test_rejects_version_rollback_and_preserves_current_file(tmp_path):
     paths = paths_for(tmp_path)
     paths.hotwords_file.parent.mkdir(parents=True)
@@ -452,18 +468,105 @@ def test_rejects_non_integer_manifest_schema_before_data_download(
     assert transport.calls == [MANIFEST_URL]
 
 
-def test_corrupt_state_is_preserved_and_blocks_an_untrusted_rollback(tmp_path):
+def test_corrupt_receipt_is_rebuilt_and_does_not_block_remote_recovery(tmp_path):
     paths = paths_for(tmp_path)
     paths.hotwords_file.parent.mkdir(parents=True)
     state_file = paths.hotwords_file.parent / "last-update.json"
     state_file.write_text("not-json", encoding="utf-8")
-    transport = FakeTransport({})
+    transport = FakeTransport({MANIFEST_URL: OSError("offline")})
 
     result = update_hotwords(paths, MANIFEST_URL, transport, NOW)
 
     assert result.status is UpdateStatus.REJECTED
-    assert state_file.read_text(encoding="utf-8") == "not-json"
-    assert transport.calls == []
+    assert transport.calls == [MANIFEST_URL]
+    assert json.loads(state_file.read_text(encoding="utf-8")) == {
+        "last_check": "2026-07-29T12:00:00+00:00",
+        "schema_version": 1,
+        "version": None,
+    }
+
+
+def test_corrupt_receipt_cannot_block_an_authoritative_current_pointer(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Authoritative")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.write_text("not-json", encoding="utf-8")
+
+    resolved = updater_module.resolve_hotword_file(paths)
+
+    assert resolved == paths.hotwords_file
+    assert resolved.read_bytes() == data
+    assert json.loads(receipt.read_text(encoding="utf-8"))["version"] == "2026.07.29"
+
+
+def test_same_version_late_worker_cannot_regress_receipt_or_current_timestamp(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data()
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    later = NOW + timedelta(days=1)
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": "2026.07.29",
+                "last_check": later.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW, force=True)
+
+    assert result.status is UpdateStatus.CURRENT
+    receipt_state = json.loads(receipt.read_text(encoding="utf-8"))
+    assert receipt_state["last_check"] == later.isoformat()
+    current = json.loads((paths.hotwords_file.parent / "current.json").read_text())
+    assert current["last_check"] == later.isoformat()
+
+
+def test_implausibly_future_receipt_is_ignored_before_throttle_or_commit(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data()
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": "2026.07.29",
+                "last_check": (
+                    datetime.now(timezone.utc) + timedelta(days=366 * 6)
+                ).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW, force=True)
+
+    assert result.status is UpdateStatus.CURRENT
+    receipt_state = json.loads(receipt.read_text(encoding="utf-8"))
+    assert receipt_state["last_check"] == NOW.isoformat()
+
+
+def test_network_timeout_records_a_failed_attempt_and_is_throttled(tmp_path):
+    paths = paths_for(tmp_path)
+    timeout = FakeTransport({MANIFEST_URL: TimeoutError("network timed out")})
+
+    first = update_hotwords(paths, MANIFEST_URL, timeout, NOW)
+    skipped = update_hotwords(paths, MANIFEST_URL, timeout, NOW + timedelta(hours=1))
+
+    assert first.status is UpdateStatus.REJECTED
+    assert skipped.status is UpdateStatus.SKIPPED
+    assert timeout.calls == [MANIFEST_URL]
 
 
 @pytest.mark.parametrize(
@@ -572,6 +675,32 @@ def test_busy_cross_process_lock_is_bounded_and_does_not_break_owner(tmp_path):
         ).status
         is UpdateStatus.UPDATED
     )
+
+
+def test_replacing_a_legacy_lock_path_cannot_split_the_os_lease(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    paths = paths_for(tmp_path)
+    holder = context.Process(
+        target=_child_hold_lock, args=(str(paths.root), ready, release)
+    )
+    holder.start()
+    assert ready.wait(10)
+    legacy_lock = paths.hotwords_file.parent / ".update.lock"
+    replacement = paths.hotwords_file.parent / ".replacement.lock"
+    replacement.write_text("replacement", encoding="utf-8")
+    os.replace(replacement, legacy_lock)
+
+    blocked = update_hotwords(
+        paths, MANIFEST_URL, transport_for(hotword_data()), NOW, force=True
+    )
+
+    assert blocked.status is UpdateStatus.REJECTED
+    assert holder.is_alive()
+    release.set()
+    holder.join(10)
+    assert holder.exitcode == 0
 
 
 def test_crashed_lock_owner_is_recovered_by_the_operating_system(tmp_path):

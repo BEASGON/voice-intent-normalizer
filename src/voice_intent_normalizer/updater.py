@@ -14,6 +14,7 @@ import re
 import stat
 import tempfile
 import time
+import unicodedata
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -64,6 +65,10 @@ _ATTEMPT_FIELDS = frozenset({"schema_version", "version", "last_check"})
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _VERSION_PATTERN = re.compile(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}\Z", re.ASCII)
 _CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class UpdateLockTimeout(TimeoutError):
+    """A bounded local lease acquisition failure, distinct from transport timeout."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +132,7 @@ def update_hotwords(
         with _update_lock(paths):
             current = _recover_locked(paths)
             if not force and _check_is_recent(
-                current, _read_attempt(paths), checked_at
+                current, _read_attempt_or_none(paths), checked_at
             ):
                 return UpdateResult(
                     UpdateStatus.SKIPPED,
@@ -141,6 +146,7 @@ def update_hotwords(
         candidate_version = manifest.version
         with _update_lock(paths):
             current = _recover_locked(paths)
+            checked_at = _merged_check_time(paths, current, checked_at)
             immediate = _decide_known_version(paths, current, manifest, checked_at)
             if immediate is not None:
                 return immediate
@@ -152,6 +158,7 @@ def update_hotwords(
 
         with _update_lock(paths):
             current = _recover_locked(paths)
+            checked_at = _merged_check_time(paths, current, checked_at)
             immediate = _decide_known_version(paths, current, manifest, checked_at)
             if immediate is not None:
                 return immediate
@@ -159,7 +166,7 @@ def update_hotwords(
             _commit_locked(paths, manifest, data, checked_at)
             return UpdateResult(UpdateStatus.UPDATED, version=manifest.version)
     except Exception as exc:
-        if candidate_version is not None:
+        if candidate_version is not None and not isinstance(exc, UpdateLockTimeout):
             try:
                 with _update_lock(paths):
                     current = _recover_locked(paths)
@@ -169,7 +176,7 @@ def update_hotwords(
                         )
             except Exception:
                 pass
-        if not isinstance(exc, TimeoutError):
+        if not isinstance(exc, UpdateLockTimeout):
             _record_failed_attempt(paths, now)
         return UpdateResult(UpdateStatus.REJECTED, message=_safe_message(exc))
 
@@ -184,7 +191,7 @@ def _commit_locked(
     _write_bytes_atomic(_pending_file(paths), _serialize_current(state))
     _write_current(paths, state)
     _materialize_current(paths, state)
-    _write_attempt(paths, _AttemptState(state.version, checked_at))
+    _write_attempt_best_effort(paths, _AttemptState(state.version, checked_at))
     _remove_pending(paths)
     _verify_current_cache(paths, state)
     _cleanup_payloads(paths, state)
@@ -201,7 +208,7 @@ def _decide_known_version(
         return None
     comparison = _compare_versions(manifest.version, current.version)
     if comparison < 0:
-        _write_attempt(paths, _AttemptState(current.version, checked_at))
+        _write_attempt_best_effort(paths, _AttemptState(current.version, checked_at))
         return UpdateResult(
             UpdateStatus.REJECTED,
             version=current.version,
@@ -209,7 +216,7 @@ def _decide_known_version(
         )
     if comparison == 0:
         _write_current(paths, _with_check(current, checked_at))
-        _write_attempt(paths, _AttemptState(current.version, checked_at))
+        _write_attempt_best_effort(paths, _AttemptState(current.version, checked_at))
         return UpdateResult(UpdateStatus.CURRENT, version=current.version)
     return None
 
@@ -218,7 +225,17 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
     """Reconcile an interrupted commit before any version decision is made."""
     _ensure_storage(paths)
     current = _read_current(paths)
-    attempt = _read_attempt(paths)
+    attempt = _read_attempt_or_none(paths)
+    if attempt is None and _attempt_file(paths).exists():
+        # Receipts are never authoritative; a verified pointer remains usable.
+        if current is None:
+            attempt = None
+        else:
+            try:
+                _discard_attempt(paths)
+            except ValueError:
+                pass
+            attempt = None
     try:
         pending = _read_pending(paths)
     except ValueError:
@@ -238,7 +255,9 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
         _verify_payload(paths, current)
         _materialize_current(paths, current)
         if attempt is None or attempt.last_check < current.last_check:
-            _write_attempt(paths, _AttemptState(current.version, current.last_check))
+            _write_attempt_best_effort(
+                paths, _AttemptState(current.version, current.last_check)
+            )
     if pending is not None:
         _remove_pending(paths)
     if current is not None:
@@ -248,7 +267,7 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
 
 def _migrate_legacy_locked(paths: StatePaths) -> _CurrentState | None:
     """Promote a valid pre-transaction Task 7 installation exactly once."""
-    attempt = _read_attempt(paths)
+    attempt = _read_attempt_or_none(paths)
     if attempt is None:
         return None
     if attempt.version is None:
@@ -272,8 +291,11 @@ def _allowed_url(value: object) -> bool:
         not isinstance(value, str)
         or not value
         or len(value) > _MAX_URL_LENGTH
-        or value != value.strip()
-        or _CONTROL_PATTERN.search(value) is not None
+        or any(
+            character.isspace()
+            or unicodedata.category(character).startswith(("C", "Z"))
+            for character in value
+        )
     ):
         return False
     try:
@@ -399,6 +421,14 @@ def _read_attempt(paths: StatePaths) -> _AttemptState | None:
     return _read_state_file(_attempt_file(paths), _ATTEMPT_FIELDS, _attempt_from_raw)
 
 
+def _read_attempt_or_none(paths: StatePaths) -> _AttemptState | None:
+    """Treat the receipt as advisory even when it is malformed or inaccessible."""
+    try:
+        return _read_attempt(paths)
+    except ValueError:
+        return None
+
+
 def _read_state_file(path: Path, fields: frozenset[str], parser):
     if not path.exists():
         return None
@@ -496,6 +526,14 @@ def _write_attempt(paths: StatePaths, state: _AttemptState) -> None:
     _write_bytes_atomic(_attempt_file(paths), _serialize(raw))
 
 
+def _write_attempt_best_effort(paths: StatePaths, state: _AttemptState) -> None:
+    """Keep the non-authoritative receipt from breaking a valid installation."""
+    try:
+        _write_attempt(paths, state)
+    except (OSError, ValueError):
+        return
+
+
 def _serialize_current(state: _CurrentState) -> bytes:
     return _serialize(
         {
@@ -527,6 +565,13 @@ def _discard_pending(paths: StatePaths) -> None:
         path.unlink()
 
 
+def _discard_attempt(paths: StatePaths) -> None:
+    path = _attempt_file(paths)
+    if path.exists():
+        _reject_symlink(path, "attempt receipt")
+        path.unlink()
+
+
 def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
     """Bound immutable payload retention after a verified authoritative commit."""
     directory = _payloads_dir(paths)
@@ -542,10 +587,19 @@ def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
         key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
     )
-    kept = 0
+    protected = {current.payload}
+    try:
+        pending = _read_pending(paths)
+    except ValueError:
+        pending = None
+    if pending is not None:
+        protected.add(pending.payload)
+    kept = set(protected)
     for path in candidates:
-        if path.name == current.payload or kept < _MAX_RETAINED_PAYLOADS:
-            kept += 1
+        if path.name in kept:
+            continue
+        if len(kept) < _MAX_RETAINED_PAYLOADS:
+            kept.add(path.name)
             continue
         path.unlink()
 
@@ -559,7 +613,10 @@ def resolve_hotword_file(paths: StatePaths) -> Path | None:
                 _verify_current_cache(paths, current)
                 return paths.hotwords_file
             if paths.hotwords_file.is_file():
-                _read_regular_file(paths.hotwords_file, _MAX_DATA_BYTES, "hotword file")
+                data = _read_regular_file(
+                    paths.hotwords_file, _MAX_DATA_BYTES, "hotword file"
+                )
+                _validate_hotword_jsonl(data)
                 return paths.hotwords_file
     except Exception:
         return None
@@ -569,9 +626,10 @@ def resolve_hotword_file(paths: StatePaths) -> Path | None:
 def _record_failed_attempt(paths: StatePaths, now: datetime) -> None:
     try:
         checked_at = _utc_now(now)
-        with _update_lock(paths):
+        with _update_lock(paths, timeout=0.05):
             current = _recover_locked(paths)
-            _write_attempt(
+            checked_at = _merged_check_time(paths, current, checked_at)
+            _write_attempt_best_effort(
                 paths,
                 _AttemptState(None if current is None else current.version, checked_at),
             )
@@ -585,6 +643,19 @@ def _check_is_recent(
 ) -> bool:
     checks = [state.last_check for state in (current, attempt) if state is not None]
     return bool(checks) and now - max(checks) < _UPDATE_INTERVAL
+
+
+def _merged_check_time(
+    paths: StatePaths, current: _CurrentState | None, checked_at: datetime
+) -> datetime:
+    """Never let a late worker regress either authoritative or receipt time."""
+    checks = [checked_at]
+    if current is not None:
+        checks.append(current.last_check)
+    attempt = _read_attempt_or_none(paths)
+    if attempt is not None:
+        checks.append(attempt.last_check)
+    return max(checks)
 
 
 def _with_check(state: _CurrentState, checked_at: datetime) -> _CurrentState:
@@ -617,7 +688,12 @@ def _parse_time(value: object) -> datetime:
         raise ValueError("invalid update check timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("update check timestamp must include a timezone")
-    return parsed.astimezone(timezone.utc)
+    canonical = parsed.astimezone(timezone.utc)
+    if value != canonical.isoformat():
+        raise ValueError("update check timestamp must be canonical UTC")
+    if canonical > datetime.now(timezone.utc) + timedelta(days=366 * 5):
+        raise ValueError("update check timestamp is implausibly far in the future")
+    return canonical
 
 
 def _utc_now(value: datetime) -> datetime:
@@ -644,34 +720,24 @@ def _ensure_storage(paths: StatePaths) -> None:
 
 
 @contextmanager
-def _update_lock(paths: StatePaths) -> Iterator[None]:
-    """Use an OS lease: crash-safe, bounded, and never stolen from an owner."""
+def _update_lock(paths: StatePaths, *, timeout: float | None = None) -> Iterator[None]:
+    """Use a stable OS lease, never a replaceable filesystem lock entry."""
     _ensure_storage(paths)
-    path = _lock_file(paths)
-    _reject_symlink(path, "update lock")
-    created = not path.exists()
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    parent_before = path.parent.stat()
-    descriptor = os.open(path, flags, 0o600)
+    if os.name == "nt":
+        with _windows_mutex(paths, timeout):
+            yield
+        return
+
+    # Flocking the state directory inode avoids split-brain if a sibling lock
+    # file is renamed/replaced. The directory is the coordination object.
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(_hotword_dir(paths), flags)
     acquired = False
     try:
-        if created and os.fstat(descriptor).st_size == 0:
-            os.write(descriptor, b"0")
-            os.fsync(descriptor)
-        _lock_descriptor(descriptor)
+        _lock_descriptor(descriptor, timeout)
         acquired = True
-        path_after = path.stat()
-        parent_after = path.parent.stat()
-        descriptor_info = os.fstat(descriptor)
-        if os.name != "nt" and (
-            (path_after.st_dev, path_after.st_ino)
-            != (descriptor_info.st_dev, descriptor_info.st_ino)
-            or (parent_before.st_dev, parent_before.st_ino)
-            != (parent_after.st_dev, parent_after.st_ino)
-        ):
-            raise ValueError("update lock path changed during acquisition")
         yield
     finally:
         try:
@@ -681,8 +747,41 @@ def _update_lock(paths: StatePaths) -> Iterator[None]:
             os.close(descriptor)
 
 
-def _lock_descriptor(descriptor: int) -> None:
-    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+@contextmanager
+def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
+    """Use a kernel mutex so no path rename or reparse point can split a lease."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    name = "Local\\voice-intent-normalizer-" + hashlib.sha256(
+        str(_hotword_dir(paths).resolve()).encode("utf-8")
+    ).hexdigest()
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        raise OSError("unable to create update mutex")
+    milliseconds = int(
+        1000 * (_LOCK_TIMEOUT_SECONDS if timeout is None else timeout)
+    )
+    result = kernel32.WaitForSingleObject(handle, milliseconds)
+    acquired = result in {0, 0x80}
+    try:
+        if not acquired:
+            raise UpdateLockTimeout("hotword update mutex is busy")
+        yield
+    finally:
+        if acquired:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+
+
+def _lock_descriptor(descriptor: int, timeout: float | None = None) -> None:
+    deadline = time.monotonic() + (
+        _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    )
     while True:
         try:
             if os.name == "nt":
@@ -697,7 +796,7 @@ def _lock_descriptor(descriptor: int) -> None:
             return
         except OSError as exc:
             if time.monotonic() >= deadline:
-                raise TimeoutError("hotword update lock is busy") from exc
+                raise UpdateLockTimeout("hotword update lock is busy") from exc
             time.sleep(_LOCK_RETRY_SECONDS)
 
 
@@ -800,10 +899,6 @@ def _pending_file(paths: StatePaths) -> Path:
 
 def _attempt_file(paths: StatePaths) -> Path:
     return _hotword_dir(paths) / "last-update.json"
-
-
-def _lock_file(paths: StatePaths) -> Path:
-    return _hotword_dir(paths) / ".update.lock"
 
 
 def _reject_constant(value: str) -> None:
