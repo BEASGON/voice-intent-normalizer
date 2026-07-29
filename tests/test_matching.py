@@ -222,6 +222,35 @@ def test_scoring_records_context_and_negative_alias_evidence():
     assert negative.evidence[0] == "alias:negative"
 
 
+def test_negative_alias_overrides_a_positive_normalized_alias_for_the_same_span():
+    from voice_intent_normalizer.matching import MatchContext, generate_candidates
+
+    entry = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.HOT,
+        aliases=("open-cloud",),
+        domains=("ai",),
+        weight=1.0,
+        status=EntryStatus.CURATED,
+        negative_aliases=("open cloud",),
+    )
+
+    candidates = generate_candidates(
+        "open cloud",
+        LexiconSet(entries=(entry,)),
+        MatchContext(
+            domains=frozenset({"ai"}),
+            project_terms=frozenset({"OpenClaw"}),
+            conversation_terms=frozenset({"OpenClaw"}),
+        ),
+    )
+
+    candidate = candidates[0]
+    assert candidate.score == 0.0
+    assert "alias:negative" in candidate.evidence
+    assert "alias:normalized" not in candidate.evidence
+
+
 def test_ties_follow_layer_precedence_then_canonical_name():
     from voice_intent_normalizer.matching import MatchContext, generate_candidates
 

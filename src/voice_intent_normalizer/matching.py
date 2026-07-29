@@ -189,7 +189,7 @@ def generate_candidates(
     """Generate ordered, explainable candidates without altering *text*."""
     source_key, starts, ends = _source_key(text)
     found: dict[tuple[LexiconEntry, tuple[int, int]], str] = {}
-    match_priority = {"negative": 0, "phonetic": 1, "normalized": 2, "exact": 3}
+    match_priority = {"phonetic": 0, "normalized": 1, "exact": 2, "negative": 3}
 
     def record(entry: LexiconEntry, span: tuple[int, int], kind: str) -> None:
         key = (entry, span)
