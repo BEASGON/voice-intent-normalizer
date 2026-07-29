@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .lexicon import load_jsonl, write_jsonl_atomic
+from .lexicon import load_jsonl, parse_entry, write_jsonl_atomic
 from .models import EntryStatus, LexiconEntry, Scope
 
 _OUTER_PUNCTUATION = " \t\r\n，。！？；：,.!?;:"
@@ -129,6 +129,7 @@ class LearningStore:
             status=EntryStatus.CONFIRMED,
             scope=resolved_scope,
             project_id=project_id,
+            baseline=self._baseline_for(resolved_scope, project_id, canonical),
         )
         self._materialize()
         return event
@@ -151,6 +152,7 @@ class LearningStore:
             canonical,
             status=EntryStatus.REJECTED,
             scope=Scope.PERSONAL,
+            baseline=self._baseline_for(Scope.PERSONAL, None, canonical),
         )
         self._materialize()
         return event
@@ -222,6 +224,7 @@ class LearningStore:
         scope: Scope | None = None,
         project_id: str | None = None,
         source: str | None = None,
+        baseline: LexiconEntry | None = None,
         target_event_id: str | None = None,
         target_event_ids: list[str] | None = None,
     ) -> LearningEvent:
@@ -256,6 +259,8 @@ class LearningStore:
             raw["target_event_id"] = target_event_id
         if target_event_ids is not None:
             raw["target_event_ids"] = target_event_ids
+        if baseline is not None:
+            raw["baseline"] = _entry_snapshot(baseline)
         self.root.mkdir(parents=True, exist_ok=True)
         with self.events_file.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(raw, ensure_ascii=False, sort_keys=True) + "\n")
@@ -320,49 +325,50 @@ class LearningStore:
                     active.pop(target, None)
         return list(active.values())
 
+    def _baseline_for(
+        self, scope: Scope, project_id: str | None, canonical: str
+    ) -> LexiconEntry | None:
+        path = self.personal_file
+        if scope is Scope.PROJECT:
+            assert project_id is not None
+            path = self.root / "projects" / project_id / "project.jsonl"
+        if not path.is_file():
+            return None
+        key = (canonical, scope, project_id)
+        legacy_entries = self._legacy_owned_entries(self._events())
+        for entry in load_jsonl(path, expected_scope=scope):
+            if _entry_key(entry) != key:
+                continue
+            if entry.source == _LEARNING_SOURCE or legacy_entries.get(key) == entry:
+                return None
+            return entry
+        return None
+
     def _materialize(self) -> None:
+        events = self._events()
         entries_by_scope: dict[tuple[Scope, str | None], list[LexiconEntry]] = {}
-        grouped: dict[tuple[Scope, str | None, str], dict[str, list[str]]] = {}
         project_ids: set[str] = set()
-        for event in self._events():
+        for event in events:
             if event.get("action") == "confirm" and event.get("scope") == "project":
                 project_ids.add(_project_id(event.get("project_id")))
-        for event in self._active_mapping_events():
-            action = event["action"]
-            scope = Scope(event["scope"])
-            project_id = event.get("project_id")
-            key = (scope, project_id, event["canonical"])
-            mapping = grouped.setdefault(key, {"aliases": [], "negative_aliases": []})
-            field = "aliases" if action == "confirm" else "negative_aliases"
-            mapping[field].append(event["alias"])
-
-        for (scope, project_id, canonical), mapping in grouped.items():
-            aliases = _unique(mapping["aliases"])
-            negative_aliases = _unique(mapping["negative_aliases"])
-            if not aliases:
-                aliases = (canonical,)
-            status = (
-                EntryStatus.CONFIRMED if mapping["aliases"] else EntryStatus.REJECTED
+        for entry in _entries_from_learning_events(
+            self._active_mapping_events(), _LEARNING_SOURCE
+        ):
+            entries_by_scope.setdefault((entry.scope, entry.project_id), []).append(
+                entry
             )
-            entries_by_scope.setdefault((scope, project_id), []).append(
-                LexiconEntry(
-                    canonical=canonical,
-                    scope=scope,
-                    aliases=aliases,
-                    domains=(),
-                    weight=1.0,
-                    status=status,
-                    project_id=project_id,
-                    source=_LEARNING_SOURCE,
-                    negative_aliases=negative_aliases,
-                )
-            )
+        baselines = self._baselines(events)
+        legacy_entries = self._legacy_owned_entries(events)
 
         personal_entries = entries_by_scope.get((Scope.PERSONAL, None), [])
         self._write_entries(
             self.personal_file,
             self._merge_entries(
-                self.personal_file, Scope.PERSONAL, personal_entries
+                self.personal_file,
+                Scope.PERSONAL,
+                personal_entries,
+                baselines,
+                legacy_entries,
             ),
         )
         for project_id in project_ids:
@@ -373,6 +379,8 @@ class LearningStore:
                     path,
                     Scope.PROJECT,
                     entries_by_scope.get((Scope.PROJECT, project_id), []),
+                    baselines,
+                    legacy_entries,
                 ),
             )
 
@@ -381,22 +389,59 @@ class LearningStore:
         path: Path,
         scope: Scope,
         learned_entries: list[LexiconEntry],
+        baselines: dict[tuple[str, Scope, str | None], LexiconEntry],
+        legacy_entries: dict[tuple[str, Scope, str | None], LexiconEntry],
     ) -> list[LexiconEntry]:
-        preserved = (
+        current = (
             ()
             if not path.is_file()
-            else tuple(
-                entry
-                for entry in load_jsonl(path, expected_scope=scope)
-                if not _is_derived_learning_entry(entry)
-            )
+            else load_jsonl(path, expected_scope=scope)
         )
+        learned_keys = {_entry_key(entry) for entry in learned_entries}
+        owned_keys = {
+            _entry_key(entry)
+            for entry in current
+            if entry.source == _LEARNING_SOURCE
+            or legacy_entries.get(_entry_key(entry)) == entry
+        }
         merged: dict[tuple[str, Scope, str | None], LexiconEntry] = {}
-        for entry in (*preserved, *learned_entries):
-            key = (entry.canonical, entry.scope, entry.project_id)
+        for entry in current:
+            key = _entry_key(entry)
+            if key not in owned_keys:
+                merged[key] = entry
+        for key, baseline in baselines.items():
+            if baseline.scope is scope and (key in learned_keys or key in owned_keys):
+                merged[key] = baseline
+        for entry in learned_entries:
+            key = _entry_key(entry)
             previous = merged.get(key)
             merged[key] = entry if previous is None else _merge_entry(previous, entry)
         return list(merged.values())
+
+    @staticmethod
+    def _baselines(
+        events: list[dict[str, Any]],
+    ) -> dict[tuple[str, Scope, str | None], LexiconEntry]:
+        baselines: dict[tuple[str, Scope, str | None], LexiconEntry] = {}
+        for event in events:
+            raw_baseline = event.get("baseline")
+            if raw_baseline is None:
+                continue
+            baseline = parse_entry(raw_baseline)
+            baselines.setdefault(_entry_key(baseline), baseline)
+        return baselines
+
+    @staticmethod
+    def _legacy_owned_entries(
+        events: list[dict[str, Any]],
+    ) -> dict[tuple[str, Scope, str | None], LexiconEntry]:
+        legacy_events = [
+            event for event in events if event.get("action") in {"confirm", "reject"}
+        ]
+        return {
+            _entry_key(entry): entry
+            for entry in _entries_from_learning_events(legacy_events, None)
+        }
 
     @staticmethod
     def _write_entries(path: Path, entries: list[LexiconEntry]) -> None:
@@ -437,12 +482,63 @@ def _unique(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _is_derived_learning_entry(entry: LexiconEntry) -> bool:
-    """Recognize current and pre-marker learning materializations."""
-    return entry.source == _LEARNING_SOURCE or (
-        entry.source is None
-        and entry.status in {EntryStatus.CONFIRMED, EntryStatus.REJECTED}
-    )
+def _entry_key(entry: LexiconEntry) -> tuple[str, Scope, str | None]:
+    return (entry.canonical, entry.scope, entry.project_id)
+
+
+def _entry_snapshot(entry: LexiconEntry) -> dict[str, Any]:
+    return {
+        "aliases": list(entry.aliases),
+        "canonical": entry.canonical,
+        "domains": list(entry.domains),
+        "negative_aliases": list(entry.negative_aliases),
+        "notes": entry.notes,
+        "phonetics": list(entry.phonetics),
+        "project_id": entry.project_id,
+        "scope": entry.scope.value,
+        "source": entry.source,
+        "status": entry.status.value,
+        "use_count": entry.use_count,
+        "weight": entry.weight,
+    }
+
+
+def _entries_from_learning_events(
+    events: list[dict[str, Any]], source: str | None
+) -> tuple[LexiconEntry, ...]:
+    grouped: dict[tuple[Scope, str | None, str], dict[str, list[str]]] = {}
+    for event in events:
+        action = event["action"]
+        scope = Scope(event["scope"])
+        project_id = event.get("project_id")
+        key = (scope, project_id, event["canonical"])
+        mapping = grouped.setdefault(key, {"aliases": [], "negative_aliases": []})
+        field = "aliases" if action == "confirm" else "negative_aliases"
+        mapping[field].append(event["alias"])
+
+    entries: list[LexiconEntry] = []
+    for (scope, project_id, canonical), mapping in grouped.items():
+        aliases = _unique(mapping["aliases"])
+        if not aliases:
+            aliases = (canonical,)
+        entries.append(
+            LexiconEntry(
+                canonical=canonical,
+                scope=scope,
+                aliases=aliases,
+                domains=(),
+                weight=1.0,
+                status=(
+                    EntryStatus.CONFIRMED
+                    if mapping["aliases"]
+                    else EntryStatus.REJECTED
+                ),
+                project_id=project_id,
+                source=source,
+                negative_aliases=_unique(mapping["negative_aliases"]),
+            )
+        )
+    return tuple(entries)
 
 
 def _merge_entry(left: LexiconEntry, right: LexiconEntry) -> LexiconEntry:
@@ -465,7 +561,7 @@ def _merge_entry(left: LexiconEntry, right: LexiconEntry) -> LexiconEntry:
         status=learned.status,
         phonetics=_unique([*existing.phonetics, *learned.phonetics]),
         project_id=existing.project_id,
-        source=existing.source,
+        source=_LEARNING_SOURCE,
         use_count=existing.use_count,
         notes=existing.notes,
         negative_aliases=_unique(

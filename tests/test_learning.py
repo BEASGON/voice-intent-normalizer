@@ -200,6 +200,56 @@ def test_personal_confirmation_preserves_manually_curated_entries(tmp_path):
     assert entries["NewTool"].aliases == ("new tool",)
 
 
+def test_personal_confirmation_preserves_source_less_confirmed_manual_entry(tmp_path):
+    """Catch broad ownership heuristics deleting a legacy manual confirmation."""
+    paths = StatePaths.resolve(
+        environ={"VOICE_INTENT_HOME": str(tmp_path / "state")}, home=tmp_path
+    )
+    paths.root.mkdir()
+    manual_entry = LexiconEntry(
+        canonical="LegacyTool",
+        scope=Scope.PERSONAL,
+        aliases=("legacy tool",),
+        domains=("ai",),
+        weight=0.8,
+        status=EntryStatus.CONFIRMED,
+    )
+    write_jsonl_atomic(paths.personal_file, (manual_entry,))
+
+    LearningStore.for_root(paths.root).confirm(
+        "new tool", "NewTool", Scope.PERSONAL
+    )
+
+    entries = {entry.canonical: entry for entry in load_jsonl(paths.personal_file)}
+    assert entries["LegacyTool"] == manual_entry
+    assert entries["NewTool"].aliases == ("new tool",)
+
+
+def test_undo_restores_the_exact_manual_entry_overlaid_by_learning(tmp_path):
+    """Catch undo leaving a learned alias or status on a manual record."""
+    paths = StatePaths.resolve(
+        environ={"VOICE_INTENT_HOME": str(tmp_path / "state")}, home=tmp_path
+    )
+    paths.root.mkdir()
+    manual_entry = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("curated alias",),
+        domains=("ai",),
+        weight=0.8,
+        status=EntryStatus.CURATED,
+        source="manual",
+        notes="hand-maintained",
+    )
+    write_jsonl_atomic(paths.personal_file, (manual_entry,))
+    store = LearningStore.for_root(paths.root)
+
+    store.confirm("learned alias", "OpenClaw", Scope.PERSONAL)
+    store.undo_last()
+
+    assert load_jsonl(paths.personal_file) == (manual_entry,)
+
+
 def test_rejected_mapping_suppresses_the_same_lower_layer_mapping(tmp_path):
     """Catch a personal rejection that leaves a base alias eligible to apply."""
     paths = StatePaths.resolve(
