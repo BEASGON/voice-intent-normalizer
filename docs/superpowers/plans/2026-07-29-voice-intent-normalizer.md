@@ -103,6 +103,8 @@ voice-intent-normalizer/
 - Create: `src/voice_intent_normalizer/models.py`
 - Create: `src/voice_intent_normalizer/lexicon.py`
 - Create: `tests/test_lexicon.py`
+- Create: `tests/test_project_metadata.py`
+- Create: `LICENSE`
 
 **Interfaces:**
 - Produces: `Scope`, `EntryStatus`, `LexiconEntry`, `Candidate`, `DecisionAction`, `CorrectionDecision`.
@@ -1258,7 +1260,7 @@ git commit -m "feat: package skill for WorkBuddy import"
 - Create: `CONTRIBUTING.md`
 - Create: `SECURITY.md`
 - Create: `CHANGELOG.md`
-- Create: `LICENSE`
+- Modify: `LICENSE`
 - Modify: all runtime and adapter files found by final verification
 
 **Interfaces:**
