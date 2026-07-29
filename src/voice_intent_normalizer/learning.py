@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -48,6 +49,12 @@ _LEARNING_ACTIONS = frozenset({"confirm", "reject", "delete"})
 _MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 _MAX_EVENT_BYTES = 64 * 1024
 _MAX_EVENTS = 20_000
+_PROJECT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
+_RESERVED_PROJECT_IDS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
 _COMMON_EVENT_FIELDS = frozenset(
     {
         "action",
@@ -289,8 +296,8 @@ class LearningStore:
 
     def export(self, path: str | Path) -> None:
         """Atomically export the currently materialized personal lexicon."""
+        destination = _export_destination(self.root, path)
         self._replay_and_verify()
-        destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         expected = self.personal_entries()
         write_jsonl_atomic(destination, expected)
@@ -354,7 +361,7 @@ class LearningStore:
 
     def _append_raw_atomic(self, raw: dict[str, Any]) -> None:
         """Atomically replace the bounded journal with one additional V1 event."""
-        existing = self._events()
+        existing, prior = self._events_snapshot()
         seen = {event["event_id"]: event for event in existing}
         _validate_v1_event(raw, seen, _undone_ids(existing))
         combined = [*existing, raw]
@@ -365,7 +372,6 @@ class LearningStore:
             raise ValueError(f"event exceeds {_MAX_EVENT_BYTES} bytes")
         if len(existing) >= _MAX_EVENTS:
             raise ValueError(f"journal exceeds {_MAX_EVENTS} events")
-        prior = self.events_file.read_bytes() if self.events_file.is_file() else b""
         separator = b"\n" if prior and not prior.endswith(b"\n") else b""
         if len(prior) + len(separator) + len(encoded) > _MAX_JOURNAL_BYTES:
             raise ValueError(f"journal exceeds {_MAX_JOURNAL_BYTES} bytes")
@@ -395,16 +401,15 @@ class LearningStore:
 
     def _events(self) -> list[dict[str, Any]]:
         """Load and strictly validate the complete bounded V1 journal."""
-        if not self.events_file.is_file():
-            return []
-        try:
-            content = self.events_file.read_bytes()
-        except OSError as exc:
-            raise ValueError(f"{self.events_file}: unable to read journal") from exc
-        if len(content) > _MAX_JOURNAL_BYTES:
-            raise ValueError(
-                f"{self.events_file}: journal exceeds {_MAX_JOURNAL_BYTES} bytes"
-            )
+        return self._events_snapshot()[0]
+
+    def _events_snapshot(self) -> tuple[list[dict[str, Any]], bytes]:
+        """Return validated events and the same bounded journal byte snapshot."""
+        content = _read_regular_file_bounded(
+            self.events_file,
+            _MAX_JOURNAL_BYTES,
+            "journal",
+        )
         lines = content.splitlines()
         if len(lines) > _MAX_EVENTS:
             raise ValueError(
@@ -449,7 +454,7 @@ class LearningStore:
             if raw["action"] == "undo":
                 undone.add(raw["target_event_id"])
         _validate_generations(events)
-        return events
+        return events, content
 
     def _latest_observation(
         self, alias: str, canonical: str
@@ -470,13 +475,9 @@ class LearningStore:
         if not path.is_file():
             return None
         key = (canonical, scope, project_id)
-        return next(
-            (
-                entry
-                for entry in load_jsonl(path, expected_scope=scope)
-                if _entry_key(entry) == key
-            ),
-            None,
+        return _effective_entry(
+            load_jsonl(path, expected_scope=scope),
+            key,
         )
 
     def _capture_generation(
@@ -494,7 +495,8 @@ class LearningStore:
         if active:
             generation_id = active[0]["generation_id"]
             baseline = _baseline_from_event(active[0])
-            _assert_active_current(key, current, baseline)
+            expected = _overlay_entry(baseline, active)
+            _assert_active_current(key, current, baseline, expected)
             return generation_id, baseline
         if current is not None and current.source == _LEARNING_SOURCE:
             raise RuntimeError(
@@ -511,6 +513,11 @@ class LearningStore:
         ] = {}
         for event in active_events:
             active_by_key.setdefault(_raw_event_key(event), []).append(event)
+        prior_active_by_key: dict[
+            tuple[str, Scope, str | None], list[dict[str, Any]]
+        ] = {}
+        for event in _active_mapping_events(events[:-1]):
+            prior_active_by_key.setdefault(_raw_event_key(event), []).append(event)
         latest_baselines = _latest_baselines(events)
 
         locations = {
@@ -525,26 +532,49 @@ class LearningStore:
             current_entries = (
                 load_jsonl(path, expected_scope=scope) if path.is_file() else ()
             )
-            merged = {_entry_key(entry): entry for entry in current_entries}
+            expected_entries = current_entries
             location_keys = [
                 key
                 for key in latest_baselines
                 if key[1] is scope and key[2] == project_id
             ]
             for key in location_keys:
-                current = merged.get(key)
+                current = _effective_entry(expected_entries, key)
                 active = active_by_key.get(key, [])
+                prior_active = prior_active_by_key.get(key, [])
+                prior_overlay = (
+                    _overlay_entry(
+                        _baseline_from_event(prior_active[0]),
+                        prior_active,
+                    )
+                    if prior_active
+                    else None
+                )
                 if active:
                     baseline = _baseline_from_event(active[0])
-                    _assert_active_current(key, current, baseline)
-                    merged[key] = _overlay_entry(baseline, active)
+                    expected_overlay = _overlay_entry(baseline, active)
+                    _assert_active_current(
+                        key,
+                        current,
+                        baseline,
+                        expected_overlay,
+                        prior_overlay,
+                    )
+                    expected_entries = _replace_effective_entry(
+                        expected_entries,
+                        key,
+                        expected_overlay,
+                    )
                 elif current is not None and current.source == _LEARNING_SOURCE:
+                    if current != prior_overlay:
+                        _raise_external_edit_conflict(key)
                     baseline = latest_baselines[key]
-                    if baseline is None:
-                        merged.pop(key)
-                    else:
-                        merged[key] = baseline
-            expected = tuple(merged.values())
+                    expected_entries = _replace_effective_entry(
+                        expected_entries,
+                        key,
+                        baseline,
+                    )
+            expected = expected_entries
             if expected != current_entries:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 write_jsonl_atomic(path, expected)
@@ -583,15 +613,109 @@ def _required_text(value: Any, field_name: str) -> str:
 
 
 def _project_id(value: Any) -> str:
-    project_id = _required_text(value, "project_id")
+    if not isinstance(value, str) or _PROJECT_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            "project_id must match [A-Za-z0-9_-]+ and be at most 64 characters"
+        )
+    if value.upper() in _RESERVED_PROJECT_IDS:
+        raise ValueError("project_id must not be a reserved device name")
+    return value
+
+
+def _read_regular_file_bounded(path: Path, limit: int, label: str) -> bytes:
+    """Read one stable regular-file snapshot without allocating past *limit*."""
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        return b""
+    except OSError as exc:
+        raise ValueError(f"{path}: unable to inspect {label}") from exc
+    if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(path_info.st_mode):
+        raise ValueError(f"{path}: {label} must be a regular file")
+    if path_info.st_size > limit:
+        raise ValueError(f"{path}: {label} exceeds {limit} bytes")
+
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        with path.open("rb") as handle:
+            opened_info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_info.st_mode):
+                raise ValueError(f"{path}: {label} must be a regular file")
+            if (
+                opened_info.st_dev != path_info.st_dev
+                or opened_info.st_ino != path_info.st_ino
+            ):
+                raise ValueError(f"{path}: {label} changed before it was read")
+            if opened_info.st_size > limit:
+                raise ValueError(f"{path}: {label} exceeds {limit} bytes")
+            while total <= limit:
+                chunk = handle.read(min(64 * 1024, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            closed_info = os.fstat(handle.fileno())
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"{path}: unable to read {label}") from exc
+
+    if total > limit:
+        raise ValueError(f"{path}: {label} exceeds {limit} bytes")
     if (
-        len(project_id) > 128
-        or project_id in {".", ".."}
-        or "/" in project_id
-        or "\\" in project_id
+        closed_info.st_size != opened_info.st_size
+        or closed_info.st_mtime_ns != opened_info.st_mtime_ns
+        or closed_info.st_size != total
     ):
-        raise ValueError("project_id must be one safe path segment")
-    return project_id
+        raise ValueError(f"{path}: {label} changed while it was read")
+    return b"".join(chunks)
+
+
+def _export_destination(root: Path, path: str | Path) -> Path:
+    """Return a canonical outside-state export path without following file links."""
+    requested = Path(path).expanduser()
+    lexical = Path(os.path.abspath(requested))
+    if lexical.is_symlink():
+        raise ValueError("export destination must not be a symlink")
+    try:
+        state_root = root.resolve(strict=False)
+        canonical = lexical.resolve(strict=False)
+    except OSError as exc:
+        raise ValueError("unable to resolve export destination safely") from exc
+    if _is_protected_state_path(lexical, state_root) or (
+        _is_protected_state_path(canonical, state_root)
+    ):
+        raise ValueError("export destination must not replace protected state")
+    if canonical.is_dir():
+        raise ValueError("export destination must be a file path")
+    return canonical
+
+
+def _at_or_below(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_protected_state_path(path: Path, root: Path) -> bool:
+    if path in {
+        root,
+        root / "learning-events.jsonl",
+        root / "personal.jsonl",
+        root / "preferences.json",
+    }:
+        return True
+    return any(
+        _at_or_below(path, protected_root)
+        for protected_root in (
+            root / "projects",
+            root / "hotwords",
+            root / "adapters",
+        )
+    )
 
 
 def _serialized_event(raw: dict[str, Any]) -> bytes:
@@ -625,6 +749,37 @@ def _entry_snapshot(entry: LexiconEntry) -> dict[str, Any]:
 
 def _entry_key(entry: LexiconEntry) -> tuple[str, Scope, str | None]:
     return (entry.canonical, entry.scope, entry.project_id)
+
+
+def _effective_entry(
+    entries: tuple[LexiconEntry, ...],
+    key: tuple[str, Scope, str | None],
+) -> LexiconEntry | None:
+    """Return the last record for *key*, matching layered loader semantics."""
+    return next(
+        (entry for entry in reversed(entries) if _entry_key(entry) == key),
+        None,
+    )
+
+
+def _replace_effective_entry(
+    entries: tuple[LexiconEntry, ...],
+    key: tuple[str, Scope, str | None],
+    replacement: LexiconEntry | None,
+) -> tuple[LexiconEntry, ...]:
+    """Replace only the last record for *key*, preserving every other record."""
+    updated = list(entries)
+    for index in range(len(updated) - 1, -1, -1):
+        if _entry_key(updated[index]) != key:
+            continue
+        if replacement is None:
+            updated.pop(index)
+        else:
+            updated[index] = replacement
+        return tuple(updated)
+    if replacement is not None:
+        updated.append(replacement)
+    return tuple(updated)
 
 
 def _raw_event_key(event: dict[str, Any]) -> tuple[str, Scope, str | None]:
@@ -729,13 +884,23 @@ def _assert_active_current(
     key: tuple[str, Scope, str | None],
     current: LexiconEntry | None,
     baseline: LexiconEntry | None,
+    expected_overlay: LexiconEntry,
+    prior_overlay: LexiconEntry | None = None,
 ) -> None:
-    if current == baseline:
+    if (
+        current == baseline
+        or current == expected_overlay
+        or (prior_overlay is not None and current == prior_overlay)
+    ):
         return
-    if current is not None and current.source == _LEARNING_SOURCE:
-        return
+    _raise_external_edit_conflict(key)
+
+
+def _raise_external_edit_conflict(
+    key: tuple[str, Scope, str | None],
+) -> None:
     raise RuntimeError(
-        "external edit conflict for active V1 learning identity "
+        "external edit conflict for V1 learning identity "
         f"{key[0]!r} ({key[1].value})"
     )
 
@@ -915,6 +1080,18 @@ def _validate_v1_event(
             for target in targets
         ):
             raise ValueError("delete targets must reference prior mapping events")
+        active_by_id = {
+            event["event_id"]: event
+            for event in _active_mapping_events(list(seen.values()))
+        }
+        if any(target not in active_by_id for target in targets):
+            raise ValueError("delete targets must be currently active")
+        target_events = [active_by_id[target] for target in targets]
+        if any(event["canonical"] != canonical for event in target_events):
+            raise ValueError("delete targets must match the delete canonical")
+        expected_scope, expected_project_id = _common_location(target_events)
+        if scope is not expected_scope or project_id != expected_project_id:
+            raise ValueError("delete location must match its target cohort")
         return
 
     target = raw["target_event_id"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -206,14 +207,70 @@ def test_journal_bounds_fail_closed(tmp_path, content: bytes, message: str):
         LearningStore.for_root(tmp_path).list_recent()
 
 
-@pytest.mark.parametrize("project_id", ["../escape", r"folder\escape", ".", ".."])
-def test_project_id_must_be_one_safe_path_segment(tmp_path, project_id: str):
-    with pytest.raises(ValueError, match="safe path segment"):
-        LearningStore.for_root(tmp_path).confirm(
+@pytest.mark.parametrize(
+    "project_id",
+    [
+        "../escape",
+        r"folder\escape",
+        ".",
+        "..",
+        "bad:id",
+        "bad\nid",
+        "bad\x00id",
+        "CON",
+        "com1",
+        "项目",
+        "a" * 65,
+    ],
+)
+def test_invalid_project_id_never_reaches_the_journal(tmp_path, project_id: str):
+    store = LearningStore.for_root(tmp_path)
+
+    with pytest.raises(ValueError, match="project_id"):
+        store.confirm(
             "alias", "Canonical", Scope.PROJECT, project_id=project_id
         )
 
+    assert not store.events_file.exists()
     assert not (tmp_path.parent / "escape").exists()
+
+
+def test_invalid_project_id_in_journal_fails_closed(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("alias", "Canonical", Scope.PROJECT, project_id="valid-id")
+    events = _read_events(tmp_path)
+    events[0]["project_id"] = "bad:id"
+    _write_events(tmp_path, events)
+
+    with pytest.raises(ValueError, match="project_id"):
+        LearningStore.for_root(tmp_path).list_recent()
+
+
+def test_journal_reader_does_not_use_unbounded_read_bytes(
+    tmp_path, monkeypatch
+):
+    store = LearningStore.for_root(tmp_path)
+    store.observe("seen", "SeenTool", "conversation")
+
+    def fail_unbounded_read(path):
+        raise AssertionError(f"unbounded read: {path}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_unbounded_read)
+
+    assert store.list_recent() == ()
+
+
+def test_journal_symlink_is_rejected(tmp_path):
+    source = tmp_path / "source"
+    LearningStore.for_root(source).observe("seen", "SeenTool", "conversation")
+    external = tmp_path / "external.jsonl"
+    external.write_bytes((source / "learning-events.jsonl").read_bytes())
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "learning-events.jsonl").symlink_to(external)
+
+    with pytest.raises(ValueError, match="regular file"):
+        LearningStore.for_root(root).list_recent()
 
 
 def test_project_confirmation_is_isolated_from_personal_state(tmp_path):
@@ -264,6 +321,44 @@ def test_delete_and_undo_delete_restore_exact_targets(tmp_path):
     assert _read_events(tmp_path)[-1]["target_event_id"] == deletion.event_id
 
 
+def test_delete_target_must_match_the_delete_canonical(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("a", "ToolA", Scope.PERSONAL)
+    store.confirm("b", "ToolB", Scope.PERSONAL)
+    store.delete("ToolA")
+    events = _read_events(tmp_path)
+    events[-1]["target_event_ids"] = [events[1]["event_id"]]
+    _write_events(tmp_path, events)
+
+    with pytest.raises(ValueError, match="delete targets"):
+        LearningStore.for_root(tmp_path).list_recent()
+
+
+def test_delete_target_must_still_be_active(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("a", "ToolA", Scope.PERSONAL)
+    store.delete("ToolA")
+    events = _read_events(tmp_path)
+    duplicate = {**events[-1], "event_id": str(uuid.uuid4())}
+    _write_events(tmp_path, [*events, duplicate])
+
+    with pytest.raises(ValueError, match="currently active"):
+        LearningStore.for_root(tmp_path).list_recent()
+
+
+def test_delete_location_must_match_its_target_cohort(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("personal", "ToolA", Scope.PERSONAL)
+    store.confirm("project", "ToolA", Scope.PROJECT, project_id="project-7")
+    store.delete("ToolA")
+    events = _read_events(tmp_path)
+    events[-1]["scope"] = Scope.PERSONAL.value
+    _write_events(tmp_path, events)
+
+    with pytest.raises(ValueError, match="delete location"):
+        LearningStore.for_root(tmp_path).list_recent()
+
+
 def test_export_copies_replayed_personal_entries(tmp_path):
     store = LearningStore.for_root(tmp_path)
     store.confirm("learned", "OpenClaw", Scope.PERSONAL)
@@ -272,6 +367,66 @@ def test_export_copies_replayed_personal_entries(tmp_path):
     store.export(destination)
 
     assert load_jsonl(destination) == store.personal_entries()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        None,
+        "learning-events.jsonl",
+        "personal.jsonl",
+        "projects/p/project.jsonl",
+        "projects/p/scan-state.json",
+        "preferences.json",
+        "hotwords/zh-ai.jsonl",
+    ],
+    ids=(
+        "state-root",
+        "journal",
+        "personal",
+        "project-lexicon",
+        "project-scan",
+        "preferences",
+        "hotwords",
+    ),
+)
+def test_export_rejects_every_state_owned_destination(tmp_path, relative):
+    store = LearningStore.for_root(tmp_path / "state")
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    prior_journal = store.events_file.read_bytes()
+    destination = store.root if relative is None else store.root / relative
+
+    with pytest.raises(ValueError, match="protected state"):
+        store.export(destination)
+
+    assert store.events_file.read_bytes() == prior_journal
+
+
+def test_export_rejects_destination_symlink(tmp_path):
+    store = LearningStore.for_root(tmp_path / "state")
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    target = tmp_path / "target.jsonl"
+    target.write_text("keep", encoding="utf-8")
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        store.export(alias)
+
+    assert target.read_text("utf-8") == "keep"
+
+
+def test_export_rejects_symlink_alias_into_state_root(tmp_path):
+    store = LearningStore.for_root(tmp_path / "state")
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(store.root, target_is_directory=True)
+    prior_personal = store.personal_file.read_bytes()
+
+    with pytest.raises(ValueError, match="protected state"):
+        store.export(alias / "personal.jsonl")
+
+    assert store.personal_file.read_bytes() == prior_personal
 
 
 def test_unrelated_manual_entries_are_preserved(tmp_path):
@@ -423,6 +578,117 @@ def test_external_same_key_edit_during_active_generation_is_a_conflict(tmp_path)
 
     assert load_jsonl(tmp_path / "personal.jsonl") == (external,)
     assert len(_read_events(tmp_path)) == 1
+
+
+def test_tampered_v1_marker_is_an_external_conflict(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    tampered = replace(
+        store.personal_entries()[0],
+        aliases=("tampered",),
+        notes="external marker edit",
+    )
+    write_jsonl_atomic(store.personal_file, (tampered,))
+    journal = store.events_file.read_bytes()
+
+    with pytest.raises(RuntimeError, match="external edit conflict"):
+        store.observe("seen", "SeenTool", "conversation")
+
+    assert load_jsonl(store.personal_file) == (tampered,)
+    assert store.events_file.read_bytes() == journal
+
+
+def test_tampered_inactive_v1_marker_is_an_external_conflict(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    overlay = store.personal_entries()[0]
+    store.delete("OpenClaw")
+    tampered = replace(
+        overlay,
+        aliases=("tampered",),
+        notes="external marker edit",
+    )
+    write_jsonl_atomic(store.personal_file, (tampered,))
+    journal = store.events_file.read_bytes()
+
+    with pytest.raises(RuntimeError, match="external edit conflict"):
+        store.export(tmp_path / "export.jsonl")
+
+    assert load_jsonl(store.personal_file) == (tampered,)
+    assert store.events_file.read_bytes() == journal
+
+
+def test_missing_nonempty_baseline_is_an_external_conflict(tmp_path):
+    baseline = _manual_entry(
+        aliases=("manual",),
+        source="manual",
+        notes="must not be silently discarded",
+    )
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (baseline,))
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    store.personal_file.unlink()
+    journal = store.events_file.read_bytes()
+
+    with pytest.raises(RuntimeError, match="external edit conflict"):
+        store.observe("seen", "SeenTool", "conversation")
+
+    assert not store.personal_file.exists()
+    assert store.events_file.read_bytes() == journal
+
+
+def test_duplicate_baseline_uses_last_record_and_preserves_all_records(tmp_path):
+    first = _manual_entry(aliases=("first",), source="manual", notes="first")
+    last = _manual_entry(aliases=("last",), source=None, notes="last")
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (first, last))
+    store = LearningStore.for_root(tmp_path)
+
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+
+    entries = load_jsonl(tmp_path / "personal.jsonl")
+    assert entries[0] == first
+    assert entries[1].aliases == ("last", "learned")
+    assert _read_events(tmp_path)[0]["baseline"]["notes"] == "last"
+
+
+def test_unrelated_duplicate_records_survive_materialization(tmp_path):
+    first = _manual_entry(
+        "OtherTool",
+        aliases=("first",),
+        source="manual",
+        notes="first",
+    )
+    last = _manual_entry(
+        "OtherTool",
+        aliases=("last",),
+        source=None,
+        notes="last",
+    )
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (first, last))
+
+    LearningStore.for_root(tmp_path).confirm(
+        "learned", "OpenClaw", Scope.PERSONAL
+    )
+
+    entries = load_jsonl(tmp_path / "personal.jsonl")
+    assert entries[:2] == (first, last)
+    assert entries[2].canonical == "OpenClaw"
+
+
+def test_active_overlay_preserves_earlier_same_key_duplicate(tmp_path):
+    store = LearningStore.for_root(tmp_path)
+    store.confirm("learned", "OpenClaw", Scope.PERSONAL)
+    overlay = store.personal_entries()[0]
+    shadowed = _manual_entry(
+        aliases=("shadowed",),
+        source=None,
+        notes="shadowed",
+    )
+    write_jsonl_atomic(store.personal_file, (shadowed, overlay))
+
+    store.observe("seen", "SeenTool", "conversation")
+
+    assert load_jsonl(store.personal_file) == (shadowed, overlay)
 
 
 def test_unrelated_external_edit_is_preserved_during_active_replay(tmp_path):
