@@ -1,5 +1,7 @@
 """Security, transaction, and recovery tests for public hotword updates."""
 
+import ctypes
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -502,20 +504,20 @@ def test_corrupt_receipt_cannot_block_an_authoritative_current_pointer(tmp_path)
     assert json.loads(receipt.read_text(encoding="utf-8"))["version"] == "2026.07.29"
 
 
-def test_same_version_late_worker_cannot_regress_receipt_or_current_timestamp(tmp_path):
+def test_same_version_late_worker_preserves_newer_authoritative_timestamp(tmp_path):
     paths = paths_for(tmp_path)
     data = hotword_data()
-    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+    later = NOW + timedelta(days=1)
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), later).status is (
         UpdateStatus.UPDATED
     )
-    later = NOW + timedelta(days=1)
     receipt = paths.hotwords_file.parent / "last-update.json"
     receipt.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "version": "2026.07.29",
-                "last_check": later.isoformat(),
+                "last_check": NOW.isoformat(),
             }
         ),
         encoding="utf-8",
@@ -530,7 +532,29 @@ def test_same_version_late_worker_cannot_regress_receipt_or_current_timestamp(tm
     assert current["last_check"] == later.isoformat()
 
 
-def test_implausibly_future_receipt_is_ignored_before_throttle_or_commit(tmp_path):
+def test_near_future_receipt_does_not_throttle_a_nonforced_check(tmp_path):
+    paths = paths_for(tmp_path)
+    paths.hotwords_file.parent.mkdir(parents=True)
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": None,
+                "last_check": (NOW + timedelta(minutes=4)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    unavailable = FakeTransport({MANIFEST_URL: OSError("offline")})
+
+    result = update_hotwords(paths, MANIFEST_URL, unavailable, NOW)
+
+    assert result.status is UpdateStatus.REJECTED
+    assert unavailable.calls == [MANIFEST_URL]
+
+
+def test_near_future_receipt_cannot_promote_authoritative_time_when_forced(tmp_path):
     paths = paths_for(tmp_path)
     data = hotword_data()
     assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
@@ -542,9 +566,7 @@ def test_implausibly_future_receipt_is_ignored_before_throttle_or_commit(tmp_pat
             {
                 "schema_version": 1,
                 "version": "2026.07.29",
-                "last_check": (
-                    datetime.now(timezone.utc) + timedelta(days=366 * 6)
-                ).isoformat(),
+                "last_check": (NOW + timedelta(minutes=4)).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -555,6 +577,76 @@ def test_implausibly_future_receipt_is_ignored_before_throttle_or_commit(tmp_pat
     assert result.status is UpdateStatus.CURRENT
     receipt_state = json.loads(receipt.read_text(encoding="utf-8"))
     assert receipt_state["last_check"] == NOW.isoformat()
+    current = json.loads((paths.hotwords_file.parent / "current.json").read_text())
+    assert current["last_check"] == NOW.isoformat()
+
+
+def test_receipt_directory_cannot_disable_authoritative_resolution(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Authoritative")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.unlink()
+    receipt.mkdir()
+
+    resolved = updater_module.resolve_hotword_file(paths)
+
+    assert resolved == paths.hotwords_file
+    assert resolved.read_bytes() == data
+    assert receipt.is_dir()
+
+
+def test_receipt_directory_cannot_block_a_forced_current_update(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data()
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.unlink()
+    receipt.mkdir()
+    transport = transport_for(data)
+
+    result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
+
+    assert result.status is UpdateStatus.CURRENT
+    assert transport.calls == [MANIFEST_URL]
+    assert receipt.is_dir()
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "0001-01-01T00:00:00+23:59",
+        "9999-12-31T23:59:59.999999-23:59",
+    ],
+)
+def test_extreme_offset_receipt_cannot_disable_authoritative_resolution(
+    tmp_path, timestamp
+):
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Authoritative")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    receipt = paths.hotwords_file.parent / "last-update.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": "2026.07.29",
+                "last_check": timestamp,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = updater_module.resolve_hotword_file(paths)
+
+    assert resolved == paths.hotwords_file
+    assert resolved.read_bytes() == data
 
 
 def test_network_timeout_records_a_failed_attempt_and_is_throttled(tmp_path):
@@ -675,6 +767,227 @@ def test_busy_cross_process_lock_is_bounded_and_does_not_break_owner(tmp_path):
         ).status
         is UpdateStatus.UPDATED
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows kernel mutex behavior")
+def test_windows_extended_path_alias_contends_on_the_same_global_mutex(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    paths = paths_for(tmp_path)
+    holder = context.Process(
+        target=_child_hold_lock, args=(str(paths.root), ready, release)
+    )
+    holder.start()
+    assert ready.wait(10)
+    extended_root = Path("\\\\?\\" + str(paths.root))
+    alias_paths = StatePaths(root=extended_root)
+    transport = transport_for(hotword_data())
+
+    blocked = update_hotwords(
+        alias_paths, MANIFEST_URL, transport, NOW, force=True
+    )
+
+    assert blocked.status is UpdateStatus.REJECTED
+    assert transport.calls == []
+    assert holder.is_alive()
+    release.set()
+    holder.join(10)
+    assert holder.exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path normalization")
+def test_windows_mutex_name_normalizes_drive_and_unc_aliases(tmp_path):
+    root = tmp_path / "state"
+    root.mkdir()
+    normal = StatePaths(root=root)
+    extended = StatePaths(root=Path("\\\\?\\" + str(root)))
+
+    assert updater_module._windows_mutex_name(normal) == (
+        updater_module._windows_mutex_name(extended)
+    )
+    assert updater_module._windows_mutex_name(normal).startswith("Global\\")
+    assert updater_module._normalize_windows_path_for_lock(
+        r"\\Server\Share\State"
+    ) == updater_module._normalize_windows_path_for_lock(
+        r"\\?\UNC\server/share/state"
+    )
+
+
+class _FakeWaitKernel:
+    def __init__(self, result, error=0):
+        self.result = result
+        self.error = error
+
+    def WaitForSingleObject(self, handle, milliseconds):
+        ctypes.set_last_error(self.error)
+        return self.result
+
+
+class _FakeCreateMutexKernel:
+    def __init__(self, *, opened_handle, open_error=0):
+        self.opened_handle = opened_handle
+        self.open_error = open_error
+        self.opened = []
+
+    def CreateMutexW(self, security, initially_owned, name):
+        ctypes.set_last_error(5)
+        return 0
+
+    def OpenMutexW(self, access, inherit_handle, name):
+        self.opened.append((access, inherit_handle, name))
+        ctypes.set_last_error(self.open_error)
+        return self.opened_handle
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows mutex access handling")
+def test_windows_create_access_denied_opens_existing_global_mutex():
+    kernel = _FakeCreateMutexKernel(opened_handle=91)
+
+    handle = updater_module._create_windows_mutex(kernel, "Global\\test-mutex")
+
+    assert handle == 91
+    assert kernel.opened == [(0x00100001, False, "Global\\test-mutex")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows mutex access handling")
+def test_windows_existing_mutex_access_denied_surfaces_native_error():
+    kernel = _FakeCreateMutexKernel(opened_handle=0, open_error=5)
+
+    with pytest.raises(OSError) as exc_info:
+        updater_module._create_windows_mutex(kernel, "Global\\test-mutex")
+
+    assert exc_info.value.winerror == 5
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows wait result handling")
+def test_windows_wait_failed_surfaces_get_last_error_as_oserror():
+    kernel = _FakeWaitKernel(0xFFFFFFFF, error=5)
+
+    with pytest.raises(OSError) as exc_info:
+        updater_module._wait_for_windows_mutex(kernel, 1, 10)
+
+    assert exc_info.value.winerror == 5
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows wait result handling")
+def test_windows_wait_timeout_is_distinct_but_abandoned_mutex_is_acquired():
+    with pytest.raises(updater_module.UpdateLockTimeout):
+        updater_module._wait_for_windows_mutex(_FakeWaitKernel(0x102), 1, 10)
+
+    updater_module._wait_for_windows_mutex(_FakeWaitKernel(0x80), 1, 10)
+
+
+def test_posix_lock_name_is_independent_of_hotword_directory_replacement(tmp_path):
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    hotwords = paths.hotwords_file.parent
+    hotwords.mkdir()
+    before = updater_module._posix_lock_name(paths)
+    moved = paths.root / "old-hotwords"
+    hotwords.rename(moved)
+    hotwords.mkdir()
+
+    after = updater_module._posix_lock_name(paths)
+
+    assert after == before
+    assert after.startswith("update-")
+    assert after.endswith(".lock")
+
+
+def test_posix_control_directory_is_outside_configured_state(tmp_path):
+    paths = paths_for(tmp_path)
+
+    control = updater_module._posix_control_directory(
+        environ={}, home=tmp_path / "home"
+    )
+
+    assert control.is_absolute()
+    assert not control.is_relative_to(paths.root)
+
+
+@pytest.mark.parametrize(
+    ("error_number", "expected"),
+    [
+        (errno.EACCES, True),
+        (errno.EAGAIN, True),
+        (getattr(errno, "EWOULDBLOCK", errno.EAGAIN), True),
+        (errno.EIO, False),
+        (errno.EBADF, False),
+    ],
+)
+def test_posix_lock_retries_only_contention_errors(error_number, expected):
+    assert updater_module._posix_lock_error_is_contention(error_number) is expected
+
+
+def test_posix_lock_loop_raises_noncontention_native_error_without_retry():
+    calls = 0
+
+    def fail_with_io_error(descriptor):
+        nonlocal calls
+        calls += 1
+        raise OSError(errno.EIO, "injected I/O failure")
+
+    with pytest.raises(OSError) as exc_info:
+        updater_module._acquire_posix_lock(7, 1.0, fail_with_io_error)
+
+    assert exc_info.value.errno == errno.EIO
+    assert calls == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock behavior")
+def test_posix_lock_survives_hotword_directory_rename_and_replacement(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    paths = paths_for(tmp_path)
+    holder = context.Process(
+        target=_child_hold_lock, args=(str(paths.root), ready, release)
+    )
+    holder.start()
+    assert ready.wait(10)
+    hotwords = paths.hotwords_file.parent
+    moved = paths.root / "hotwords-held"
+    hotwords.rename(moved)
+    hotwords.mkdir()
+    transport = transport_for(hotword_data())
+
+    blocked = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
+
+    assert blocked.status is UpdateStatus.REJECTED
+    assert transport.calls == []
+    assert holder.is_alive()
+    release.set()
+    holder.join(10)
+    assert holder.exitcode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink and flock behavior")
+def test_posix_symlink_state_alias_contends_on_the_same_control_lock(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    alias_root = tmp_path / "state-alias"
+    alias_root.symlink_to(paths.root, target_is_directory=True)
+    holder = context.Process(
+        target=_child_hold_lock, args=(str(paths.root), ready, release)
+    )
+    holder.start()
+    assert ready.wait(10)
+    transport = transport_for(hotword_data())
+
+    blocked = update_hotwords(
+        StatePaths(root=alias_root), MANIFEST_URL, transport, NOW, force=True
+    )
+
+    assert blocked.status is UpdateStatus.REJECTED
+    assert transport.calls == []
+    assert holder.is_alive()
+    release.set()
+    holder.join(10)
+    assert holder.exitcode == 0
 
 
 def test_replacing_a_legacy_lock_path_cannot_split_the_os_lease(tmp_path):

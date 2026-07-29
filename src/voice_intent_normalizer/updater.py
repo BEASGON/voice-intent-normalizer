@@ -1,21 +1,27 @@
 """Safe, recoverable retrieval of the public hotword lexicon.
 
 The transport receives only already allowlisted public URLs.  The updater never
-sends local lexicons, project data, or user input over the network.
+sends local lexicons, project data, or user input over the network. POSIX
+coordination lives in an owner-only control root outside updateable state.
+Replacing that verified root requires the same user's authority and is outside
+the lock's threat model; ordinary state-directory replacement remains safe.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
+import ntpath
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
 import unicodedata
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -54,6 +60,7 @@ _MAX_URL_LENGTH = 4096
 _MAX_REDIRECTS = 10
 _MAX_RETAINED_PAYLOADS = 4
 _UPDATE_INTERVAL = timedelta(days=1)
+_RECEIPT_CLOCK_SKEW = timedelta(minutes=5)
 _LOCK_TIMEOUT_SECONDS = 2.0
 _LOCK_RETRY_SECONDS = 0.02
 _STATE_SCHEMA_VERSION = 1
@@ -130,9 +137,9 @@ def update_hotwords(
                 UpdateStatus.REJECTED, message="manifest source rejected"
             )
         with _update_lock(paths):
-            current = _recover_locked(paths)
+            current = _recover_locked(paths, checked_at)
             if not force and _check_is_recent(
-                current, _read_attempt_or_none(paths), checked_at
+                current, _read_attempt_or_none(paths, checked_at), checked_at
             ):
                 return UpdateResult(
                     UpdateStatus.SKIPPED,
@@ -145,7 +152,7 @@ def update_hotwords(
         )
         candidate_version = manifest.version
         with _update_lock(paths):
-            current = _recover_locked(paths)
+            current = _recover_locked(paths, checked_at)
             checked_at = _merged_check_time(paths, current, checked_at)
             immediate = _decide_known_version(paths, current, manifest, checked_at)
             if immediate is not None:
@@ -157,7 +164,7 @@ def update_hotwords(
         _validate_hotword_jsonl(data)
 
         with _update_lock(paths):
-            current = _recover_locked(paths)
+            current = _recover_locked(paths, checked_at)
             checked_at = _merged_check_time(paths, current, checked_at)
             immediate = _decide_known_version(paths, current, manifest, checked_at)
             if immediate is not None:
@@ -169,7 +176,7 @@ def update_hotwords(
         if candidate_version is not None and not isinstance(exc, UpdateLockTimeout):
             try:
                 with _update_lock(paths):
-                    current = _recover_locked(paths)
+                    current = _recover_locked(paths, checked_at)
                     if current is not None and current.version == candidate_version:
                         return UpdateResult(
                             UpdateStatus.UPDATED, version=candidate_version
@@ -221,21 +228,18 @@ def _decide_known_version(
     return None
 
 
-def _recover_locked(paths: StatePaths) -> _CurrentState | None:
+def _recover_locked(paths: StatePaths, operation_now: datetime) -> _CurrentState | None:
     """Reconcile an interrupted commit before any version decision is made."""
     _ensure_storage(paths)
     current = _read_current(paths)
-    attempt = _read_attempt_or_none(paths)
-    if attempt is None and _attempt_file(paths).exists():
+    attempt = _read_attempt_or_none(paths, operation_now)
+    if attempt is not None and attempt.last_check > operation_now:
+        # A small positive offset can be parsed as clock skew, but advisory
+        # future time is never allowed to throttle or advance authority.
+        attempt = None
+    if attempt is None:
         # Receipts are never authoritative; a verified pointer remains usable.
-        if current is None:
-            attempt = None
-        else:
-            try:
-                _discard_attempt(paths)
-            except ValueError:
-                pass
-            attempt = None
+        _discard_attempt_best_effort(paths)
     try:
         pending = _read_pending(paths)
     except ValueError:
@@ -250,7 +254,7 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
         _remove_pending(paths)
         pending = None
     if current is None:
-        current = _migrate_legacy_locked(paths)
+        current = _migrate_legacy_locked(paths, attempt)
     if current is not None:
         _verify_payload(paths, current)
         _materialize_current(paths, current)
@@ -265,9 +269,10 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
     return current
 
 
-def _migrate_legacy_locked(paths: StatePaths) -> _CurrentState | None:
+def _migrate_legacy_locked(
+    paths: StatePaths, attempt: _AttemptState | None
+) -> _CurrentState | None:
     """Promote a valid pre-transaction Task 7 installation exactly once."""
-    attempt = _read_attempt_or_none(paths)
     if attempt is None:
         return None
     if attempt.version is None:
@@ -421,12 +426,20 @@ def _read_attempt(paths: StatePaths) -> _AttemptState | None:
     return _read_state_file(_attempt_file(paths), _ATTEMPT_FIELDS, _attempt_from_raw)
 
 
-def _read_attempt_or_none(paths: StatePaths) -> _AttemptState | None:
+def _read_attempt_or_none(
+    paths: StatePaths, operation_now: datetime
+) -> _AttemptState | None:
     """Treat the receipt as advisory even when it is malformed or inaccessible."""
     try:
-        return _read_attempt(paths)
-    except ValueError:
+        attempt = _read_attempt(paths)
+    except (OSError, OverflowError, ValueError):
         return None
+    if (
+        attempt is not None
+        and attempt.last_check - operation_now > _RECEIPT_CLOCK_SKEW
+    ):
+        return None
+    return attempt
 
 
 def _read_state_file(path: Path, fields: frozenset[str], parser):
@@ -572,6 +585,14 @@ def _discard_attempt(paths: StatePaths) -> None:
         path.unlink()
 
 
+def _discard_attempt_best_effort(paths: StatePaths) -> None:
+    """Quarantine an invalid receipt only when its path can be removed safely."""
+    try:
+        _discard_attempt(paths)
+    except (OSError, ValueError):
+        return
+
+
 def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
     """Bound immutable payload retention after a verified authoritative commit."""
     directory = _payloads_dir(paths)
@@ -607,8 +628,9 @@ def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
 def resolve_hotword_file(paths: StatePaths) -> Path | None:
     """Return a recovered authoritative cache for LexiconSet, or fail safely."""
     try:
+        operation_now = datetime.now(timezone.utc)
         with _update_lock(paths):
-            current = _recover_locked(paths)
+            current = _recover_locked(paths, operation_now)
             if current is not None:
                 _verify_current_cache(paths, current)
                 return paths.hotwords_file
@@ -627,7 +649,7 @@ def _record_failed_attempt(paths: StatePaths, now: datetime) -> None:
     try:
         checked_at = _utc_now(now)
         with _update_lock(paths, timeout=0.05):
-            current = _recover_locked(paths)
+            current = _recover_locked(paths, checked_at)
             checked_at = _merged_check_time(paths, current, checked_at)
             _write_attempt_best_effort(
                 paths,
@@ -642,7 +664,10 @@ def _check_is_recent(
     current: _CurrentState | None, attempt: _AttemptState | None, now: datetime
 ) -> bool:
     checks = [state.last_check for state in (current, attempt) if state is not None]
-    return bool(checks) and now - max(checks) < _UPDATE_INTERVAL
+    return any(
+        timedelta(0) <= now - checked_at < _UPDATE_INTERVAL
+        for checked_at in checks
+    )
 
 
 def _merged_check_time(
@@ -652,8 +677,8 @@ def _merged_check_time(
     checks = [checked_at]
     if current is not None:
         checks.append(current.last_check)
-    attempt = _read_attempt_or_none(paths)
-    if attempt is not None:
+    attempt = _read_attempt_or_none(paths, checked_at)
+    if attempt is not None and attempt.last_check <= checked_at:
         checks.append(attempt.last_check)
     return max(checks)
 
@@ -684,15 +709,13 @@ def _parse_time(value: object) -> datetime:
         raise ValueError("invalid update check timestamp")
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("update check timestamp must include a timezone")
+        canonical = parsed.astimezone(timezone.utc)
+    except (OSError, OverflowError, ValueError) as exc:
         raise ValueError("invalid update check timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("update check timestamp must include a timezone")
-    canonical = parsed.astimezone(timezone.utc)
     if value != canonical.isoformat():
         raise ValueError("update check timestamp must be canonical UTC")
-    if canonical > datetime.now(timezone.utc) + timedelta(days=366 * 5):
-        raise ValueError("update check timestamp is implausibly far in the future")
     return canonical
 
 
@@ -722,94 +745,408 @@ def _ensure_storage(paths: StatePaths) -> None:
 @contextmanager
 def _update_lock(paths: StatePaths, *, timeout: float | None = None) -> Iterator[None]:
     """Use a stable OS lease, never a replaceable filesystem lock entry."""
-    _ensure_storage(paths)
     if os.name == "nt":
+        # The state root must exist before its stable volume/file identity can
+        # be queried. Directory creation here is idempotent; the mutex protects
+        # every subsequent recovery or mutation.
+        _ensure_storage(paths)
         with _windows_mutex(paths, timeout):
             yield
         return
 
-    # Flocking the state directory inode avoids split-brain if a sibling lock
-    # file is renamed/replaced. The directory is the coordination object.
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(_hotword_dir(paths), flags)
+    with _posix_control_lock(paths, timeout):
+        _ensure_storage(paths)
+        yield
+
+
+@contextmanager
+def _posix_control_lock(paths: StatePaths, timeout: float | None) -> Iterator[None]:
+    """Lock a permanent owner-only control entry outside replaceable state."""
+    control_descriptor = _open_posix_control_directory()
+    lock_descriptor: int | None = None
     acquired = False
     try:
-        _lock_descriptor(descriptor, timeout)
+        flags = os.O_RDWR | os.O_CREAT
+        for required_flag in ("O_CLOEXEC", "O_NOFOLLOW"):
+            if not hasattr(os, required_flag):
+                raise OSError(f"secure POSIX locks require {required_flag}")
+            flags |= getattr(os, required_flag)
+        name = _posix_lock_name(paths)
+        lock_descriptor = os.open(name, flags, 0o600, dir_fd=control_descriptor)
+        descriptor_info = os.fstat(lock_descriptor)
+        entry_info = os.stat(
+            name, dir_fd=control_descriptor, follow_symlinks=False
+        )
+        _verify_posix_lock_file(descriptor_info)
+        descriptor_identity = (descriptor_info.st_dev, descriptor_info.st_ino)
+        if descriptor_identity != (entry_info.st_dev, entry_info.st_ino):
+            raise OSError("POSIX update lock changed during open")
+        _lock_descriptor(lock_descriptor, timeout)
         acquired = True
+        entry_after = os.stat(
+            name, dir_fd=control_descriptor, follow_symlinks=False
+        )
+        if descriptor_identity != (entry_after.st_dev, entry_after.st_ino):
+            raise OSError("POSIX update lock changed during acquisition")
         yield
     finally:
         try:
-            if acquired:
-                _unlock_descriptor(descriptor)
+            if acquired and lock_descriptor is not None:
+                _unlock_descriptor(lock_descriptor)
         finally:
-            os.close(descriptor)
+            if lock_descriptor is not None:
+                os.close(lock_descriptor)
+            os.close(control_descriptor)
+
+
+def _posix_control_directory(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: str | Path | None = None,
+) -> Path:
+    """Choose one per-user control root outside any configured state tree."""
+    environment = os.environ if environ is None else environ
+    runtime = environment.get("XDG_RUNTIME_DIR", "")
+    if runtime and Path(runtime).is_absolute():
+        parent = Path(os.path.realpath(runtime))
+    else:
+        user_home = Path.home() if home is None else Path(home)
+        parent = Path(os.path.realpath(user_home.expanduser().absolute()))
+    return parent / ".voice-intent-normalizer-locks"
+
+
+def _open_posix_control_directory() -> int:
+    """Create and verify the private root, then return a no-follow dir handle."""
+    directory = _posix_control_directory()
+    parent_info = os.stat(directory.parent)
+    _verify_posix_control_parent(parent_info)
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY
+    for required_flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+        if not hasattr(os, required_flag):
+            raise OSError(f"secure POSIX control roots require {required_flag}")
+        flags |= getattr(os, required_flag)
+    before = os.stat(directory, follow_symlinks=False)
+    descriptor = os.open(directory, flags)
+    try:
+        descriptor_info = os.fstat(descriptor)
+        after = os.stat(directory, follow_symlinks=False)
+        _verify_posix_control_root(descriptor_info)
+        identity = (descriptor_info.st_dev, descriptor_info.st_ino)
+        if identity != (before.st_dev, before.st_ino) or identity != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise OSError("POSIX control root changed during open")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _verify_posix_control_parent(info: os.stat_result) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError("POSIX control parent must be a directory")
+    if info.st_uid != os.geteuid():
+        raise PermissionError("POSIX control parent is not owned by this user")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise PermissionError("POSIX control parent must not be group/world writable")
+
+
+def _verify_posix_control_root(info: os.stat_result) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError("POSIX control root must be a directory")
+    if info.st_uid != os.geteuid():
+        raise PermissionError("POSIX control root is not owned by this user")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077 or mode & 0o700 != 0o700:
+        raise PermissionError("POSIX control root must have mode 0700")
+
+
+def _verify_posix_lock_file(info: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("POSIX update lock must be a regular file")
+    if info.st_uid != os.geteuid():
+        raise PermissionError("POSIX update lock is not owned by this user")
+    if info.st_nlink != 1:
+        raise PermissionError("POSIX update lock must not be hard-linked")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise PermissionError("POSIX update lock must not grant group/world access")
+
+
+def _posix_lock_name(paths: StatePaths) -> str:
+    """Key the external lock by the canonical configured state-root identity."""
+    identity = os.path.normpath(
+        os.path.realpath(os.path.abspath(os.fspath(paths.root)))
+    )
+    digest = hashlib.sha256(os.fsencode(identity)).hexdigest()
+    return f"update-{digest}.lock"
 
 
 @contextmanager
 def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
-    """Use a kernel mutex so no path rename or reparse point can split a lease."""
+    """Use one cross-session kernel mutex for every alias of a state directory."""
     import ctypes
+    from ctypes import wintypes
 
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
-    kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
-    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    name = "Local\\voice-intent-normalizer-" + hashlib.sha256(
-        str(_hotword_dir(paths).resolve()).encode("utf-8")
-    ).hexdigest()
-    handle = kernel32.CreateMutexW(None, False, name)
-    if not handle:
-        raise OSError("unable to create update mutex")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.OpenMutexW.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    name = _windows_mutex_name(paths)
+    handle = _create_windows_mutex(kernel32, name)
     milliseconds = int(
         1000 * (_LOCK_TIMEOUT_SECONDS if timeout is None else timeout)
     )
-    result = kernel32.WaitForSingleObject(handle, milliseconds)
-    acquired = result in {0, 0x80}
+    acquired = False
     try:
-        if not acquired:
-            raise UpdateLockTimeout("hotword update mutex is busy")
+        _wait_for_windows_mutex(kernel32, handle, milliseconds)
+        acquired = True
         yield
     finally:
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
         if acquired:
-            kernel32.ReleaseMutex(handle)
-        kernel32.CloseHandle(handle)
+            ctypes.set_last_error(0)
+            if not kernel32.ReleaseMutex(handle):
+                cleanup_error = ctypes.WinError(ctypes.get_last_error())
+        ctypes.set_last_error(0)
+        if not kernel32.CloseHandle(handle) and cleanup_error is None:
+            cleanup_error = ctypes.WinError(ctypes.get_last_error())
+        if cleanup_error is not None and not active_exception:
+            raise cleanup_error
+
+
+def _create_windows_mutex(kernel32, name: str) -> int:
+    """Create or securely open the existing mutex, preserving native errors."""
+    import ctypes
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, False, name)
+    if handle:
+        return handle
+    error = ctypes.get_last_error()
+    if error != 5:
+        raise ctypes.WinError(error)
+    # An existing Global object may deny creation while still allowing this
+    # user to open synchronization and release rights.
+    handle = kernel32.OpenMutexW(0x00100001, False, name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+def _wait_for_windows_mutex(kernel32, handle: int, milliseconds: int) -> None:
+    """Acquire or raise the precise Win32 timeout/native failure."""
+    import ctypes
+
+    ctypes.set_last_error(0)
+    result = kernel32.WaitForSingleObject(handle, milliseconds)
+    if result in {0, 0x80}:  # WAIT_OBJECT_0 or recovered WAIT_ABANDONED
+        return
+    if result == 0x102:  # WAIT_TIMEOUT
+        raise UpdateLockTimeout("hotword update mutex is busy")
+    if result == 0xFFFFFFFF:  # WAIT_FAILED
+        error = ctypes.get_last_error()
+        raise ctypes.WinError(error or 31)
+    raise OSError(f"unexpected Windows mutex wait result: {result:#x}")
+
+
+def _windows_mutex_name(paths: StatePaths) -> str:
+    """Derive a collision-resistant Global name from volume and directory ID."""
+    identity = _windows_directory_identity(paths.root)
+    digest = hashlib.sha256(
+        f"voice-intent-normalizer-state-v1:{identity}".encode("ascii")
+    ).hexdigest()
+    return f"Global\\voice-intent-normalizer-update-{digest}"
+
+
+def _normalize_windows_path_for_lock(value: str | Path) -> str:
+    """Normalize drive, separator, extended-drive, and extended-UNC aliases."""
+    return ntpath.normcase(_absolute_windows_path(value))
+
+
+def _absolute_windows_path(value: str | Path) -> str:
+    """Remove Win32 extended prefixes while preserving case for native opens."""
+    path = str(value).replace("/", "\\")
+    folded = path.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        path = "\\\\" + path[8:]
+    elif folded.startswith("\\\\?\\"):
+        path = path[4:]
+    path = ntpath.abspath(path)
+    return ntpath.normpath(path)
+
+
+def _extended_windows_path(value: str | Path) -> str:
+    """Return an absolute extended path for native no-follow directory opening."""
+    normalized = _absolute_windows_path(value)
+    if normalized.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + normalized[2:]
+    return "\\\\?\\" + normalized
+
+
+def _windows_directory_identity(path: Path) -> str:
+    """Query the volume serial and stable file ID through a no-follow handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileId128(ctypes.Structure):
+        _fields_ = [("identifier", ctypes.c_ubyte * 16)]
+
+    class _FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("volume_serial_number", ctypes.c_ulonglong),
+            ("file_id", _FileId128),
+        ]
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x80,  # FILE_READ_ATTRIBUTES
+        0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    failure: OSError | None = None
+    identity: str | None = None
+    try:
+        file_id = _FileIdInfo()
+        ctypes.set_last_error(0)
+        if kernel32.GetFileInformationByHandleEx(
+            handle, 18, ctypes.byref(file_id), ctypes.sizeof(file_id)
+        ):
+            identity = (
+                f"{file_id.volume_serial_number:016x}:"
+                f"{bytes(file_id.file_id.identifier).hex()}"
+            )
+        else:
+            extended_error = ctypes.get_last_error()
+            if extended_error not in {1, 50, 87, 120}:
+                raise ctypes.WinError(extended_error)
+            legacy = _ByHandleFileInformation()
+            ctypes.set_last_error(0)
+            if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(legacy)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            file_index = (legacy.file_index_high << 32) | legacy.file_index_low
+            identity = f"{legacy.volume_serial_number:08x}:{file_index:016x}"
+    except OSError as exc:
+        failure = exc
+    finally:
+        ctypes.set_last_error(0)
+        if not kernel32.CloseHandle(handle) and failure is None:
+            failure = ctypes.WinError(ctypes.get_last_error())
+    if failure is not None:
+        raise failure
+    if identity is None:
+        raise OSError("Windows directory identity query returned no identity")
+    return identity
 
 
 def _lock_descriptor(descriptor: int, timeout: float | None = None) -> None:
+    import fcntl
+
+    def acquire(target: int) -> None:
+        fcntl.flock(target, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    _acquire_posix_lock(descriptor, timeout, acquire)
+
+
+def _acquire_posix_lock(
+    descriptor: int,
+    timeout: float | None,
+    lock_operation: Callable[[int], None],
+) -> None:
     deadline = time.monotonic() + (
         _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
     )
     while True:
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_operation(descriptor)
             return
         except OSError as exc:
+            if not _posix_lock_error_is_contention(exc.errno):
+                raise
             if time.monotonic() >= deadline:
                 raise UpdateLockTimeout("hotword update lock is busy") from exc
             time.sleep(_LOCK_RETRY_SECONDS)
 
 
 def _unlock_descriptor(descriptor: int) -> None:
-    if os.name == "nt":
-        import msvcrt
+    import fcntl
 
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
 
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+def _posix_lock_error_is_contention(error_number: int | None) -> bool:
+    return error_number in {
+        errno.EACCES,
+        errno.EAGAIN,
+        getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+    }
 
 
 def _read_json_file(path: Path, limit: int) -> object:
