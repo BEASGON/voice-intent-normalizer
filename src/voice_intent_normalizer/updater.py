@@ -486,6 +486,7 @@ def _compare_versions(candidate: str, installed: str) -> int:
 
 
 def _valid_version(value: object) -> bool:
+    """Accept only calendar releases as ``YYYY.MM.DD`` for numeric ordering."""
     if not isinstance(value, str) or _VERSION_PATTERN.fullmatch(value) is None:
         return False
     try:
