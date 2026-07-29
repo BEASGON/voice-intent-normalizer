@@ -250,6 +250,159 @@ def test_undo_restores_the_exact_manual_entry_overlaid_by_learning(tmp_path):
     assert load_jsonl(paths.personal_file) == (manual_entry,)
 
 
+def test_new_overlay_generation_uses_current_manual_baseline(tmp_path):
+    """Catch a completed overlay generation replaying its stale first baseline."""
+    store = LearningStore.for_root(tmp_path)
+    initial = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("manual v0",),
+        domains=("ai",),
+        weight=0.7,
+        status=EntryStatus.CURATED,
+        source="manual",
+        notes="v0",
+    )
+    tmp_path.mkdir(exist_ok=True)
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (initial,))
+    store.confirm("learned v0", "OpenClaw", Scope.PERSONAL)
+    store.delete("OpenClaw")
+    updated = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("manual v1",),
+        domains=("software-development",),
+        weight=0.9,
+        status=EntryStatus.CURATED,
+        source="manual",
+        notes="v1",
+    )
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (updated,))
+
+    store.confirm("learned v1", "OpenClaw", Scope.PERSONAL)
+
+    overlaid = load_jsonl(tmp_path / "personal.jsonl")[0]
+    assert overlaid.aliases == ("manual v1", "learned v1")
+    assert overlaid.domains == ("software-development",)
+    assert overlaid.weight == 1.0
+    assert overlaid.notes == "v1"
+    store.delete("OpenClaw")
+    assert load_jsonl(tmp_path / "personal.jsonl") == (updated,)
+
+
+def test_unrelated_learning_rebuild_keeps_active_overlay_generation(tmp_path):
+    """Catch another mapping rebuild replacing an active overlay's baseline."""
+    store = LearningStore.for_root(tmp_path)
+    manual_entry = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("manual alias",),
+        domains=("ai",),
+        weight=0.8,
+        status=EntryStatus.CURATED,
+        source="manual",
+        notes="manual",
+    )
+    tmp_path.mkdir(exist_ok=True)
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (manual_entry,))
+    store.confirm("learned alias", "OpenClaw", Scope.PERSONAL)
+
+    store.confirm("other alias", "OtherTool", Scope.PERSONAL)
+
+    entries = {
+        entry.canonical: entry for entry in load_jsonl(tmp_path / "personal.jsonl")
+    }
+    assert entries["OpenClaw"].aliases == ("manual alias", "learned alias")
+    assert entries["OpenClaw"].domains == ("ai",)
+    assert entries["OpenClaw"].notes == "manual"
+    assert entries["OtherTool"].aliases == ("other alias",)
+
+
+def test_undo_migrates_pre_snapshot_merged_mapping_conservatively(tmp_path):
+    """Catch undo retaining a learned alias in valid pre-snapshot state."""
+    manual_merged = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("curated alias", "learned alias"),
+        domains=("ai",),
+        weight=1.0,
+        status=EntryStatus.CONFIRMED,
+        source="manual",
+        notes="manual provenance",
+    )
+    tmp_path.mkdir(exist_ok=True)
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (manual_merged,))
+    prior_event = {
+        "action": "confirm",
+        "alias": "learned alias",
+        "canonical": "OpenClaw",
+        "event_id": "prior-confirm",
+        "project_id": None,
+        "scope": "personal",
+        "source": None,
+        "status": "confirmed",
+        "timestamp": "2026-07-29T00:00:00.000000Z",
+    }
+    (tmp_path / "learning-events.jsonl").write_text(
+        json.dumps(prior_event) + "\n", encoding="utf-8"
+    )
+
+    LearningStore.for_root(tmp_path).undo_last()
+
+    migrated = load_jsonl(tmp_path / "personal.jsonl")[0]
+    assert migrated.aliases == ("curated alias",)
+    assert migrated.domains == ("ai",)
+    assert migrated.weight == 1.0
+    assert migrated.source == "manual"
+    assert migrated.notes == "manual provenance"
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "learning-events.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert audit[-1]["migration_fallback"] == "remove-historical-learning-aliases"
+
+
+def test_delete_migrates_pre_snapshot_merged_rejection_conservatively(tmp_path):
+    """Catch delete retaining a historical negative mapping without a baseline."""
+    manual_merged = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("curated alias", "OpenClaw"),
+        domains=("ai",),
+        weight=1.0,
+        status=EntryStatus.REJECTED,
+        source="manual",
+        negative_aliases=("龙虾",),
+    )
+    tmp_path.mkdir(exist_ok=True)
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (manual_merged,))
+    prior_event = {
+        "action": "reject",
+        "alias": "龙虾",
+        "canonical": "OpenClaw",
+        "event_id": "prior-reject",
+        "project_id": None,
+        "scope": "personal",
+        "source": None,
+        "status": "rejected",
+        "timestamp": "2026-07-29T00:00:00.000000Z",
+    }
+    (tmp_path / "learning-events.jsonl").write_text(
+        json.dumps(prior_event) + "\n", encoding="utf-8"
+    )
+
+    LearningStore.for_root(tmp_path).delete("OpenClaw")
+
+    migrated = load_jsonl(tmp_path / "personal.jsonl")[0]
+    assert migrated.aliases == ("curated alias", "OpenClaw")
+    assert migrated.negative_aliases == ()
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "learning-events.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert audit[-1]["migration_fallback"] == "remove-historical-learning-aliases"
+
+
 def test_rejected_mapping_suppresses_the_same_lower_layer_mapping(tmp_path):
     """Catch a personal rejection that leaves a base alias eligible to apply."""
     paths = StatePaths.resolve(

@@ -172,6 +172,7 @@ class LearningStore:
             scope=event.scope,
             project_id=event.project_id,
             target_event_id=event.event_id,
+            migration_fallback=self._migration_fallback_for((target,)),
         )
         self._materialize()
         return event
@@ -204,6 +205,13 @@ class LearningStore:
             canonical,
             status=EntryStatus.CONFIRMED,
             target_event_ids=targets,
+            migration_fallback=self._migration_fallback_for(
+                tuple(
+                    event
+                    for event in self._active_mapping_events()
+                    if event["event_id"] in targets
+                )
+            ),
         )
         self._materialize()
         return event
@@ -225,6 +233,7 @@ class LearningStore:
         project_id: str | None = None,
         source: str | None = None,
         baseline: LexiconEntry | None = None,
+        migration_fallback: str | None = None,
         target_event_id: str | None = None,
         target_event_ids: list[str] | None = None,
     ) -> LearningEvent:
@@ -261,6 +270,8 @@ class LearningStore:
             raw["target_event_ids"] = target_event_ids
         if baseline is not None:
             raw["baseline"] = _entry_snapshot(baseline)
+        if migration_fallback is not None:
+            raw["migration_fallback"] = migration_fallback
         self.root.mkdir(parents=True, exist_ok=True)
         with self.events_file.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(raw, ensure_ascii=False, sort_keys=True) + "\n")
@@ -344,6 +355,32 @@ class LearningStore:
             return entry
         return None
 
+    def _migration_fallback_for(self, events: tuple[dict[str, Any], ...]) -> str | None:
+        """Record when pre-snapshot state needs conservative contribution removal."""
+        for event in events:
+            if event.get("baseline") is not None:
+                continue
+            scope = Scope(event["scope"])
+            project_id = event.get("project_id")
+            path = self.personal_file
+            if scope is Scope.PROJECT:
+                assert project_id is not None
+                path = self.root / "projects" / project_id / "project.jsonl"
+            if not path.is_file():
+                continue
+            key = (event["canonical"], scope, project_id)
+            for entry in load_jsonl(path, expected_scope=scope):
+                if _entry_key(entry) != key or entry.source == _LEARNING_SOURCE:
+                    continue
+                values = (
+                    entry.aliases
+                    if event["action"] == "confirm"
+                    else entry.negative_aliases
+                )
+                if event["alias"] in values:
+                    return "remove-historical-learning-aliases"
+        return None
+
     def _materialize(self) -> None:
         events = self._events()
         entries_by_scope: dict[tuple[Scope, str | None], list[LexiconEntry]] = {}
@@ -351,14 +388,14 @@ class LearningStore:
         for event in events:
             if event.get("action") == "confirm" and event.get("scope") == "project":
                 project_ids.add(_project_id(event.get("project_id")))
-        for entry in _entries_from_learning_events(
-            self._active_mapping_events(), _LEARNING_SOURCE
-        ):
+        active_events = self._active_mapping_events()
+        for entry in _entries_from_learning_events(active_events, _LEARNING_SOURCE):
             entries_by_scope.setdefault((entry.scope, entry.project_id), []).append(
                 entry
             )
-        baselines = self._baselines(events)
+        baselines = self._baselines(events, active_events)
         legacy_entries = self._legacy_owned_entries(events)
+        fallbacks = self._migration_fallbacks(events)
 
         personal_entries = entries_by_scope.get((Scope.PERSONAL, None), [])
         self._write_entries(
@@ -369,6 +406,7 @@ class LearningStore:
                 personal_entries,
                 baselines,
                 legacy_entries,
+                fallbacks,
             ),
         )
         for project_id in project_ids:
@@ -381,6 +419,7 @@ class LearningStore:
                     entries_by_scope.get((Scope.PROJECT, project_id), []),
                     baselines,
                     legacy_entries,
+                    fallbacks,
                 ),
             )
 
@@ -391,6 +430,7 @@ class LearningStore:
         learned_entries: list[LexiconEntry],
         baselines: dict[tuple[str, Scope, str | None], LexiconEntry],
         legacy_entries: dict[tuple[str, Scope, str | None], LexiconEntry],
+        fallbacks: dict[tuple[str, Scope, str | None], tuple[dict[str, Any], ...]],
     ) -> list[LexiconEntry]:
         current = (
             ()
@@ -412,6 +452,14 @@ class LearningStore:
         for key, baseline in baselines.items():
             if baseline.scope is scope and (key in learned_keys or key in owned_keys):
                 merged[key] = baseline
+        for key, events in fallbacks.items():
+            if key in learned_keys or key not in merged:
+                continue
+            migrated = _remove_historical_contributions(merged[key], events)
+            if migrated is None:
+                del merged[key]
+            else:
+                merged[key] = migrated
         for entry in learned_entries:
             key = _entry_key(entry)
             previous = merged.get(key)
@@ -421,15 +469,51 @@ class LearningStore:
     @staticmethod
     def _baselines(
         events: list[dict[str, Any]],
+        active_events: list[dict[str, Any]],
     ) -> dict[tuple[str, Scope, str | None], LexiconEntry]:
         baselines: dict[tuple[str, Scope, str | None], LexiconEntry] = {}
+        active_ids = {event["event_id"] for event in active_events}
         for event in events:
+            if event["event_id"] not in active_ids:
+                continue
+            raw_baseline = event.get("baseline")
+            if raw_baseline is None:
+                continue
+            baseline = parse_entry(raw_baseline)
+            baselines.setdefault(_entry_key(baseline), baseline)
+        for event in reversed(events):
             raw_baseline = event.get("baseline")
             if raw_baseline is None:
                 continue
             baseline = parse_entry(raw_baseline)
             baselines.setdefault(_entry_key(baseline), baseline)
         return baselines
+
+    @staticmethod
+    def _migration_fallbacks(
+        events: list[dict[str, Any]],
+    ) -> dict[tuple[str, Scope, str | None], tuple[dict[str, Any], ...]]:
+        by_id = {event["event_id"]: event for event in events}
+        fallbacks: dict[
+            tuple[str, Scope, str | None], list[dict[str, Any]]
+        ] = {}
+        for event in events:
+            if event.get("migration_fallback") is None:
+                continue
+            target_ids = event.get("target_event_ids", [])
+            if "target_event_id" in event:
+                target_ids = [event["target_event_id"]]
+            for target_id in target_ids:
+                target = by_id.get(target_id)
+                if target is None:
+                    continue
+                key = (
+                    target["canonical"],
+                    Scope(target["scope"]),
+                    target.get("project_id"),
+                )
+                fallbacks.setdefault(key, []).append(target)
+        return {key: tuple(value) for key, value in fallbacks.items()}
 
     @staticmethod
     def _legacy_owned_entries(
@@ -539,6 +623,37 @@ def _entries_from_learning_events(
             )
         )
     return tuple(entries)
+
+
+def _remove_historical_contributions(
+    entry: LexiconEntry, events: tuple[dict[str, Any], ...]
+) -> LexiconEntry | None:
+    """Remove only pre-snapshot aliases explicitly owned by audit events."""
+    aliases = {
+        event["alias"] for event in events if event["action"] == "confirm"
+    }
+    negative_aliases = {
+        event["alias"] for event in events if event["action"] == "reject"
+    }
+    remaining_aliases = tuple(alias for alias in entry.aliases if alias not in aliases)
+    if not remaining_aliases:
+        return None
+    return LexiconEntry(
+        canonical=entry.canonical,
+        scope=entry.scope,
+        aliases=remaining_aliases,
+        domains=entry.domains,
+        weight=entry.weight,
+        status=entry.status,
+        phonetics=entry.phonetics,
+        project_id=entry.project_id,
+        source=entry.source,
+        use_count=entry.use_count,
+        notes=entry.notes,
+        negative_aliases=tuple(
+            alias for alias in entry.negative_aliases if alias not in negative_aliases
+        ),
+    )
 
 
 def _merge_entry(left: LexiconEntry, right: LexiconEntry) -> LexiconEntry:
