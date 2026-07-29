@@ -103,11 +103,13 @@ def test_write_jsonl_atomic_emits_stable_unicode_jsonl(tmp_path):
         "canonical",
         "domains",
         "negative_aliases",
+        "notes",
         "phonetics",
         "project_id",
         "scope",
         "source",
         "status",
+        "use_count",
         "weight",
     ]
     assert load_jsonl(path) == (entry,)
@@ -122,6 +124,36 @@ def test_parse_entry_accepts_optional_collections():
     assert entry.phonetics == ("open claw",)
     assert entry.negative_aliases == ("open door",)
     assert entry.status is EntryStatus.CURATED
+
+
+def test_scan_metadata_round_trips_through_jsonl(tmp_path):
+    """Catch JSONL persistence that drops scan kind or exact use count."""
+    path = tmp_path / "project.jsonl"
+    entry = parse_entry(
+        _raw_entry(
+            scope="project",
+            project_id="project-7",
+            source="src/widget.py",
+            notes="camel-case",
+            use_count=3,
+        )
+    )
+
+    write_jsonl_atomic(path, (entry,))
+
+    assert load_jsonl(path) == (entry,)
+    assert entry.notes == "camel-case"
+    assert entry.use_count == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("use_count", -1), ("use_count", True), ("notes", 3)),
+)
+def test_parse_entry_rejects_invalid_scan_metadata(field: str, value: object):
+    """Catch malformed metadata entering the strict project cache schema."""
+    with pytest.raises(ValueError):
+        parse_entry(_raw_entry(**{field: value}))
 
 
 def test_candidate_normalizes_mutable_matching_metadata():

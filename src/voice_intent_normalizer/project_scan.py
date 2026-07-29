@@ -38,6 +38,17 @@ _CREDENTIAL_NAME_PARTS = frozenset(
         "id_rsa",
     }
 )
+_SSH_PRIVATE_KEY_NAMES = frozenset(
+    {
+        "id_dsa",
+        "id_ecdsa",
+        "id_ecdsa_sk",
+        "id_ed25519",
+        "id_ed25519_sk",
+        "id_rsa",
+        "id_xmss",
+    }
+)
 _TEXT_EXTENSIONS = frozenset(
     {
         "",
@@ -113,7 +124,7 @@ class ScanResult:
 def _is_private_name(name: str) -> bool:
     """Return whether *name* is hidden or conventionally stores credentials."""
     lowered = name.casefold()
-    return lowered.startswith(".") or any(
+    return lowered.startswith(".") or lowered in _SSH_PRIVATE_KEY_NAMES or any(
         part in lowered for part in _CREDENTIAL_NAME_PARTS
     )
 
@@ -171,7 +182,7 @@ def _entries_from_observations(
     entries: list[LexiconEntry] = []
     for canonical in sorted(observations, key=lambda value: (value.casefold(), value)):
         locations = observations[canonical]
-        source, _kind = min(
+        source, kind = min(
             locations,
             key=lambda item: (-locations[item], item[0], item[1]),
         )
@@ -188,6 +199,8 @@ def _entries_from_observations(
                 ),
                 project_id=project_id,
                 source=source,
+                use_count=frequency,
+                notes=kind,
             )
         )
     return tuple(entries)
@@ -208,7 +221,10 @@ def scan_project(
     if max_files < 0 or max_text_bytes < 0:
         raise ValueError("scan limits must be non-negative")
 
-    project_root = Path(root).expanduser().resolve()
+    supplied_root = Path(root).expanduser()
+    if supplied_root.is_symlink():
+        return ScanResult((), False, 0, 0)
+    project_root = supplied_root.resolve()
     project_paths = state_paths.for_project(project_root)
     observations: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
     pending = [project_root]

@@ -18,7 +18,14 @@ _REQUIRED_FIELDS = frozenset(
     {"canonical", "scope", "aliases", "domains", "weight", "status"}
 )
 _OPTIONAL_FIELDS = frozenset(
-    {"phonetics", "project_id", "source", "negative_aliases"}
+    {
+        "phonetics",
+        "project_id",
+        "source",
+        "negative_aliases",
+        "use_count",
+        "notes",
+    }
 )
 _ALL_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 
@@ -151,6 +158,16 @@ def _optional_string(raw: Mapping[str, Any], name: str) -> str | None:
     return value
 
 
+def _optional_use_count(raw: Mapping[str, Any]) -> int | None:
+    """Read a non-negative integer count without accepting booleans."""
+    value = raw.get("use_count")
+    if isinstance(value, bool) or (value is not None and not isinstance(value, int)):
+        raise ValueError("use_count must be a non-negative integer or null")
+    if value is not None and value < 0:
+        raise ValueError("use_count must be a non-negative integer or null")
+    return value
+
+
 def parse_entry(
     raw: Mapping[str, Any], expected_scope: Scope | None = None
 ) -> LexiconEntry:
@@ -190,6 +207,8 @@ def parse_entry(
             phonetics=_collection(raw, "phonetics"),
             project_id=_optional_string(raw, "project_id"),
             source=_optional_string(raw, "source"),
+            use_count=_optional_use_count(raw),
+            notes=_optional_string(raw, "notes"),
             negative_aliases=_collection(raw, "negative_aliases"),
         )
     except ValueError as exc:
@@ -236,11 +255,13 @@ def _entry_data(entry: LexiconEntry) -> dict[str, Any]:
         "canonical": entry.canonical,
         "domains": list(entry.domains),
         "negative_aliases": list(entry.negative_aliases),
+        "notes": entry.notes,
         "phonetics": list(entry.phonetics),
         "project_id": entry.project_id,
         "scope": entry.scope.value,
         "source": entry.source,
         "status": entry.status.value,
+        "use_count": entry.use_count,
         "weight": entry.weight,
     }
 

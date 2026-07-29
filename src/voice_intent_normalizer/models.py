@@ -46,6 +46,8 @@ class LexiconEntry:
     phonetics: tuple[str, ...] = ()
     project_id: str | None = None
     source: str | None = None
+    use_count: int | None = None
+    notes: str | None = None
     negative_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -59,6 +61,13 @@ class LexiconEntry:
             raise ValueError("project_id must be a string or None")
         if self.source is not None and not isinstance(self.source, str):
             raise ValueError("source must be a string or None")
+        if isinstance(self.use_count, bool) or (
+            self.use_count is not None
+            and (not isinstance(self.use_count, int) or self.use_count < 0)
+        ):
+            raise ValueError("use_count must be a non-negative integer or None")
+        if self.notes is not None and not isinstance(self.notes, str):
+            raise ValueError("notes must be a string or None")
 
         object.__setattr__(self, "scope", Scope(self.scope))
         object.__setattr__(self, "status", EntryStatus(self.status))

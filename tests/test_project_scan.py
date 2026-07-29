@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from voice_intent_normalizer.lexicon import load_jsonl
 from voice_intent_normalizer.paths import StatePaths
 from voice_intent_normalizer.project_scan import scan_project
@@ -69,6 +71,59 @@ def test_scanner_ignores_binary_content_with_a_text_extension(tmp_path):
     result = scan_project(tmp_path, _state_paths(tmp_path))
 
     assert "HiddenBinaryTerm" not in {entry.canonical for entry in result.entries}
+
+
+def test_scanner_never_opens_extensionless_openssh_private_keys(tmp_path, monkeypatch):
+    """Catch a scanner that opens a conventional private-key filename."""
+    private_key = tmp_path / "id_ed25519"
+    private_key.write_text("class PrivateKeyLeak:\n", encoding="utf-8")
+    real_open = Path.open
+
+    def reject_private_key(path, *args, **kwargs):
+        if path == private_key:
+            raise AssertionError("scanner opened an OpenSSH private key")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", reject_private_key)
+
+    result = scan_project(tmp_path, _state_paths(tmp_path))
+
+    assert "PrivateKeyLeak" not in {entry.canonical for entry in result.entries}
+
+
+def test_scanner_rejects_a_symlink_supplied_as_the_project_root(tmp_path):
+    """Catch scan-root resolution that follows a caller-provided symlink."""
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / "target.py").write_text("class OutsideTarget:\n", encoding="utf-8")
+    link = tmp_path / "linked-project"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot create test symlink: {exc}")
+
+    result = scan_project(link, _state_paths(tmp_path))
+
+    assert result.entries == ()
+    assert result.files_scanned == 0
+
+
+def test_scanner_persists_extraction_kind_and_exact_frequency(tmp_path):
+    """Catch project caches that discard scanner provenance or counts."""
+    (tmp_path / "terms.py").write_text(
+        "WidgetEngine = object()\nWidgetEngine.run()\n", encoding="utf-8"
+    )
+    state_paths = _state_paths(tmp_path)
+
+    scan_project(tmp_path, state_paths)
+
+    entry = next(
+        item
+        for item in load_jsonl(state_paths.for_project(tmp_path).lexicon_file)
+        if item.canonical == "WidgetEngine"
+    )
+    assert entry.notes == "camel-case"
+    assert entry.use_count == 2
 
 
 def test_scanner_counts_rejected_binary_files_toward_its_file_limit(tmp_path):
