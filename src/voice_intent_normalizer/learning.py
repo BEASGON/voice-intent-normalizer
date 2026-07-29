@@ -39,6 +39,7 @@ _SIMPLE_CONTROLS = {
     "查看最近学到的词": "list_recent",
 }
 _LEARNING_ACTIONS = frozenset({"confirm", "reject", "delete"})
+_LEARNING_SOURCE = "explicit-learning"
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,18 +353,50 @@ class LearningStore:
                     weight=1.0,
                     status=status,
                     project_id=project_id,
+                    source=_LEARNING_SOURCE,
                     negative_aliases=negative_aliases,
                 )
             )
 
+        personal_entries = entries_by_scope.get((Scope.PERSONAL, None), [])
         self._write_entries(
-            self.personal_file, entries_by_scope.get((Scope.PERSONAL, None), [])
+            self.personal_file,
+            self._merge_entries(
+                self.personal_file, Scope.PERSONAL, personal_entries
+            ),
         )
         for project_id in project_ids:
             path = self.root / "projects" / project_id / "project.jsonl"
             self._write_entries(
-                path, entries_by_scope.get((Scope.PROJECT, project_id), [])
+                path,
+                self._merge_entries(
+                    path,
+                    Scope.PROJECT,
+                    entries_by_scope.get((Scope.PROJECT, project_id), []),
+                ),
             )
+
+    @staticmethod
+    def _merge_entries(
+        path: Path,
+        scope: Scope,
+        learned_entries: list[LexiconEntry],
+    ) -> list[LexiconEntry]:
+        preserved = (
+            ()
+            if not path.is_file()
+            else tuple(
+                entry
+                for entry in load_jsonl(path, expected_scope=scope)
+                if not _is_derived_learning_entry(entry)
+            )
+        )
+        merged: dict[tuple[str, Scope, str | None], LexiconEntry] = {}
+        for entry in (*preserved, *learned_entries):
+            key = (entry.canonical, entry.scope, entry.project_id)
+            previous = merged.get(key)
+            merged[key] = entry if previous is None else _merge_entry(previous, entry)
+        return list(merged.values())
 
     @staticmethod
     def _write_entries(path: Path, entries: list[LexiconEntry]) -> None:
@@ -402,3 +435,40 @@ def _project_id(project_id: str | None) -> str:
 
 def _unique(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _is_derived_learning_entry(entry: LexiconEntry) -> bool:
+    """Recognize current and pre-marker learning materializations."""
+    return entry.source == _LEARNING_SOURCE or (
+        entry.source is None
+        and entry.status in {EntryStatus.CONFIRMED, EntryStatus.REJECTED}
+    )
+
+
+def _merge_entry(left: LexiconEntry, right: LexiconEntry) -> LexiconEntry:
+    """Merge equal lexicon identities without retaining duplicate JSONL records."""
+    if (left.canonical, left.scope, left.project_id) != (
+        right.canonical,
+        right.scope,
+        right.project_id,
+    ):
+        raise ValueError("only equal lexicon identities can be merged")
+    left_is_learning = left.source == _LEARNING_SOURCE
+    existing = right if left_is_learning else left
+    learned = left if left_is_learning else right
+    return LexiconEntry(
+        canonical=existing.canonical,
+        scope=existing.scope,
+        aliases=_unique([*existing.aliases, *learned.aliases]),
+        domains=_unique([*existing.domains, *learned.domains]),
+        weight=max(existing.weight, learned.weight),
+        status=learned.status,
+        phonetics=_unique([*existing.phonetics, *learned.phonetics]),
+        project_id=existing.project_id,
+        source=existing.source,
+        use_count=existing.use_count,
+        notes=existing.notes,
+        negative_aliases=_unique(
+            [*existing.negative_aliases, *learned.negative_aliases]
+        ),
+    )

@@ -189,6 +189,7 @@ def generate_candidates(
     """Generate ordered, explainable candidates without altering *text*."""
     source_key, starts, ends = _source_key(text)
     found: dict[tuple[LexiconEntry, tuple[int, int]], str] = {}
+    blocked: set[tuple[str, tuple[int, int]]] = set()
     match_priority = {"phonetic": 0, "normalized": 1, "exact": 2, "negative": 3}
 
     def record(entry: LexiconEntry, span: tuple[int, int], kind: str) -> None:
@@ -205,6 +206,7 @@ def generate_candidates(
         for alias in entry.negative_aliases:
             for span in _alias_matches(source_key, starts, ends, alias):
                 record(entry, span, "negative")
+                blocked.add((entry.canonical, span))
 
     provider = _load_pypinyin()
     if provider is not None:
@@ -213,7 +215,13 @@ def generate_candidates(
                 record(entry, span, "phonetic")
 
     candidates = tuple(
-        _candidate(text, entry, span, kind, context)
+        _candidate(
+            text,
+            entry,
+            span,
+            "negative" if (entry.canonical, span) in blocked else kind,
+            context,
+        )
         for (entry, span), kind in found.items()
     )
     return tuple(
