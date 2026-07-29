@@ -115,6 +115,7 @@ class LearningStore:
         project_id: str | None = None,
     ) -> LearningEvent:
         """Persist an explicit positive mapping in the requested lexicon scope."""
+        self._reconcile_pending()
         resolved_scope = Scope(scope)
         if resolved_scope not in {Scope.PERSONAL, Scope.PROJECT}:
             raise ValueError("confirmed mappings must be personal or project scoped")
@@ -143,6 +144,7 @@ class LearningStore:
 
     def observe(self, alias: str, canonical: str, source: str) -> EntryStatus:
         """Record an unconfirmed sighting without changing active lexicons."""
+        self._reconcile_pending()
         status = (
             EntryStatus.REPEATED
             if self._latest_observation(alias, canonical) is not None
@@ -153,6 +155,7 @@ class LearningStore:
 
     def reject(self, alias: str, canonical: str) -> LearningEvent:
         """Persist an explicit personal negative mapping."""
+        self._reconcile_pending()
         alias = _required_text(alias, "alias")
         canonical = _required_text(canonical, "canonical")
         baseline_captured, baseline, migrated_ids = self._baseline_capture_for(
@@ -173,6 +176,7 @@ class LearningStore:
 
     def undo_last(self) -> LearningEvent | None:
         """Append a compensating event for the latest effective learning action."""
+        self._reconcile_pending()
         operations = self._effective_operations()
         if not operations:
             return None
@@ -211,6 +215,7 @@ class LearningStore:
 
     def delete(self, canonical: str) -> LearningEvent | None:
         """Append a deletion event and rebuild all derived lexicons."""
+        self._reconcile_pending()
         canonical = _required_text(canonical, "canonical")
         target_events = [
             event
@@ -322,6 +327,11 @@ class LearningStore:
             ):
                 return event
         return None
+
+    def _reconcile_pending(self) -> None:
+        """Finish durable migration transitions before observing current state."""
+        if _pending_migration_events(self._events()):
+            self._materialize()
 
     def _events(self) -> list[dict[str, Any]]:
         if not self.events_file.is_file():
@@ -510,8 +520,8 @@ class LearningStore:
             entries_by_scope.setdefault((entry.scope, entry.project_id), []).append(
                 entry
             )
-        baselines = _provenance_baselines(events, active_events)
         pending = _pending_migration_events(events)
+        baselines = _provenance_baselines(events, active_events, pending)
         pending_keys = {
             _migration_key(migration)
             for event in pending
@@ -519,30 +529,51 @@ class LearningStore:
         }
 
         personal_entries = entries_by_scope.get((Scope.PERSONAL, None), [])
-        self._write_entries(
-            self.personal_file,
-            self._merge_entries(
+        materializations: list[
+            tuple[Path, Scope, list[LexiconEntry]]
+        ] = [
+            (
                 self.personal_file,
                 Scope.PERSONAL,
-                personal_entries,
-                baselines,
-                active_events,
-                pending_keys,
-            ),
-        )
-        for project_id in project_ids:
-            path = self.root / "projects" / project_id / "project.jsonl"
-            self._write_entries(
-                path,
                 self._merge_entries(
-                    path,
-                    Scope.PROJECT,
-                    entries_by_scope.get((Scope.PROJECT, project_id), []),
+                    self.personal_file,
+                    Scope.PERSONAL,
+                    personal_entries,
                     baselines,
                     active_events,
                     pending_keys,
                 ),
             )
+        ]
+        for project_id in sorted(project_ids):
+            path = self.root / "projects" / project_id / "project.jsonl"
+            materializations.append(
+                (
+                    path,
+                    Scope.PROJECT,
+                    self._merge_entries(
+                        path,
+                        Scope.PROJECT,
+                        entries_by_scope.get((Scope.PROJECT, project_id), []),
+                        baselines,
+                        active_events,
+                        pending_keys,
+                    ),
+                )
+            )
+        for path, _scope, expected in materializations:
+            self._write_entries(path, expected)
+        for path, scope, expected in materializations:
+            try:
+                persisted = load_jsonl(path, expected_scope=scope)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"materialization verification failed for {path}"
+                ) from exc
+            if persisted != tuple(expected):
+                raise RuntimeError(
+                    f"materialization verification failed for {path}"
+                )
         for event in pending:
             self._append_event(
                 "migration_applied",
@@ -557,6 +588,9 @@ class LearningStore:
                 project_id=event.get("project_id"),
                 target_event_id=event["event_id"],
                 migration_fallback=event.get("migration_fallback"),
+                migration_baselines=_applied_migration_baselines(
+                    event, active_events
+                ),
             )
 
     @staticmethod
@@ -860,6 +894,7 @@ def _candidate_is_clean(
 def _provenance_baselines(
     events: list[dict[str, Any]],
     active_events: list[dict[str, Any]],
+    pending_events: list[dict[str, Any]],
 ) -> dict[tuple[str, Scope, str | None], LexiconEntry | None]:
     latest: dict[
         tuple[str, Scope, str | None],
@@ -887,6 +922,14 @@ def _provenance_baselines(
         candidate = _active_provenance_candidate(events, active)
         if candidate is not None:
             latest[key] = (candidate[1], candidate[2])
+    pending_position = len(events)
+    for event in pending_events:
+        for migration in event["migration_baselines"]:
+            latest[_migration_key(migration)] = (
+                pending_position,
+                _migration_baseline(migration),
+            )
+        pending_position += 1
     return {key: value[1] for key, value in latest.items()}
 
 
@@ -901,9 +944,37 @@ def _pending_migration_events(
     return [
         event
         for event in events
-        if event.get("migration_baselines")
+        if event.get("action") != "migration_applied"
+        and event.get("migration_baselines")
         and event.get("event_id") not in consumed
     ]
+
+
+def _applied_migration_baselines(
+    event: dict[str, Any],
+    active_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Checkpoint the verified baseline for every mapping it now governs."""
+    applied: list[dict[str, Any]] = []
+    for migration in event["migration_baselines"]:
+        key = _migration_key(migration)
+        event_ids = list(migration["event_ids"])
+        event_ids.extend(
+            active["event_id"]
+            for active in active_events
+            if _raw_event_key(active) == key
+        )
+        applied.append(
+            {
+                "baseline": migration.get("baseline"),
+                "canonical": key[0],
+                "event_ids": list(dict.fromkeys(event_ids)),
+                "project_id": key[2],
+                "reason": "verified-migration-application",
+                "scope": key[1].value,
+            }
+        )
+    return applied
 
 
 def _expand_mapping_targets(

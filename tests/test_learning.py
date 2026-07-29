@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import voice_intent_normalizer.learning as learning_module
 from voice_intent_normalizer.learning import LearningStore, parse_control
 from voice_intent_normalizer.lexicon import LexiconSet, load_jsonl, write_jsonl_atomic
 from voice_intent_normalizer.matching import MatchContext, generate_candidates
@@ -49,6 +50,13 @@ def _write_learning_events(root, *events: dict[str, object]) -> None:
         "".join(json.dumps(event) + "\n" for event in events),
         encoding="utf-8",
     )
+
+
+def _read_learning_events(root) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in (root / "learning-events.jsonl").read_text("utf-8").splitlines()
+    ]
 
 
 @pytest.mark.parametrize(
@@ -721,6 +729,178 @@ def test_new_overlay_adopts_manual_edits_over_an_active_legacy_mapping(tmp_path)
     assert restored.aliases == ("curated alias", "legacy two")
     assert restored.domains == ("manual",)
     assert restored.notes == "manual replacement"
+
+
+def test_failed_migration_retries_before_noop_undo_or_new_baseline(
+    tmp_path, monkeypatch
+):
+    """Catch a failed migration becoming inactive but never reconciled after restart."""
+    contaminated = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("curated alias", "legacy alias"),
+        domains=("ai",),
+        weight=0.8,
+        status=EntryStatus.CONFIRMED,
+        source="manual",
+    )
+    tmp_path.mkdir(exist_ok=True)
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (contaminated,))
+    _write_learning_events(
+        tmp_path,
+        _legacy_mapping_event(
+            "legacy-confirm", "confirm", "legacy alias", "OpenClaw"
+        ),
+    )
+    store = LearningStore.for_root(tmp_path)
+    real_write = learning_module.write_jsonl_atomic
+
+    def fail_before_replace(path, entries):
+        raise OSError("injected pre-replace failure")
+
+    monkeypatch.setattr(
+        learning_module, "write_jsonl_atomic", fail_before_replace
+    )
+    with pytest.raises(OSError, match="injected pre-replace failure"):
+        store.undo_last()
+
+    assert load_jsonl(tmp_path / "personal.jsonl") == (contaminated,)
+    assert "migration_applied" not in {
+        event["action"] for event in _read_learning_events(tmp_path)
+    }
+    monkeypatch.setattr(learning_module, "write_jsonl_atomic", real_write)
+
+    restarted = LearningStore.for_root(tmp_path)
+    restarted.confirm("modern alias", "OpenClaw", Scope.PERSONAL)
+    final = load_jsonl(tmp_path / "personal.jsonl")[0]
+    assert final.aliases == ("curated alias", "modern alias")
+    assert [
+        event["action"] for event in _read_learning_events(tmp_path)[-2:]
+    ] == ["migration_applied", "confirm"]
+
+
+def test_migration_is_not_marked_applied_when_writer_does_not_persist(
+    tmp_path, monkeypatch
+):
+    """Catch a successful writer return being trusted without persisted verification."""
+    contaminated = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("curated alias", "legacy alias"),
+        domains=("ai",),
+        weight=0.8,
+        status=EntryStatus.CONFIRMED,
+        source="manual",
+    )
+    tmp_path.mkdir(exist_ok=True)
+    write_jsonl_atomic(tmp_path / "personal.jsonl", (contaminated,))
+    _write_learning_events(
+        tmp_path,
+        _legacy_mapping_event(
+            "legacy-confirm", "confirm", "legacy alias", "OpenClaw"
+        ),
+    )
+    store = LearningStore.for_root(tmp_path)
+    real_write = learning_module.write_jsonl_atomic
+    monkeypatch.setattr(
+        learning_module, "write_jsonl_atomic", lambda path, entries: None
+    )
+
+    with pytest.raises(RuntimeError, match="verification"):
+        store.undo_last()
+
+    assert load_jsonl(tmp_path / "personal.jsonl") == (contaminated,)
+    assert "migration_applied" not in {
+        event["action"] for event in _read_learning_events(tmp_path)
+    }
+    monkeypatch.setattr(learning_module, "write_jsonl_atomic", real_write)
+    assert LearningStore.for_root(tmp_path).undo_last() is None
+    assert load_jsonl(tmp_path / "personal.jsonl")[0].aliases == ("curated alias",)
+
+
+def test_partial_personal_project_migration_recovers_idempotently(
+    tmp_path, monkeypatch
+):
+    """Catch a partial multi-file migration being consumed or left unrecoverable."""
+    project_id = "project-recovery"
+    personal_path = tmp_path / "personal.jsonl"
+    project_path = tmp_path / "projects" / project_id / "project.jsonl"
+    personal = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PERSONAL,
+        aliases=("personal curated", "personal legacy"),
+        domains=("ai",),
+        weight=0.8,
+        status=EntryStatus.CONFIRMED,
+        source="manual",
+    )
+    project = LexiconEntry(
+        canonical="OpenClaw",
+        scope=Scope.PROJECT,
+        aliases=("project curated", "project legacy"),
+        domains=("project",),
+        weight=0.7,
+        status=EntryStatus.CONFIRMED,
+        project_id=project_id,
+        source="manual",
+    )
+    tmp_path.mkdir(exist_ok=True)
+    project_path.parent.mkdir(parents=True)
+    write_jsonl_atomic(personal_path, (personal,))
+    write_jsonl_atomic(project_path, (project,))
+    _write_learning_events(
+        tmp_path,
+        _legacy_mapping_event(
+            "personal-legacy", "confirm", "personal legacy", "OpenClaw"
+        ),
+        _legacy_mapping_event(
+            "project-legacy",
+            "confirm",
+            "project legacy",
+            "OpenClaw",
+            scope=Scope.PROJECT,
+            project_id=project_id,
+        ),
+    )
+    store = LearningStore.for_root(tmp_path)
+    real_write = learning_module.write_jsonl_atomic
+    calls = 0
+
+    def fail_second_write(path, entries):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second-file failure")
+        real_write(path, entries)
+
+    monkeypatch.setattr(learning_module, "write_jsonl_atomic", fail_second_write)
+    with pytest.raises(OSError, match="injected second-file failure"):
+        store.delete("OpenClaw")
+
+    assert load_jsonl(personal_path)[0].aliases == ("personal curated",)
+    assert load_jsonl(project_path, Scope.PROJECT) == (project,)
+    assert "migration_applied" not in {
+        event["action"] for event in _read_learning_events(tmp_path)
+    }
+    monkeypatch.setattr(learning_module, "write_jsonl_atomic", real_write)
+
+    restarted = LearningStore.for_root(tmp_path)
+    assert restarted.delete("OpenClaw") is None
+    assert load_jsonl(personal_path)[0].aliases == ("personal curated",)
+    assert load_jsonl(project_path, Scope.PROJECT)[0].aliases == (
+        "project curated",
+    )
+
+    restored = restarted.undo_last()
+    assert restored is not None and restored.action == "delete"
+    assert load_jsonl(personal_path)[0].aliases == (
+        "personal curated",
+        "personal legacy",
+    )
+    assert load_jsonl(project_path, Scope.PROJECT)[0].aliases == (
+        "project curated",
+        "project legacy",
+    )
 
 
 def test_rejected_mapping_suppresses_the_same_lower_layer_mapping(tmp_path):
