@@ -141,10 +141,24 @@ def _child_update(root: str, transport: FakeTransport, results) -> None:
     results.put((result.status.value, result.version))
 
 
+def _child_update_after_signal(
+    root: str, transport: FakeTransport, start, results
+) -> None:
+    if not start.wait(10):
+        results.put(("test-timeout", None))
+        return
+    _child_update(root, transport, results)
+
+
 def _child_hold_lock(root: str, ready, release) -> None:
     with updater_module._update_lock(StatePaths(root=Path(root))):
         ready.set()
         release.wait(10)
+
+
+def _child_hold_lock_with_xdg(root: str, runtime: str, ready, release) -> None:
+    os.environ["XDG_RUNTIME_DIR"] = runtime
+    _child_hold_lock(root, ready, release)
 
 
 def test_valid_update_replaces_hotwords_and_records_check(tmp_path):
@@ -598,6 +612,22 @@ def test_receipt_directory_cannot_disable_authoritative_resolution(tmp_path):
     assert receipt.is_dir()
 
 
+def test_pending_directory_cannot_disable_authoritative_resolution(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Authoritative")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    pending = paths.hotwords_file.parent / "pending.json"
+    pending.mkdir()
+
+    resolved = updater_module.resolve_hotword_file(paths)
+
+    assert resolved == paths.hotwords_file
+    assert resolved.read_bytes() == data
+    assert pending.is_dir()
+
+
 def test_receipt_directory_cannot_block_a_forced_current_update(tmp_path):
     paths = paths_for(tmp_path)
     data = hotword_data()
@@ -796,6 +826,100 @@ def test_windows_extended_path_alias_contends_on_the_same_global_mutex(tmp_path)
     assert holder.exitcode == 0
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows kernel mutex behavior")
+def test_windows_state_root_replacement_still_contends_on_path_mutex(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    paths = paths_for(tmp_path)
+    holder = context.Process(
+        target=_child_hold_lock, args=(str(paths.root), ready, release)
+    )
+    holder.start()
+    assert ready.wait(10)
+    moved = tmp_path / "held-state-root"
+    paths.root.rename(moved)
+    paths.root.mkdir()
+    transport = transport_for(hotword_data())
+
+    try:
+        blocked = update_hotwords(
+            paths, MANIFEST_URL, transport, NOW, force=True
+        )
+
+        assert blocked.status is UpdateStatus.REJECTED
+        assert transport.calls == []
+        assert holder.is_alive()
+    finally:
+        release.set()
+        holder.join(10)
+    assert holder.exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows identity replacement handling")
+def test_windows_retries_when_state_identity_changes_before_mutex_creation(
+    tmp_path, monkeypatch
+):
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    moved = tmp_path / "identity-before-mutex"
+    real_identity = updater_module._windows_directory_identity
+    lookups = 0
+
+    def replace_after_first_lookup(path):
+        nonlocal lookups
+        identity = real_identity(path)
+        lookups += 1
+        if lookups == 1:
+            paths.root.rename(moved)
+            paths.root.mkdir()
+        return identity
+
+    monkeypatch.setattr(
+        updater_module, "_windows_directory_identity", replace_after_first_lookup
+    )
+
+    with updater_module._update_lock(paths):
+        assert paths.root.is_dir()
+
+    assert lookups >= 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows alias lock ordering")
+def test_windows_normal_and_extended_alias_updates_do_not_deadlock(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    extended_root = "\\\\?\\" + str(paths.root)
+    processes = [
+        context.Process(
+            target=_child_update_after_signal,
+            args=(
+                root,
+                transport_for(hotword_data()),
+                start,
+                results,
+            ),
+        )
+        for root in (str(paths.root), extended_root)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(15)
+
+    assert all(process.exitcode == 0 for process in processes)
+    outcomes = {results.get(timeout=3), results.get(timeout=3)}
+    assert outcomes <= {
+        ("updated", "2026.07.29"),
+        ("current", "2026.07.29"),
+    }
+    assert outcomes
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows path normalization")
 def test_windows_mutex_name_normalizes_drive_and_unc_aliases(tmp_path):
     root = tmp_path / "state"
@@ -838,6 +962,56 @@ class _FakeCreateMutexKernel:
         self.opened.append((access, inherit_handle, name))
         ctypes.set_last_error(self.open_error)
         return self.opened_handle
+
+
+class _FakeMutexSetKernel:
+    def __init__(self):
+        self.created = []
+        self.released = []
+        self.closed = []
+        self.waits = 0
+
+    def CreateMutexW(self, security, initially_owned, name):
+        handle = 11 + len(self.created) * 11
+        self.created.append((name, handle))
+        return handle
+
+    def OpenMutexW(self, access, inherit_handle, name):
+        raise AssertionError("OpenMutexW should not be needed")
+
+    def WaitForSingleObject(self, handle, milliseconds):
+        self.waits += 1
+        if self.waits == 1:
+            return 0
+        ctypes.set_last_error(6)
+        return 0xFFFFFFFF
+
+    def ReleaseMutex(self, handle):
+        self.released.append(handle)
+        return True
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows multi-mutex cleanup")
+def test_windows_partial_mutex_acquisition_releases_and_closes_every_handle():
+    kernel = _FakeMutexSetKernel()
+
+    with pytest.raises(OSError) as exc_info:
+        with updater_module._acquire_windows_mutex_names(
+            kernel, ("Global\\z-path", "Global\\a-identity"), timeout=1.0
+        ):
+            raise AssertionError("partial acquisition must not yield")
+
+    assert exc_info.value.winerror == 6
+    assert [name for name, _handle in kernel.created] == [
+        "Global\\a-identity",
+        "Global\\z-path",
+    ]
+    assert kernel.released == [11]
+    assert kernel.closed == [22, 11]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows mutex access handling")
@@ -897,13 +1071,16 @@ def test_posix_lock_name_is_independent_of_hotword_directory_replacement(tmp_pat
 
 def test_posix_control_directory_is_outside_configured_state(tmp_path):
     paths = paths_for(tmp_path)
+    home = tmp_path / "home"
 
-    control = updater_module._posix_control_directory(
-        environ={}, home=tmp_path / "home"
+    without_xdg = updater_module._posix_control_directory(environ={}, home=home)
+    with_xdg = updater_module._posix_control_directory(
+        environ={"XDG_RUNTIME_DIR": str(tmp_path / "runtime")}, home=home
     )
 
-    assert control.is_absolute()
-    assert not control.is_relative_to(paths.root)
+    assert without_xdg == with_xdg
+    assert without_xdg.is_absolute()
+    assert not without_xdg.is_relative_to(paths.root)
 
 
 @pytest.mark.parametrize(
@@ -959,6 +1136,41 @@ def test_posix_lock_survives_hotword_directory_rename_and_replacement(tmp_path):
     assert holder.is_alive()
     release.set()
     holder.join(10)
+    assert holder.exitcode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process environment behavior")
+def test_posix_same_user_contends_across_different_xdg_environments(
+    tmp_path, monkeypatch
+):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    paths = paths_for(tmp_path)
+    holder_runtime = tmp_path / "holder-runtime"
+    contender_runtime = tmp_path / "contender-runtime"
+    holder_runtime.mkdir(mode=0o700)
+    contender_runtime.mkdir(mode=0o700)
+    holder = context.Process(
+        target=_child_hold_lock_with_xdg,
+        args=(str(paths.root), str(holder_runtime), ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(contender_runtime))
+    transport = transport_for(hotword_data())
+
+    try:
+        blocked = update_hotwords(
+            paths, MANIFEST_URL, transport, NOW, force=True
+        )
+
+        assert blocked.status is UpdateStatus.REJECTED
+        assert transport.calls == []
+        assert holder.is_alive()
+    finally:
+        release.set()
+        holder.join(10)
     assert holder.exitcode == 0
 
 

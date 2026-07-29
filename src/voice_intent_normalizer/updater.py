@@ -13,6 +13,7 @@ import errno
 import hashlib
 import io
 import json
+import math
 import ntpath
 import os
 import re
@@ -63,6 +64,7 @@ _UPDATE_INTERVAL = timedelta(days=1)
 _RECEIPT_CLOCK_SKEW = timedelta(minutes=5)
 _LOCK_TIMEOUT_SECONDS = 2.0
 _LOCK_RETRY_SECONDS = 0.02
+_WINDOWS_IDENTITY_RETRIES = 3
 _STATE_SCHEMA_VERSION = 1
 _MANIFEST_FIELDS = frozenset({"schema_version", "version", "data_url", "sha256"})
 _CURRENT_FIELDS = frozenset(
@@ -242,16 +244,16 @@ def _recover_locked(paths: StatePaths, operation_now: datetime) -> _CurrentState
         _discard_attempt_best_effort(paths)
     try:
         pending = _read_pending(paths)
-    except ValueError:
-        if current is None:
-            raise
-        _discard_pending(paths)
+    except (OSError, OverflowError, ValueError):
+        # The prepare journal never grants authority.  A malformed or
+        # non-removable entry therefore cannot invalidate a verified pointer.
+        _discard_pending_best_effort(paths)
         pending = None
     if pending is not None and (current is None or pending != current):
         # A prepared record without the matching authoritative pointer was not
         # committed.  Leaving its immutable payload is harmless; discard only
         # the journal marker.
-        _remove_pending(paths)
+        _discard_pending_best_effort(paths)
         pending = None
     if current is None:
         current = _migrate_legacy_locked(paths, attempt)
@@ -263,7 +265,7 @@ def _recover_locked(paths: StatePaths, operation_now: datetime) -> _CurrentState
                 paths, _AttemptState(current.version, current.last_check)
             )
     if pending is not None:
-        _remove_pending(paths)
+        _discard_pending_best_effort(paths)
     if current is not None:
         _cleanup_payloads(paths, current)
     return current
@@ -571,11 +573,19 @@ def _remove_pending(paths: StatePaths) -> None:
 
 
 def _discard_pending(paths: StatePaths) -> None:
-    """Discard an invalid non-authoritative journal only after pointer validation."""
+    """Discard a non-authoritative prepare journal when its path is safe."""
     path = _pending_file(paths)
     if path.exists():
         _reject_symlink(path, "pending state")
         path.unlink()
+
+
+def _discard_pending_best_effort(paths: StatePaths) -> None:
+    """Keep an advisory journal path from breaking authoritative recovery."""
+    try:
+        _discard_pending(paths)
+    except (OSError, ValueError):
+        return
 
 
 def _discard_attempt(paths: StatePaths) -> None:
@@ -746,10 +756,6 @@ def _ensure_storage(paths: StatePaths) -> None:
 def _update_lock(paths: StatePaths, *, timeout: float | None = None) -> Iterator[None]:
     """Use a stable OS lease, never a replaceable filesystem lock entry."""
     if os.name == "nt":
-        # The state root must exist before its stable volume/file identity can
-        # be queried. Directory creation here is idempotent; the mutex protects
-        # every subsequent recovery or mutation.
-        _ensure_storage(paths)
         with _windows_mutex(paths, timeout):
             yield
         return
@@ -805,13 +811,16 @@ def _posix_control_directory(
     home: str | Path | None = None,
 ) -> Path:
     """Choose one per-user control root outside any configured state tree."""
-    environment = os.environ if environ is None else environ
-    runtime = environment.get("XDG_RUNTIME_DIR", "")
-    if runtime and Path(runtime).is_absolute():
-        parent = Path(os.path.realpath(runtime))
+    # XDG_RUNTIME_DIR is session-specific and may differ between a desktop,
+    # cron, and service process owned by the same user.  Lock identity must not.
+    del environ
+    if home is None and os.name == "posix":
+        import pwd
+
+        user_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
     else:
         user_home = Path.home() if home is None else Path(home)
-        parent = Path(os.path.realpath(user_home.expanduser().absolute()))
+    parent = Path(os.path.realpath(user_home.expanduser().absolute()))
     return parent / ".voice-intent-normalizer-locks"
 
 
@@ -888,7 +897,7 @@ def _posix_lock_name(paths: StatePaths) -> str:
 
 @contextmanager
 def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
-    """Use one cross-session kernel mutex for every alias of a state directory."""
+    """Hold stable path plus alias-convergent identity mutexes in fixed order."""
     import ctypes
     from ctypes import wintypes
 
@@ -911,26 +920,60 @@ def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
     kernel32.ReleaseMutex.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
-    name = _windows_mutex_name(paths)
-    handle = _create_windows_mutex(kernel32, name)
-    milliseconds = int(
-        1000 * (_LOCK_TIMEOUT_SECONDS if timeout is None else timeout)
-    )
-    acquired = False
+    lease_timeout = _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + lease_timeout
+    path_name = _windows_path_mutex_name(paths)
+    with _acquire_windows_mutex_names(kernel32, (path_name,), timeout=lease_timeout):
+        for attempt_number in range(_WINDOWS_IDENTITY_RETRIES):
+            remaining = max(0.0, deadline - time.monotonic())
+            _ensure_storage(paths)
+            identity = _windows_directory_identity(paths.root)
+            identity_name = _windows_identity_mutex_name(identity)
+            with _acquire_windows_mutex_names(
+                kernel32, (identity_name,), timeout=remaining
+            ):
+                if _windows_directory_identity(paths.root) == identity:
+                    yield
+                    return
+            if (
+                attempt_number + 1 >= _WINDOWS_IDENTITY_RETRIES
+                or time.monotonic() >= deadline
+            ):
+                raise OSError("Windows state path changed during lock acquisition")
+
+
+@contextmanager
+def _acquire_windows_mutex_names(
+    kernel32, names: tuple[str, ...], *, timeout: float
+) -> Iterator[None]:
+    """Acquire unique mutex names deterministically and clean partial state."""
+    import ctypes
+
+    deadline = time.monotonic() + timeout
+    handles: list[list[int | bool]] = []
     try:
-        _wait_for_windows_mutex(kernel32, handle, milliseconds)
-        acquired = True
+        for name in sorted(set(names)):
+            handle = _create_windows_mutex(kernel32, name)
+            record: list[int | bool] = [handle, False]
+            handles.append(record)
+            milliseconds = max(
+                0, math.ceil(1000 * max(0.0, deadline - time.monotonic()))
+            )
+            _wait_for_windows_mutex(kernel32, handle, milliseconds)
+            record[1] = True
         yield
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_error: OSError | None = None
-        if acquired:
+        for handle_value, acquired_value in reversed(handles):
+            handle = int(handle_value)
+            if bool(acquired_value):
+                ctypes.set_last_error(0)
+                if not kernel32.ReleaseMutex(handle) and cleanup_error is None:
+                    cleanup_error = ctypes.WinError(ctypes.get_last_error())
             ctypes.set_last_error(0)
-            if not kernel32.ReleaseMutex(handle):
+            if not kernel32.CloseHandle(handle) and cleanup_error is None:
                 cleanup_error = ctypes.WinError(ctypes.get_last_error())
-        ctypes.set_last_error(0)
-        if not kernel32.CloseHandle(handle) and cleanup_error is None:
-            cleanup_error = ctypes.WinError(ctypes.get_last_error())
         if cleanup_error is not None and not active_exception:
             raise cleanup_error
 
@@ -973,10 +1016,24 @@ def _wait_for_windows_mutex(kernel32, handle: int, milliseconds: int) -> None:
 def _windows_mutex_name(paths: StatePaths) -> str:
     """Derive a collision-resistant Global name from volume and directory ID."""
     identity = _windows_directory_identity(paths.root)
+    return _windows_identity_mutex_name(identity)
+
+
+def _windows_path_mutex_name(paths: StatePaths) -> str:
+    """Name the replacement-stable mutex for one canonical configured path."""
+    canonical_path = _normalize_windows_path_for_lock(paths.root)
+    digest = hashlib.sha256(
+        f"voice-intent-normalizer-path-v1:{canonical_path}".encode()
+    ).hexdigest()
+    return f"Global\\voice-intent-normalizer-update-0-path-{digest}"
+
+
+def _windows_identity_mutex_name(identity: str) -> str:
+    """Name the alias-convergent mutex for one volume/file identity."""
     digest = hashlib.sha256(
         f"voice-intent-normalizer-state-v1:{identity}".encode("ascii")
     ).hexdigest()
-    return f"Global\\voice-intent-normalizer-update-{digest}"
+    return f"Global\\voice-intent-normalizer-update-1-identity-{digest}"
 
 
 def _normalize_windows_path_for_lock(value: str | Path) -> str:
@@ -1005,7 +1062,7 @@ def _extended_windows_path(value: str | Path) -> str:
 
 
 def _windows_directory_identity(path: Path) -> str:
-    """Query the volume serial and stable file ID through a no-follow handle."""
+    """Query the target directory's volume serial and stable native file ID."""
     import ctypes
     from ctypes import wintypes
 
@@ -1065,7 +1122,7 @@ def _windows_directory_identity(path: Path) -> str:
         0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
         None,
         3,  # OPEN_EXISTING
-        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS; follow junction aliases
         None,
     )
     if handle == ctypes.c_void_p(-1).value:
