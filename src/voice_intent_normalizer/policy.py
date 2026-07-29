@@ -14,24 +14,43 @@ ASK_THRESHOLD = 0.65
 MARGIN_THRESHOLD = 0.15
 _FLOAT_TOLERANCE = 1e-9
 
+_COMMAND_PATTERN = re.compile(
+    r"""
+    (?:
+        \b(?:git\s+(?:push|commit|reset|clean)|
+        (?:rm|del|rmdir|Remove-Item|kubectl|docker)\b)
+        |
+        (?<![A-Za-z0-9_])
+        [A-Za-z_][\w.-]*
+        \s+
+        (?:--?[\w-]+|[./~][\w./~-]*|[\w.-]+\.(?:py|js|mjs|cjs|sh|ps1))
+        |
+        \b(?:npm|pnpm|yarn|pip(?:x|3)?|poetry|uv)\s+
+        (?:publish|install|uninstall|build|run|test|add|remove|update)\b
+    )
+    """,
+    re.VERBOSE,
+)
+
 RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "path",
         re.compile(r"(?:^|\s)(?:[A-Za-z]:[\\/]|~?[\\/]|\.\.?[\\/])"),
     ),
-    (
-        "command",
-        re.compile(
-            r"\b(?:git\s+(?:push|commit|reset|clean)|"
-            r"(?:rm|del|rmdir|Remove-Item|kubectl|docker)\b)"
-        ),
-    ),
+    ("command", _COMMAND_PATTERN),
     ("semantic-version", re.compile(r"\bv?\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b")),
     ("date", re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b")),
     ("percentage", re.compile(r"\b\d+(?:\.\d+)?\s*%")),
     (
         "money",
         re.compile(r"(?:[¥￥$€]\s*\d|\b\d+(?:\.\d+)?\s*(?:元|人民币|美元|dollars?))"),
+    ),
+    (
+        "number",
+        re.compile(
+            r"(?<![A-Za-z0-9_.¥￥$€-])\d+(?:\.\d+)?"
+            r"(?![A-Za-z0-9_.-]|\s*(?:%|元|人民币|美元|dollars?\b))"
+        ),
     ),
     (
         "code-identifier",

@@ -146,6 +146,28 @@ def test_detect_risk_reports_consequential_signals(text: str, reason: str) -> No
     assert reason in assessment.reasons
 
 
+@pytest.mark.parametrize("text", ("将重试次数设为 42", "将预算系数设为 3.5"))
+def test_detect_risk_reports_standalone_numbers(text: str) -> None:
+    from voice_intent_normalizer.policy import detect_risk
+
+    assessment = detect_risk(text)
+
+    assert assessment.high_impact is True
+    assert "number" in assessment.reasons
+
+
+@pytest.mark.parametrize(
+    "text", ("python deploy.py", "npm publish", "ls -la")
+)
+def test_detect_risk_reports_clear_command_shapes(text: str) -> None:
+    from voice_intent_normalizer.policy import detect_risk
+
+    assessment = detect_risk(text)
+
+    assert assessment.high_impact is True
+    assert "command" in assessment.reasons
+
+
 def test_low_risk_apply_requires_confidence_and_competing_margin() -> None:
     from voice_intent_normalizer.policy import decide
 
