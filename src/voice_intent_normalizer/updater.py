@@ -14,25 +14,24 @@ import re
 import stat
 import tempfile
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
-from .lexicon import parse_entry
 from .models import Scope
 from .paths import StatePaths
 
 
 class Response(Protocol):
-    """A bounded-read HTTP response with its complete redirect provenance."""
+    """One response returned by a transport that does not auto-follow redirects."""
 
-    final_url: str
-    redirect_chain: Sequence[str]
+    status: int
+    location: str | None
 
     def read(self, size: int) -> bytes: ...
 
@@ -40,9 +39,9 @@ class Response(Protocol):
 
 
 class Transport(Protocol):
-    """A transport that opens one public URL without exposing local state."""
+    """A no-follow transport: the updater validates every next redirect URL."""
 
-    def open(self, url: str) -> Response: ...
+    def open_no_redirect(self, url: str) -> Response: ...
 
 
 _ALLOWED_HOSTS = frozenset(
@@ -52,6 +51,7 @@ _MAX_MANIFEST_BYTES = 256 * 1024
 _MAX_DATA_BYTES = 10 * 1024 * 1024
 _MAX_URL_LENGTH = 4096
 _MAX_REDIRECTS = 10
+_MAX_RETAINED_PAYLOADS = 4
 _UPDATE_INTERVAL = timedelta(days=1)
 _LOCK_TIMEOUT_SECONDS = 2.0
 _LOCK_RETRY_SECONDS = 0.02
@@ -117,6 +117,7 @@ def update_hotwords(
     Fetching happens outside the cross-process lease.  The lease is held only
     while recovering local state and committing a fully validated candidate.
     """
+    candidate_version: str | None = None
     try:
         checked_at = _utc_now(now)
         if not _allowed_url(manifest_url):
@@ -137,6 +138,7 @@ def update_hotwords(
         manifest = _parse_manifest(
             _fetch_limited(fetcher, manifest_url, _MAX_MANIFEST_BYTES)
         )
+        candidate_version = manifest.version
         with _update_lock(paths):
             current = _recover_locked(paths)
             immediate = _decide_known_version(paths, current, manifest, checked_at)
@@ -157,7 +159,18 @@ def update_hotwords(
             _commit_locked(paths, manifest, data, checked_at)
             return UpdateResult(UpdateStatus.UPDATED, version=manifest.version)
     except Exception as exc:
-        _record_failed_attempt(paths, now)
+        if candidate_version is not None:
+            try:
+                with _update_lock(paths):
+                    current = _recover_locked(paths)
+                    if current is not None and current.version == candidate_version:
+                        return UpdateResult(
+                            UpdateStatus.UPDATED, version=candidate_version
+                        )
+            except Exception:
+                pass
+        if not isinstance(exc, TimeoutError):
+            _record_failed_attempt(paths, now)
         return UpdateResult(UpdateStatus.REJECTED, message=_safe_message(exc))
 
 
@@ -174,6 +187,7 @@ def _commit_locked(
     _write_attempt(paths, _AttemptState(state.version, checked_at))
     _remove_pending(paths)
     _verify_current_cache(paths, state)
+    _cleanup_payloads(paths, state)
 
 
 def _decide_known_version(
@@ -204,7 +218,14 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
     """Reconcile an interrupted commit before any version decision is made."""
     _ensure_storage(paths)
     current = _read_current(paths)
-    pending = _read_pending(paths)
+    attempt = _read_attempt(paths)
+    try:
+        pending = _read_pending(paths)
+    except ValueError:
+        if current is None:
+            raise
+        _discard_pending(paths)
+        pending = None
     if pending is not None and (current is None or pending != current):
         # A prepared record without the matching authoritative pointer was not
         # committed.  Leaving its immutable payload is harmless; discard only
@@ -216,9 +237,12 @@ def _recover_locked(paths: StatePaths) -> _CurrentState | None:
     if current is not None:
         _verify_payload(paths, current)
         _materialize_current(paths, current)
-        _write_attempt(paths, _AttemptState(current.version, current.last_check))
+        if attempt is None or attempt.last_check < current.last_check:
+            _write_attempt(paths, _AttemptState(current.version, current.last_check))
     if pending is not None:
         _remove_pending(paths)
+    if current is not None:
+        _cleanup_payloads(paths, current)
     return current
 
 
@@ -269,28 +293,54 @@ def _allowed_url(value: object) -> bool:
 
 
 def _fetch_limited(fetcher: Transport, requested_url: str, limit: int) -> bytes:
-    """Validate every redirect then issue one bounded ``read(limit + 1)``."""
+    """Follow validated redirects explicitly and drain a bounded response body."""
     if not _allowed_url(requested_url):
         raise ValueError("remote source rejected")
-    response = fetcher.open(requested_url)
-    try:
-        chain = getattr(response, "redirect_chain", None)
-        final_url = getattr(response, "final_url", None)
-        if not isinstance(chain, Sequence) or isinstance(chain, (str, bytes)):
-            raise ValueError("transport did not provide redirect chain")
-        if len(chain) > _MAX_REDIRECTS:
-            raise ValueError("redirect chain exceeds limit")
-        urls = (requested_url, *chain, final_url)
-        if any(not _allowed_url(url) for url in urls):
-            raise ValueError("redirect source rejected")
-        data = response.read(limit + 1)
-        if not isinstance(data, bytes):
-            raise ValueError("transport response must yield bytes")
-        if len(data) > limit:
+    url = requested_url
+    for _ in range(_MAX_REDIRECTS + 1):
+        response = fetcher.open_no_redirect(url)
+        try:
+            status = getattr(response, "status", None)
+            location = getattr(response, "location", None)
+            if type(status) is not int:
+                raise ValueError("transport response has invalid status")
+            if status in {301, 302, 303, 307, 308}:
+                if not isinstance(location, str) or not location:
+                    raise ValueError("redirect response has no location")
+                if location != location.strip() or _CONTROL_PATTERN.search(location):
+                    raise ValueError("redirect location rejected")
+                next_url = urljoin(url, location)
+                if not _allowed_url(next_url):
+                    raise ValueError("redirect source rejected")
+                url = next_url
+                continue
+            if status != 200:
+                raise ValueError("unexpected transport response status")
+            return _read_limited(response, limit)
+        finally:
+            response.close()
+    raise ValueError("redirect chain exceeds limit")
+
+
+def _read_limited(response: Response, limit: int) -> bytes:
+    """Drain short reads through EOF while rejecting anomalous or lying streams."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining = limit + 1 - total
+        if remaining <= 0:
             raise ValueError("remote payload exceeds size limit")
-        return data
-    finally:
-        response.close()
+        chunk = response.read(min(64 * 1024, remaining))
+        if chunk == b"":
+            return b"".join(chunks)
+        if not isinstance(chunk, bytes):
+            raise ValueError("transport response must yield non-empty bytes or EOF")
+        if len(chunk) > min(64 * 1024, remaining):
+            raise ValueError("transport ignored read bound")
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("remote payload exceeds size limit")
+        chunks.append(chunk)
 
 
 def _parse_manifest(data: bytes) -> HotwordManifest:
@@ -316,6 +366,9 @@ def _parse_manifest(data: bytes) -> HotwordManifest:
 
 
 def _validate_hotword_jsonl(data: bytes) -> None:
+    # Local import keeps the authoritative resolver usable from lexicon.py.
+    from .lexicon import parse_entry
+
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -391,7 +444,19 @@ def _stage_payload(paths: StatePaths, state: _CurrentState, data: bytes) -> None
 
 
 def _verify_payload(paths: StatePaths, state: _CurrentState) -> bytes:
-    data = _read_regular_file(_payload_file(paths, state), _MAX_DATA_BYTES, "payload")
+    payload = _payload_file(paths, state)
+    if not payload.exists():
+        # The pointer is authoritative. If a crash happened after switching it
+        # but before payload cleanup completed, a matching validated cache can
+        # reconstruct the immutable payload without accepting stale bytes.
+        cached = _read_regular_file(
+            paths.hotwords_file, _MAX_DATA_BYTES, "hotword file"
+        )
+        if hashlib.sha256(cached).hexdigest() != state.sha256:
+            raise ValueError("authoritative payload is missing")
+        _validate_hotword_jsonl(cached)
+        _write_bytes_atomic(payload, cached)
+    data = _read_regular_file(payload, _MAX_DATA_BYTES, "payload")
     if hashlib.sha256(data).hexdigest() != state.sha256:
         raise ValueError("payload checksum mismatch")
     _validate_hotword_jsonl(data)
@@ -452,6 +517,53 @@ def _remove_pending(paths: StatePaths) -> None:
     if path.exists():
         _reject_symlink(path, "pending state")
         path.unlink()
+
+
+def _discard_pending(paths: StatePaths) -> None:
+    """Discard an invalid non-authoritative journal only after pointer validation."""
+    path = _pending_file(paths)
+    if path.exists():
+        _reject_symlink(path, "pending state")
+        path.unlink()
+
+
+def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
+    """Bound immutable payload retention after a verified authoritative commit."""
+    directory = _payloads_dir(paths)
+    candidates = sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and not path.is_symlink()
+            and path.name.startswith("payload-")
+            and path.suffix == ".jsonl"
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    kept = 0
+    for path in candidates:
+        if path.name == current.payload or kept < _MAX_RETAINED_PAYLOADS:
+            kept += 1
+            continue
+        path.unlink()
+
+
+def resolve_hotword_file(paths: StatePaths) -> Path | None:
+    """Return a recovered authoritative cache for LexiconSet, or fail safely."""
+    try:
+        with _update_lock(paths):
+            current = _recover_locked(paths)
+            if current is not None:
+                _verify_current_cache(paths, current)
+                return paths.hotwords_file
+            if paths.hotwords_file.is_file():
+                _read_regular_file(paths.hotwords_file, _MAX_DATA_BYTES, "hotword file")
+                return paths.hotwords_file
+    except Exception:
+        return None
+    return None
 
 
 def _record_failed_attempt(paths: StatePaths, now: datetime) -> None:
@@ -541,6 +653,7 @@ def _update_lock(paths: StatePaths) -> Iterator[None]:
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    parent_before = path.parent.stat()
     descriptor = os.open(path, flags, 0o600)
     acquired = False
     try:
@@ -549,6 +662,16 @@ def _update_lock(paths: StatePaths) -> Iterator[None]:
             os.fsync(descriptor)
         _lock_descriptor(descriptor)
         acquired = True
+        path_after = path.stat()
+        parent_after = path.parent.stat()
+        descriptor_info = os.fstat(descriptor)
+        if os.name != "nt" and (
+            (path_after.st_dev, path_after.st_ino)
+            != (descriptor_info.st_dev, descriptor_info.st_ino)
+            or (parent_before.st_dev, parent_before.st_ino)
+            != (parent_after.st_dev, parent_after.st_ino)
+        ):
+            raise ValueError("update lock path changed during acquisition")
         yield
     finally:
         try:

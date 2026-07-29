@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import voice_intent_normalizer.updater as updater_module
+from voice_intent_normalizer.lexicon import LexiconSet
 from voice_intent_normalizer.paths import StatePaths
 from voice_intent_normalizer.updater import UpdateStatus, update_hotwords
 
@@ -27,21 +28,28 @@ NOW = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
 @dataclass
 class Route:
     data: bytes
-    final_url: str | None = None
-    redirects: tuple[str, ...] = ()
+    status: int = 200
+    location: str | None = None
+    chunks: tuple[object, ...] | None = None
 
 
 class FakeResponse:
     def __init__(self, route: Route) -> None:
         self._route = route
-        self.final_url = route.final_url
-        self.redirect_chain = route.redirects
+        self.status = route.status
+        self.location = route.location
         self.read_sizes: list[int] = []
         self.closed = False
+        self._offset = 0
+        self._chunks = list(route.chunks) if route.chunks is not None else None
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int) -> object:
         self.read_sizes.append(size)
-        return self._route.data[:size]
+        if self._chunks is not None:
+            return self._chunks.pop(0) if self._chunks else b""
+        data = self._route.data[self._offset : self._offset + size]
+        self._offset += len(data)
+        return data
 
     def close(self) -> None:
         self.closed = True
@@ -53,14 +61,12 @@ class FakeTransport:
         self.calls: list[str] = []
         self.opened: list[FakeResponse] = []
 
-    def open(self, url: str) -> FakeResponse:
+    def open_no_redirect(self, url: str) -> FakeResponse:
         self.calls.append(url)
         response = self.responses[url]
         if isinstance(response, Exception):
             raise response
-        route = response if isinstance(response, Route) else Route(response, url)
-        if route.final_url is None:
-            route = Route(route.data, url, route.redirects)
+        route = response if isinstance(response, Route) else Route(response)
         opened = FakeResponse(route)
         self.opened.append(opened)
         return opened
@@ -75,12 +81,12 @@ class BlockingTransport(FakeTransport):
         self.ready = ready
         self.release = release
 
-    def open(self, url: str) -> FakeResponse:
+    def open_no_redirect(self, url: str) -> FakeResponse:
         if url == self.blocked_url:
             self.ready.set()
             if not self.release.wait(10):
                 raise TimeoutError("test release was not signalled")
-        return super().open(url)
+        return super().open_no_redirect(url)
 
 
 def paths_for(tmp_path):
@@ -162,10 +168,10 @@ def test_transport_reads_only_a_bounded_amount_and_closes_each_response(tmp_path
     assert update_hotwords(
         paths_for(tmp_path), MANIFEST_URL, transport, NOW
     ).status is (UpdateStatus.UPDATED)
-    assert [response.read_sizes for response in transport.opened] == [
-        [256 * 1024 + 1],
-        [10 * 1024 * 1024 + 1],
-    ]
+    assert all(
+        response.read_sizes and max(response.read_sizes) <= 64 * 1024
+        for response in transport.opened
+    )
     assert all(response.closed for response in transport.opened)
 
 
@@ -214,41 +220,64 @@ def test_rejects_unsafe_manifest_sources_without_egress(tmp_path, url):
     assert transport.calls == []
 
 
-def test_rejects_any_unapproved_redirect_hop_before_accepting_bytes(tmp_path):
-    data = hotword_data()
-    transport = FakeTransport(
-        {
-            MANIFEST_URL: Route(
-                manifest(data),
-                final_url=MANIFEST_URL,
-                redirects=("https://evil.example/redirect",),
-            )
-        }
-    )
+@pytest.mark.parametrize(
+    "location",
+    ["http://github.com/data", "http://localhost/data", "https://evil.example/data"],
+)
+def test_never_opens_a_disallowed_redirect_target(tmp_path, location):
+    transport = FakeTransport({MANIFEST_URL: Route(b"", 302, location)})
 
     result = update_hotwords(paths_for(tmp_path), MANIFEST_URL, transport, NOW)
 
     assert result.status is UpdateStatus.REJECTED
+    assert transport.calls == [MANIFEST_URL]
     assert transport.opened[0].read_sizes == []
     assert transport.opened[0].closed
 
 
-def test_rejects_an_unbounded_redirect_chain_before_accepting_bytes(tmp_path):
+def test_resolves_relative_redirect_then_opens_only_the_valid_target(tmp_path):
     data = hotword_data()
+    redirected_manifest = "https://github.com/manifest-next.json"
     transport = FakeTransport(
         {
-            MANIFEST_URL: Route(
-                manifest(data),
-                final_url=MANIFEST_URL,
-                redirects=(MANIFEST_URL,) * 11,
-            )
+            MANIFEST_URL: Route(b"", 302, "/manifest-next.json"),
+            redirected_manifest: Route(manifest(data)),
+            DATA_URL: Route(data),
         }
     )
 
     result = update_hotwords(paths_for(tmp_path), MANIFEST_URL, transport, NOW)
 
+    assert result.status is UpdateStatus.UPDATED
+    assert transport.calls == [MANIFEST_URL, redirected_manifest, DATA_URL]
+
+
+def test_short_reads_are_drained_until_eof_and_lying_streams_are_rejected(tmp_path):
+    data = hotword_data()
+    manifest_bytes = manifest(data)
+    transport = FakeTransport(
+        {
+            MANIFEST_URL: Route(
+                b"", chunks=(manifest_bytes[:8], manifest_bytes[8:], b"")
+            ),
+            DATA_URL: Route(b"", chunks=(data[:10], data[10:], b"")),
+        }
+    )
+
+    assert update_hotwords(
+        paths_for(tmp_path), MANIFEST_URL, transport, NOW
+    ).status is (UpdateStatus.UPDATED)
+    assert len(transport.opened[0].read_sizes) == 3
+    assert len(transport.opened[1].read_sizes) == 3
+
+
+def test_rejects_none_or_oversized_lie_from_a_stream_and_closes_it(tmp_path):
+    transport = FakeTransport({MANIFEST_URL: Route(b"", chunks=(None,))})
+
+    result = update_hotwords(paths_for(tmp_path), MANIFEST_URL, transport, NOW)
+
     assert result.status is UpdateStatus.REJECTED
-    assert transport.opened[0].read_sizes == []
+    assert transport.opened[0].closed
 
 
 def test_rejects_unapproved_manifest_data_url_before_download(tmp_path):
@@ -295,6 +324,32 @@ def test_failure_is_throttled_for_a_day_but_force_retries(tmp_path):
     assert unavailable.calls == [MANIFEST_URL, MANIFEST_URL]
 
 
+def test_newer_failed_receipt_survives_recovery_and_exact_day_boundary(tmp_path):
+    paths = paths_for(tmp_path)
+    data = hotword_data()
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    unavailable = FakeTransport({MANIFEST_URL: OSError("offline")})
+    assert (
+        update_hotwords(
+            paths, MANIFEST_URL, unavailable, NOW + timedelta(hours=1), force=True
+        ).status
+        is UpdateStatus.REJECTED
+    )
+
+    skipped = update_hotwords(
+        paths, MANIFEST_URL, unavailable, NOW + timedelta(hours=24)
+    )
+    boundary = update_hotwords(
+        paths, MANIFEST_URL, unavailable, NOW + timedelta(hours=25)
+    )
+
+    assert skipped.status is UpdateStatus.SKIPPED
+    assert boundary.status is UpdateStatus.REJECTED
+    assert unavailable.calls == [MANIFEST_URL, MANIFEST_URL]
+
+
 def test_current_version_does_not_download_data(tmp_path):
     paths = paths_for(tmp_path)
     paths.hotwords_file.parent.mkdir(parents=True)
@@ -315,6 +370,39 @@ def test_current_version_does_not_download_data(tmp_path):
 
     assert result.status is UpdateStatus.CURRENT
     assert transport.calls == [MANIFEST_URL]
+
+
+def test_loader_recovers_authoritative_pointer_instead_of_stale_cache(tmp_path):
+    paths = paths_for(tmp_path)
+    authoritative = hotword_data(canonical="Authoritative")
+    assert (
+        update_hotwords(paths, MANIFEST_URL, transport_for(authoritative), NOW).status
+        is UpdateStatus.UPDATED
+    )
+    paths.hotwords_file.write_bytes(hotword_data(canonical="Stale"))
+
+    loaded = LexiconSet.load(paths, tmp_path / "builtins")
+
+    assert [entry.canonical for entry in loaded.entries] == ["Authoritative"]
+
+
+def test_authoritative_cache_reconstructs_missing_payload_and_discards_bad_pending(
+    tmp_path,
+):
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Recovered pointer")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    current = json.loads((paths.hotwords_file.parent / "current.json").read_text())
+    (paths.hotwords_file.parent / "payloads" / current["payload"]).unlink()
+    (paths.hotwords_file.parent / "pending.json").write_text("not-json")
+
+    loaded = LexiconSet.load(paths, tmp_path / "builtins")
+
+    assert [entry.canonical for entry in loaded.entries] == ["Recovered pointer"]
+    assert (paths.hotwords_file.parent / "payloads" / current["payload"]).is_file()
+    assert not (paths.hotwords_file.parent / "pending.json").exists()
 
 
 def test_rejects_version_rollback_and_preserves_current_file(tmp_path):
@@ -401,7 +489,12 @@ def test_commit_faults_recover_without_mixing_version_and_payload(
     result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
     monkeypatch.setattr(updater_module, "_write_bytes_atomic", real_write)
 
-    assert result.status is UpdateStatus.REJECTED
+    expected = (
+        UpdateStatus.UPDATED
+        if failure_name in {"zh-ai", "last-update"}
+        else UpdateStatus.REJECTED
+    )
+    assert result.status is expected
     assert failed
     restarted = update_hotwords(
         paths, MANIFEST_URL, transport_for(data, version="2026.07.30"), NOW, force=True

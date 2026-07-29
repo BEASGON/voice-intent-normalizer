@@ -13,6 +13,7 @@ from typing import Any
 
 from .models import EntryStatus, LexiconEntry, Scope
 from .paths import StatePaths
+from .updater import resolve_hotword_file
 
 _REQUIRED_FIELDS = frozenset(
     {"canonical", "scope", "aliases", "domains", "weight", "status"}
@@ -118,8 +119,8 @@ class LexiconSet:
             if industry_path is not None:
                 layers.extend(_load_if_present(industry_path, Scope.INDUSTRY))
 
-        hotword_path = state_paths.hotwords_file
-        if not hotword_path.is_file():
+        hotword_path = resolve_hotword_file(state_paths)
+        if hotword_path is None:
             hotword_path = _first_existing(
                 (
                     builtin_paths / "hotwords-snapshot.jsonl",
