@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from voice_intent_normalizer.lexicon import load_jsonl, parse_entry, write_jsonl_atomic
+from voice_intent_normalizer.lexicon import (
+    LexiconSet,
+    load_jsonl,
+    parse_entry,
+    write_jsonl_atomic,
+)
 from voice_intent_normalizer.models import Candidate, EntryStatus, Scope
+from voice_intent_normalizer.paths import StatePaths
 
 
 def _raw_entry(**overrides: object) -> dict[str, object]:
@@ -130,3 +137,98 @@ def test_candidate_normalizes_mutable_matching_metadata():
 
     assert candidate.replacement_span == (0, 10)
     assert candidate.evidence == ("alias",)
+
+
+def _write_entries(path: Path, *entries: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def layer_fixture(tmp_path):
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    builtins_root = tmp_path / "builtins"
+    project_root = tmp_path / "project"
+    project = paths.for_project(project_root)
+
+    _write_entries(
+        paths.personal_file,
+        _raw_entry(
+            canonical="Personal WorkBuddy", scope="personal", aliases=["work body"]
+        ),
+    )
+    _write_entries(
+        project.lexicon_file,
+        _raw_entry(
+            canonical="Project WorkBuddy",
+            scope="project",
+            aliases=["work body"],
+            project_id=project.project_id,
+        ),
+        _raw_entry(
+            canonical="Other Project",
+            scope="project",
+            aliases=["other project"],
+            project_id="another-project",
+        ),
+    )
+    _write_entries(
+        builtins_root / "domains" / "ai.jsonl",
+        _raw_entry(
+            canonical="Industry WorkBuddy", scope="industry", aliases=["work body"]
+        ),
+    )
+    _write_entries(
+        paths.hotwords_file,
+        _raw_entry(canonical="Hot WorkBuddy", scope="hot", aliases=["work body"]),
+    )
+    _write_entries(
+        builtins_root / "base-zh.jsonl",
+        _raw_entry(canonical="Base WorkBuddy", scope="base", aliases=["work body"]),
+    )
+    return {
+        "state_paths": paths,
+        "builtins_root": builtins_root,
+        "project_root": project_root,
+        "domains": ("ai",),
+    }
+
+
+def test_personal_alias_wins_over_hot_alias(layer_fixture):
+    """Catch lower-precedence public data overriding a personal correction."""
+    lexicons = LexiconSet.load(**layer_fixture)
+
+    entries = lexicons.by_alias("work body")
+
+    assert entries[0].scope is Scope.PERSONAL
+
+
+def test_layered_entries_follow_precedence_and_exclude_other_projects(layer_fixture):
+    """Catch wrong layer ordering or loading another workspace's state."""
+    lexicons = LexiconSet.load(**layer_fixture)
+
+    assert [entry.scope for entry in lexicons.entries] == [
+        Scope.PERSONAL,
+        Scope.PROJECT,
+        Scope.INDUSTRY,
+        Scope.HOT,
+        Scope.BASE,
+    ]
+    assert all(entry.canonical != "Other Project" for entry in lexicons.entries)
+
+
+def test_layer_loader_keeps_last_duplicate_record_inside_one_file(layer_fixture):
+    """Catch duplicate records retaining stale, earlier data from the same file."""
+    paths = layer_fixture["state_paths"]
+    _write_entries(
+        paths.personal_file,
+        _raw_entry(canonical="Old personal", scope="personal", aliases=["old"]),
+        _raw_entry(canonical="Old personal", scope="personal", aliases=["new"]),
+    )
+
+    lexicons = LexiconSet.load(**layer_fixture)
+
+    assert lexicons.by_alias("old") == ()
+    assert lexicons.by_alias("NEW") == (lexicons.entries[0],)

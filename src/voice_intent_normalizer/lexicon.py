@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import unicodedata
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .models import EntryStatus, LexiconEntry, Scope
+from .paths import StatePaths
 
 _REQUIRED_FIELDS = frozenset(
     {"canonical", "scope", "aliases", "domains", "weight", "status"}
@@ -18,6 +21,118 @@ _OPTIONAL_FIELDS = frozenset(
     {"phonetics", "project_id", "source", "negative_aliases"}
 )
 _ALL_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
+
+
+def _normalized_alias(value: str) -> str:
+    """Normalize alias lookup keys while preserving entry display values."""
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _deduplicate(entries: Sequence[LexiconEntry]) -> tuple[LexiconEntry, ...]:
+    """Keep only the final record for each exact identity within one file."""
+    unique: dict[tuple[str, Scope, str | None], LexiconEntry] = {}
+    for entry in entries:
+        key = (entry.canonical, entry.scope, entry.project_id)
+        unique.pop(key, None)
+        unique[key] = entry
+    return tuple(unique.values())
+
+
+def _load_if_present(path: Path, scope: Scope) -> tuple[LexiconEntry, ...]:
+    """Load one lexicon when present; a present invalid file remains an error."""
+    if not path.is_file():
+        return ()
+    return _deduplicate(load_jsonl(path, expected_scope=scope))
+
+
+def _first_existing(paths: Sequence[Path]) -> Path | None:
+    """Return the first conventional built-in file that exists."""
+    return next((path for path in paths if path.is_file()), None)
+
+
+@dataclass(frozen=True, slots=True)
+class LexiconSet:
+    """Layered lexicon entries and a normalized alias index."""
+
+    entries: tuple[LexiconEntry, ...]
+    _aliases: Mapping[str, tuple[LexiconEntry, ...]] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        entries = tuple(self.entries)
+        aliases: dict[str, list[LexiconEntry]] = {}
+        for entry in entries:
+            for alias in entry.aliases:
+                aliases.setdefault(_normalized_alias(alias), []).append(entry)
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(
+            self,
+            "_aliases",
+            {alias: tuple(matches) for alias, matches in aliases.items()},
+        )
+
+    @classmethod
+    def load(
+        cls,
+        state_paths: StatePaths,
+        builtins_root: str | Path,
+        project_root: str | Path | None = None,
+        domains: Sequence[str] = (),
+    ) -> LexiconSet:
+        """Load layers in personal, project, industry, hot, then base precedence."""
+        builtin_paths = Path(builtins_root)
+        layers: list[LexiconEntry] = []
+
+        layers.extend(_load_if_present(state_paths.personal_file, Scope.PERSONAL))
+
+        if project_root is not None:
+            project_paths = state_paths.for_project(project_root)
+            project_entries = _load_if_present(
+                project_paths.lexicon_file, Scope.PROJECT
+            )
+            layers.extend(
+                entry
+                for entry in project_entries
+                if entry.project_id == project_paths.project_id
+            )
+
+        seen_domains: set[str] = set()
+        for domain in domains:
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            industry_path = _first_existing(
+                (
+                    builtin_paths / "domains" / f"{domain}.jsonl",
+                    builtin_paths / "industry" / f"{domain}.jsonl",
+                )
+            )
+            if industry_path is not None:
+                layers.extend(_load_if_present(industry_path, Scope.INDUSTRY))
+
+        hotword_path = state_paths.hotwords_file
+        if not hotword_path.is_file():
+            hotword_path = _first_existing(
+                (
+                    builtin_paths / "hotwords-snapshot.jsonl",
+                    builtin_paths / "hot.jsonl",
+                )
+            )
+        if hotword_path is not None:
+            layers.extend(_load_if_present(hotword_path, Scope.HOT))
+
+        base_path = _first_existing(
+            (builtin_paths / "base-zh.jsonl", builtin_paths / "base.jsonl")
+        )
+        if base_path is not None:
+            layers.extend(_load_if_present(base_path, Scope.BASE))
+
+        return cls(entries=tuple(layers))
+
+    def by_alias(self, alias: str) -> tuple[LexiconEntry, ...]:
+        """Return matching entries in layer precedence order."""
+        return self._aliases.get(_normalized_alias(alias), ())
 
 
 def _collection(raw: Mapping[str, Any], name: str) -> tuple[str, ...]:
