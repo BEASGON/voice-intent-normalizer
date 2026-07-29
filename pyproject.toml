@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-intent-normalizer"
+version = "0.1.0"
+description = "Validated lexicon models for Chinese voice-intent normalization."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+pinyin = ["pypinyin>=0.55,<1"]
+dev = [
+    "build>=1.2",
+    "coverage>=7.6",
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
