@@ -1,7 +1,7 @@
 # Voice Intent Normalizer 设计规格
 
 日期：2026-07-29  
-状态：待用户书面审阅  
+状态：用户已于 2026-07-29 书面通过
 建议技能名：`voice-intent-normalizer`
 
 ## 1. 背景
