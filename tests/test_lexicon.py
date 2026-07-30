@@ -208,6 +208,25 @@ def _write_transactional_hotword(
     )
 
 
+def test_corrupt_hotword_pointer_is_diagnostic_even_with_raw_fallback(tmp_path):
+    """Catch pointer corruption being hidden by a still-readable legacy cache."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    _write_entries(
+        paths.hotwords_file,
+        _raw_entry(canonical="RawFallback", scope="hot", aliases=["raw"]),
+    )
+    (paths.hotwords_file.parent / "current.json").write_text(
+        '{"payload":"not-a-valid-pointer"}', encoding="utf-8"
+    )
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins"
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == ["RawFallback"]
+    assert "hotword_state_invalid" in diagnostics
+
+
 @pytest.fixture
 def layer_fixture(tmp_path):
     paths = StatePaths.resolve(environ={}, home=tmp_path / "home")

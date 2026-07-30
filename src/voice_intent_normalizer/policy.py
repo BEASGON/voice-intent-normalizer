@@ -119,11 +119,9 @@ def _has_high_impact_support(candidate: Candidate, context: MatchContext) -> boo
         and candidate.entry.source == "explicit-learning-v1"
     ):
         return True
-    return (
-        candidate.entry.scope is Scope.PROJECT
-        and normalize_alias(candidate.canonical)
-        in {normalize_alias(term) for term in context.project_terms}
-    )
+    return candidate.entry.scope is Scope.PROJECT and normalize_alias(
+        candidate.canonical
+    ) in {normalize_alias(term) for term in context.project_terms}
 
 
 def _eligible_to_apply(
@@ -139,6 +137,8 @@ def _eligible_to_apply(
         return False
     if risk.high_impact and not _has_high_impact_support(candidate, context):
         return False
+    if risk.high_impact:
+        return True
     return _has_context_support(candidate, context) or not context.domains
 
 

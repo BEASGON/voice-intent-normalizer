@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from voice_intent_normalizer.lexicon import load_jsonl
+from voice_intent_normalizer.lexicon import load_jsonl, write_jsonl_atomic
+from voice_intent_normalizer.models import EntryStatus, LexiconEntry, Scope
 from voice_intent_normalizer.paths import StatePaths
-from voice_intent_normalizer.project_scan import scan_project
+from voice_intent_normalizer.project_scan import project_cache_is_stale, scan_project
 
 
 def _state_paths(tmp_path):
@@ -182,11 +183,59 @@ def test_scanner_returns_truncated_at_file_and_text_byte_limits(tmp_path):
     (tmp_path / "second.py").write_text("class SecondTerm:\n", encoding="utf-8")
 
     file_limited = scan_project(tmp_path, _state_paths(tmp_path), max_files=1)
-    byte_limited = scan_project(
-        tmp_path, _state_paths(tmp_path), max_text_bytes=1
-    )
+    byte_limited = scan_project(tmp_path, _state_paths(tmp_path), max_text_bytes=1)
 
     assert file_limited.truncated is True
     assert file_limited.files_scanned == 1
     assert byte_limited.truncated is True
     assert byte_limited.text_bytes_scanned == 0
+
+
+def test_scan_cache_hash_mismatch_is_stale_and_next_scan_recovers(tmp_path):
+    """Catch metadata publication that can declare an altered cache fresh."""
+    (tmp_path / "widget.py").write_text("class WidgetEngine:\n", encoding="utf-8")
+    state_paths = _state_paths(tmp_path)
+    scan_project(tmp_path, state_paths)
+    project_paths = state_paths.for_project(tmp_path)
+    project_paths.scan_lexicon_file.write_text("{}\n", encoding="utf-8")
+
+    assert project_cache_is_stale(tmp_path, state_paths) is True
+
+    scan_project(tmp_path, state_paths)
+    assert project_cache_is_stale(tmp_path, state_paths) is False
+
+
+def test_first_refresh_removes_only_legacy_scanner_records(tmp_path):
+    """Catch a migration that erases a learned project entry with old shapes."""
+    (tmp_path / "widget.py").write_text("class Widget:\n", encoding="utf-8")
+    state_paths = _state_paths(tmp_path)
+    project_paths = state_paths.for_project(tmp_path)
+    project_paths.root.mkdir(parents=True)
+    legacy = LexiconEntry(
+        canonical="Widget",
+        scope=Scope.PROJECT,
+        aliases=("Widget",),
+        domains=(),
+        weight=0.5,
+        status=EntryStatus.CANDIDATE,
+        project_id=project_paths.project_id,
+        source="widget.py",
+        notes="camel-case",
+    )
+    learned = LexiconEntry(
+        canonical="WidgetEngine",
+        scope=Scope.PROJECT,
+        aliases=("WidgetEngine",),
+        domains=(),
+        weight=0.9,
+        status=EntryStatus.CONFIRMED,
+        project_id=project_paths.project_id,
+        source="user-learning",
+    )
+    write_jsonl_atomic(project_paths.lexicon_file, (legacy, learned))
+
+    scan_project(tmp_path, state_paths)
+
+    assert [entry.canonical for entry in load_jsonl(project_paths.lexicon_file)] == [
+        "WidgetEngine"
+    ]

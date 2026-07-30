@@ -61,9 +61,9 @@ class NormalizeRequest:
                 _MAX_CONVERSATION_TERMS,
             ),
         )
-        pairs = frozenset(self.notified_pairs)
-        if len(pairs) > _MAX_NOTIFIED_PAIRS:
-            raise ValueError("notified_pairs exceeds normalization bounds")
+        pairs = frozenset(
+            _bounded_values(self.notified_pairs, "notified_pairs", _MAX_NOTIFIED_PAIRS)
+        )
         if any(
             not isinstance(pair, tuple)
             or len(pair) != 2
@@ -72,8 +72,7 @@ class NormalizeRequest:
         ):
             raise ValueError("notified_pairs must contain string pairs")
         if any(
-            len(value) > _MAX_TERM_CHARS
-            or len(value.encode("utf-8")) > _MAX_TERM_BYTES
+            len(value) > _MAX_TERM_CHARS or len(value.encode("utf-8")) > _MAX_TERM_BYTES
             for pair in pairs
             for value in pair
         ):
@@ -294,21 +293,27 @@ def _required(value: str | None) -> str:
     return value
 
 
-def _text_tuple(
-    values: Iterable[str], name: str, maximum: int
-) -> tuple[str, ...]:
-    values = tuple(values)
+def _text_tuple(values: Iterable[str], name: str, maximum: int) -> tuple[str, ...]:
+    values = _bounded_values(values, name, maximum)
     if any(not isinstance(value, str) for value in values):
         raise ValueError(f"{name} must contain only strings")
     if len(values) > maximum:
         raise ValueError(f"{name} exceeds normalization bounds")
     if any(
-        len(value) > _MAX_TERM_CHARS
-        or len(value.encode("utf-8")) > _MAX_TERM_BYTES
+        len(value) > _MAX_TERM_CHARS or len(value.encode("utf-8")) > _MAX_TERM_BYTES
         for value in values
     ):
         raise ValueError(f"{name} contains an oversized term")
     return values
+
+
+def _bounded_values(values: Iterable[Any], name: str, maximum: int) -> tuple[Any, ...]:
+    collected: list[Any] = []
+    for value in values:
+        collected.append(value)
+        if len(collected) > maximum:
+            raise ValueError(f"{name} exceeds normalization bounds")
+    return tuple(collected)
 
 
 def _unique(values: Iterable[str]) -> tuple[str, ...]:

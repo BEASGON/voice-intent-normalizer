@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .lexicon import write_jsonl_atomic
+from .lexicon import _entry_data, load_jsonl_bytes
 from .models import EntryStatus, LexiconEntry, Scope
-from .paths import StatePaths
+from .paths import StatePaths, StateRootLease, guard_state_root
 
 _EXCLUDED_DIRECTORY_NAMES = frozenset(
     {
@@ -113,7 +112,11 @@ _QUOTED_CHINESE = re.compile(r"[“\"「『]([\u4e00-\u9fff]{2,20})[”\"」』]
 _NAMED_CHINESE = re.compile(
     r"(?:产品名是|产品名称是|名称是|名为|叫做)[：:\s]*([\u4e00-\u9fff]{2,20})(?=[，。；;、\s]|$)"
 )
-_SCAN_STATE_VERSION = 1
+_SCAN_STATE_VERSION = 2
+_MAX_SCAN_STATE_BYTES = 64 * 1024
+_MAX_SCAN_CACHE_BYTES = 10 * 1024 * 1024
+_MAX_DIRECTORY_ENTRIES = 4_096
+_SCAN_ATTEMPTS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,16 +132,17 @@ class ScanResult:
 def _is_private_name(name: str) -> bool:
     """Return whether *name* is hidden or conventionally stores credentials."""
     lowered = name.casefold()
-    return lowered.startswith(".") or lowered in _SSH_PRIVATE_KEY_NAMES or any(
-        part in lowered for part in _CREDENTIAL_NAME_PARTS
+    return (
+        lowered.startswith(".")
+        or lowered in _SSH_PRIVATE_KEY_NAMES
+        or any(part in lowered for part in _CREDENTIAL_NAME_PARTS)
     )
 
 
 def _is_allowed_text_file(path: Path) -> bool:
     """Limit content checks to known text-like filenames."""
     return (
-        not _is_private_name(path.name)
-        and path.suffix.casefold() in _TEXT_EXTENSIONS
+        not _is_private_name(path.name) and path.suffix.casefold() in _TEXT_EXTENSIONS
     )
 
 
@@ -231,77 +235,38 @@ def scan_project(
         return ScanResult((), False, 0, 0)
     project_root = supplied_root.resolve()
     project_paths = state_paths.for_project(project_root)
-    observations: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
-    pending = [project_root]
-    files_scanned = 0
-    text_bytes_scanned = 0
-    truncated = False
-
-    while pending and not truncated:
-        directory = pending.pop()
-        try:
-            children = sorted(
-                directory.iterdir(), key=lambda path: path.name.casefold()
-            )
-        except OSError:
+    # A source can change while it is read.  Only publish a cache after a
+    # matching bounded metadata snapshot, otherwise retry and leave old state stale.
+    for attempt in range(_SCAN_ATTEMPTS):
+        before = _project_fingerprint(project_root, max_files=max_files)
+        result = _scan_once(
+            project_root, project_paths.project_id, max_files, max_text_bytes
+        )
+        after = _project_fingerprint(project_root, max_files=max_files)
+        if before != after:
             continue
-        for path in children:
-            if path.is_symlink():
-                continue
-            if path.is_dir():
-                if (
-                    path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
-                    and not _is_private_name(path.name)
-                ):
-                    source = _relative_source(project_root, path)
-                    _add_stem(observations, path.name, source, "directory-stem")
-                    pending.append(path)
-                continue
-            if not path.is_file() or not _is_allowed_text_file(path):
-                continue
-            if files_scanned >= max_files:
-                truncated = True
-                break
-            remaining_bytes = max_text_bytes - text_bytes_scanned
-            if remaining_bytes <= 0:
-                truncated = True
-                break
-            try:
-                with path.open("rb") as text_file:
-                    content_bytes = text_file.read(remaining_bytes + 1)
-            except OSError:
-                continue
-            if len(content_bytes) > remaining_bytes:
-                truncated = True
-                break
-            files_scanned += 1
-            text_bytes_scanned += len(content_bytes)
-            if b"\0" in content_bytes:
-                continue
-            try:
-                content = content_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            source = _relative_source(project_root, path)
-            _add_stem(observations, path.stem, source, "file-stem")
-            _extract_text_terms(content, source, observations)
-
-    entries = _entries_from_observations(observations, project_paths.project_id)
-    project_paths.root.mkdir(parents=True, exist_ok=True)
-    write_jsonl_atomic(project_paths.scan_lexicon_file, entries)
-    _write_scan_state(
-        project_paths.scan_state_file,
-        _project_fingerprint(project_root, max_files=max_files),
-        max_files=max_files,
-        max_text_bytes=max_text_bytes,
-    )
-    return ScanResult(
-        entries=entries,
-        truncated=truncated,
-        files_scanned=files_scanned,
-        text_bytes_scanned=text_bytes_scanned,
-    )
+        cache = _serialize_entries(result.entries)
+        relative_dir = Path("projects") / project_paths.project_id
+        with guard_state_root(
+            state_paths.root,
+            create=True,
+            retained_dirs=(relative_dir,),
+            create_retained=True,
+        ) as lease:
+            cache_relative = relative_dir / "project-scan.jsonl"
+            state_relative = relative_dir / "scan-state.json"
+            if not lease.exists(cache_relative):
+                _remove_pre_release_scan_entries(
+                    lease, relative_dir, project_paths.project_id
+                )
+            lease.write_bytes_atomic(cache_relative, cache)
+            generation = _next_generation(lease, state_relative)
+            lease.write_bytes_atomic(
+                state_relative,
+                _scan_state_bytes(after, cache, max_files, max_text_bytes, generation),
+            )
+        return result
+    raise RuntimeError("project changed during bounded scan")
 
 
 def project_cache_is_stale(
@@ -318,12 +283,23 @@ def project_cache_is_stale(
         return False
     project_root = supplied_root.resolve()
     project_paths = state_paths.for_project(project_root)
-    if not project_paths.scan_lexicon_file.is_file():
-        return True
+    relative_dir = Path("projects") / project_paths.project_id
     try:
-        raw = json.loads(project_paths.scan_state_file.read_text(encoding="utf-8"))
+        with guard_state_root(state_paths.root, retained_dirs=(relative_dir,)) as lease:
+            cache_relative = relative_dir / "project-scan.jsonl"
+            state_relative = relative_dir / "scan-state.json"
+            if not lease.root_exists or not lease.exists(cache_relative):
+                return True
+            cache = lease.read_bytes(
+                cache_relative, _MAX_SCAN_CACHE_BYTES, "scan cache"
+            )
+            raw = json.loads(
+                lease.read_bytes(state_relative, _MAX_SCAN_STATE_BYTES, "scan state")
+            )
         if not isinstance(raw, dict) or set(raw) != {
             "fingerprint",
+            "cache_sha256",
+            "generation",
             "max_files",
             "max_text_bytes",
             "schema_version",
@@ -334,9 +310,14 @@ def project_cache_is_stale(
             or raw["max_files"] != max_files
             or raw["max_text_bytes"] != max_text_bytes
             or not isinstance(raw["fingerprint"], str)
+            or not isinstance(raw["cache_sha256"], str)
+            or isinstance(raw["generation"], bool)
+            or not isinstance(raw["generation"], int)
         ):
             return True
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        if hashlib.sha256(cache).hexdigest() != raw["cache_sha256"]:
+            return True
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return True
     return raw["fingerprint"] != _project_fingerprint(project_root, max_files=max_files)
 
@@ -345,17 +326,23 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
     """Hash bounded metadata only; source content never enters state."""
     records: list[tuple[str, int, int]] = []
     pending = [root]
-    files_seen = 0
+    files_seen = entries_seen = 0
+    max_entries = _tree_entry_budget(max_files)
     truncated = False
     while pending and not truncated:
         directory = pending.pop()
         try:
-            children = sorted(
-                directory.iterdir(), key=lambda path: path.name.casefold()
-            )
+            children, overflow = _bounded_children(directory)
         except OSError:
             continue
+        if overflow:
+            truncated = True
+            break
         for path in children:
+            entries_seen += 1
+            if entries_seen > max_entries:
+                truncated = True
+                break
             if path.is_symlink():
                 continue
             if path.is_dir():
@@ -386,16 +373,109 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _write_scan_state(
-    path: Path,
-    fingerprint: str,
-    *,
-    max_files: int,
-    max_text_bytes: int,
-) -> None:
-    payload = json.dumps(
+def _scan_once(
+    root: Path, project_id: str, max_files: int, max_text_bytes: int
+) -> ScanResult:
+    observations: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
+    pending = [root]
+    files_scanned = text_bytes_scanned = entries_seen = 0
+    truncated = False
+    max_entries = _tree_entry_budget(max_files)
+    while pending and not truncated:
+        directory = pending.pop()
+        try:
+            children, overflow = _bounded_children(directory)
+        except OSError:
+            continue
+        if overflow:
+            truncated = True
+            break
+        directories: list[Path] = []
+        for path in children:
+            entries_seen += 1
+            if entries_seen > max_entries:
+                truncated = True
+                break
+            if path.is_symlink():
+                continue
+            if path.is_dir():
+                if (
+                    path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
+                    and not _is_private_name(path.name)
+                ):
+                    source = _relative_source(root, path)
+                    _add_stem(observations, path.name, source, "directory-stem")
+                    directories.append(path)
+                continue
+            if not path.is_file() or not _is_allowed_text_file(path):
+                continue
+            if files_scanned >= max_files or max_text_bytes - text_bytes_scanned <= 0:
+                truncated = True
+                break
+            remaining = max_text_bytes - text_bytes_scanned
+            try:
+                with path.open("rb") as text_file:
+                    content_bytes = text_file.read(remaining + 1)
+            except OSError:
+                continue
+            if len(content_bytes) > remaining:
+                truncated = True
+                break
+            files_scanned += 1
+            text_bytes_scanned += len(content_bytes)
+            if b"\0" in content_bytes:
+                continue
+            try:
+                content = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            source = _relative_source(root, path)
+            _add_stem(observations, path.stem, source, "file-stem")
+            _extract_text_terms(content, source, observations)
+        pending.extend(reversed(directories))
+    return ScanResult(
+        _entries_from_observations(observations, project_id),
+        truncated,
+        files_scanned,
+        text_bytes_scanned,
+    )
+
+
+def _bounded_children(directory: Path) -> tuple[list[Path], bool]:
+    iterator = directory.iterdir()
+    children: list[Path] = []
+    for child in iterator:
+        children.append(child)
+        if len(children) > _MAX_DIRECTORY_ENTRIES:
+            return [], True
+    return sorted(children, key=lambda path: (path.name.casefold(), path.name)), False
+
+
+def _tree_entry_budget(max_files: int) -> int:
+    return max(_MAX_DIRECTORY_ENTRIES, max_files * 4 + 1)
+
+
+def _serialize_entries(entries: Iterable[LexiconEntry]) -> bytes:
+    serialized = "\n".join(
+        json.dumps(
+            _entry_data(entry),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for entry in entries
+    )
+    return (serialized + "\n" if serialized else "").encode("utf-8")
+
+
+def _scan_state_bytes(
+    fingerprint: str, cache: bytes, max_files: int, max_text_bytes: int, generation: int
+) -> bytes:
+    return json.dumps(
         {
+            "cache_sha256": hashlib.sha256(cache).hexdigest(),
             "fingerprint": fingerprint,
+            "generation": generation,
             "max_files": max_files,
             "max_text_bytes": max_text_bytes,
             "schema_version": _SCAN_STATE_VERSION,
@@ -404,19 +484,62 @@ def _write_scan_state(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
+
+
+def _next_generation(lease: StateRootLease, relative: Path) -> int:
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
+        raw = json.loads(
+            lease.read_bytes(relative, _MAX_SCAN_STATE_BYTES, "scan state")
+        )
+        generation = raw.get("generation", 0) if isinstance(raw, dict) else 0
+        return (
+            generation + 1
+            if isinstance(generation, int) and not isinstance(generation, bool)
+            else 1
+        )
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return 1
+
+
+def _remove_pre_release_scan_entries(
+    lease: StateRootLease, relative_dir: Path, project_id: str
+) -> None:
+    relative = relative_dir / "project.jsonl"
+    if not lease.exists(relative):
+        return
+    try:
+        entries = load_jsonl_bytes(
+            lease.read_bytes(relative, _MAX_SCAN_CACHE_BYTES, "project lexicon"),
+            relative,
+            expected_scope=Scope.PROJECT,
+        )
+    except (OSError, ValueError):
+        return
+    kept = tuple(
+        entry for entry in entries if not _is_pre_release_scan_entry(entry, project_id)
+    )
+    if len(kept) != len(entries):
+        lease.write_bytes_atomic(relative, _serialize_entries(kept))
+
+
+def _is_pre_release_scan_entry(entry: LexiconEntry, project_id: str) -> bool:
+    return (
+        entry.project_id == project_id
+        and entry.scope is Scope.PROJECT
+        and entry.status in {EntryStatus.CANDIDATE, EntryStatus.REPEATED}
+        and entry.source is not None
+        and entry.notes
+        in {
+            "directory-stem",
+            "file-stem",
+            "markdown-heading",
+            "camel-case",
+            "snake-case",
+            "quoted-chinese",
+            "named-chinese",
+        }
+        and entry.aliases == (entry.canonical,)
+        and entry.domains == ()
+        and entry.phonetics == ()
+        and entry.negative_aliases == ()
+    )

@@ -206,9 +206,7 @@ def test_stale_scanner_cache_refreshes_without_erasing_project_learning(
     assert decision.corrected_text == "WorkBuddy 和 SecondWidget"
     assert project_paths.lexicon_file.is_file()
     assert project_paths.scan_lexicon_file.is_file()
-    assert "SecondWidget" in project_paths.scan_lexicon_file.read_text(
-        encoding="utf-8"
-    )
+    assert "SecondWidget" in project_paths.scan_lexicon_file.read_text(encoding="utf-8")
     assert "WorkBuddy" in project_paths.lexicon_file.read_text(encoding="utf-8")
 
 
@@ -326,6 +324,18 @@ def test_confirmed_mapping_applies_to_an_ordinary_phrase_without_context(service
     assert decision.corrected_text == "打开 WorkBuddy"
 
 
+def test_confirmed_mapping_applies_to_high_impact_text_with_unrelated_domain(service):
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    service.learning.confirm("work body", "WorkBuddy", Scope.PERSONAL)
+    decision = service.normalize(
+        NormalizeRequest(text="删除 work body", domains=("food",))
+    )
+
+    assert decision.action is DecisionAction.APPLY
+    assert decision.corrected_text == "删除 WorkBuddy"
+
+
 @pytest.mark.parametrize(
     "text",
     (
@@ -353,9 +363,16 @@ def test_request_rejects_unbounded_text_and_context_terms():
     with pytest.raises(ValueError, match="text exceeds"):
         NormalizeRequest(text="😀" * 17_000)
     with pytest.raises(ValueError, match="conversation_terms"):
-        NormalizeRequest(
-            text="ok", conversation_terms=tuple("x" for _ in range(129))
-        )
+        NormalizeRequest(text="ok", conversation_terms=tuple("x" for _ in range(129)))
+
+
+def test_request_bounds_stop_an_infinite_context_generator_promptly():
+    from itertools import repeat
+
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    with pytest.raises(ValueError, match="conversation_terms"):
+        NormalizeRequest(text="ok", conversation_terms=repeat("term"))
 
 
 def test_package_root_exports_service_contracts():

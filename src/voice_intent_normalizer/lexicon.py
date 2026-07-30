@@ -19,7 +19,7 @@ from .paths import (
     guard_state_root,
     validate_state_root,
 )
-from .updater import resolve_hotword_file
+from .updater import _read_current, _transaction_payloads_present, resolve_hotword_file
 
 _REQUIRED_FIELDS = frozenset(
     {"canonical", "scope", "aliases", "domains", "weight", "status"}
@@ -69,7 +69,7 @@ def _load_lease_if_present(
     if not lease.available(relative) or not lease.exists(relative):
         return ()
     if not stat.S_ISREG(lease.stat(relative).st_mode):
-        return ()
+        raise ValueError("lexicon layer must be a regular file")
     data = lease.read_bytes(relative, _MAX_STATE_LEXICON_BYTES, "lexicon")
     return _deduplicate(
         load_jsonl_bytes(data, relative, expected_scope=scope)
@@ -105,6 +105,18 @@ def _invalid_hotword_snapshot(lease: StateRootLease) -> bool:
             expected_scope=Scope.HOT,
         )
     except (OSError, ValueError):
+        return True
+    return False
+
+
+def _invalid_hotword_pointer(lease: StateRootLease) -> bool:
+    """Detect a corrupt current pointer even when an older raw cache works."""
+    relative = Path("hotwords") / "current.json"
+    try:
+        if not lease.available(relative) or not lease.exists(relative):
+            return False
+        _read_current(lease)
+    except (OSError, OverflowError, ValueError):
         return True
     return False
 
@@ -181,8 +193,19 @@ class LexiconSet:
             state_paths.root, retained_dirs=retained_dirs
         ) as lease:
             hotword_data = resolve_hotword_file(lease)
-            if hotword_data is None and _invalid_hotword_snapshot(lease):
-                diagnostics.append("hotword_invalid")
+            if _invalid_hotword_pointer(lease):
+                diagnostics.append("hotword_state_invalid")
+            if hotword_data is None:
+                if _invalid_hotword_snapshot(lease):
+                    diagnostics.append("hotword_invalid")
+                elif not _transaction_payloads_present(lease):
+                    # A bad pointer must not hide a separately validated raw
+                    # cache; preserve that non-authoritative fallback locally.
+                    raw_hotword = Path("hotwords") / "zh-ai.jsonl"
+                    if lease.exists(raw_hotword):
+                        hotword_data = lease.read_bytes(
+                            raw_hotword, _MAX_STATE_LEXICON_BYTES, "hotword"
+                        )
             if lease.root_exists:
                 layers.extend(
                     _safe_load_lease_layer(
