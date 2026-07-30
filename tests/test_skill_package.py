@@ -33,15 +33,31 @@ def _local_references(text: str) -> tuple[str, ...]:
 
 
 def _markdown_matrix(text: str, heading: str) -> dict[str, str]:
-    """Read one compact two-column policy matrix without snapshotting prose."""
+    """Read a named two-column policy matrix without relying on row offsets."""
     lines = text.splitlines()
-    start = lines.index(heading) + 4
+    try:
+        heading_index = lines.index(heading)
+    except ValueError as exc:
+        raise AssertionError(f"missing policy section: {heading}") from exc
+    table_start = next(
+        (
+            index
+            for index in range(heading_index + 1, len(lines) - 1)
+            if lines[index].startswith("|")
+            and lines[index + 1].replace(" ", "").startswith("|---")
+        ),
+        None,
+    )
+    assert table_start is not None, f"missing policy matrix: {heading}"
+    headers = [cell.strip() for cell in lines[table_start].strip("|").split("|")]
+    assert headers == ["Response state", "Host behavior"]
     matrix: dict[str, str] = {}
-    for line in lines[start:]:
+    for line in lines[table_start + 2 :]:
         if not line.startswith("|"):
             break
         cells = [cell.strip() for cell in line.strip("|").split("|")]
         if len(cells) == 2:
+            assert cells[0] not in matrix, f"duplicate policy row: {cells[0]}"
             matrix[cells[0]] = cells[1]
     return matrix
 
@@ -260,19 +276,21 @@ def test_skill_contract_routes_learning_and_nonfatal_diagnostics(
 
 
 def test_policy_reference_matches_skill_response_contract(repo_root: Path) -> None:
-    """Catch a policy reference that tells hosts to discard a valid decision."""
+    """Catch response rules that alter or act before a valid correction decision."""
     policy = (repo_root / "references" / "correction-policy.md").read_text(
         encoding="utf-8"
     )
     matrix = _markdown_matrix(policy, "## Response handling")
-    valid = matrix["Valid `apply`, `ask`, or `keep` action"]
-    normalized_valid = valid.casefold()
-    assert (
-        "honor" in normalized_valid
-        and "notices" in normalized_valid
-        and "diagnostics" in normalized_valid
-    )
-    assert "personal_invalid" in valid and "read_only_state" in valid
+    apply = matrix["Valid `apply` action"].casefold()
+    assert "corrected_text" in apply and "notices" in apply
+    ask = matrix["Valid `ask` action"].casefold()
+    assert "question" in ask and "wait" in ask
+    assert "never execute" in ask and "choose" in ask
+    keep = matrix["Valid `keep` action"].casefold()
+    assert "original" in keep and "no correction receipt" in keep
+    diagnostics = matrix["Valid action with non-fatal diagnostics"].casefold()
+    assert "honor" in diagnostics and "notices" in diagnostics
+    assert "personal_invalid" in diagnostics and "read_only_state" in diagnostics
     assert "fail open" in matrix[
         "Command failure, invalid JSON, or no valid action"
     ].casefold()
