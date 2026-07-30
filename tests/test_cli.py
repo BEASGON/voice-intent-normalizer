@@ -168,6 +168,41 @@ def test_bootstrap_prefers_its_own_src_over_an_earlier_pythonpath_package(tmp_pa
     assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
 
 
+def test_bootstrap_discards_a_preloaded_shadow_package_from_sitecustomize(tmp_path):
+    repository = Path(__file__).resolve().parents[1]
+    script = repository / "scripts" / "voice_intent.py"
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "sitecustomize.py").write_text(
+        "import sys\n"
+        "import types\n"
+        "package = types.ModuleType('voice_intent_normalizer')\n"
+        "package.__path__ = []\n"
+        "cli = types.ModuleType('voice_intent_normalizer.cli')\n"
+        "cli.main = lambda: 99\n"
+        "sys.modules['voice_intent_normalizer'] = package\n"
+        "sys.modules['voice_intent_normalizer.cli'] = cli\n",
+        encoding="utf-8",
+    )
+    environment = {
+        "PYTHONPATH": str(evil) + ";" + str(repository / "src"),
+        "PATH": str(Path(sys.executable).parent),
+    }
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor", "--json"],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
+
+
 def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):
     class BrokenLearning:
         def list_recent(self, limit):
@@ -212,6 +247,7 @@ def test_human_management_commands_explain_their_result(tmp_path):
     code, stdout, _ = run_cli(["doctor"], service)
     assert code == 0
     assert "Status:" in stdout
+    assert str(tmp_path) in stdout
 
 
 def test_human_scan_project_prints_a_concise_summary(tmp_path, monkeypatch):

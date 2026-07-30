@@ -266,7 +266,15 @@ def _human_result(args: argparse.Namespace, payload: dict[str, object]) -> str:
         )
     if args.command == "doctor":
         diagnostics = payload["diagnostics"]
-        lines = [f"Status: {payload['status']}"]
+        lines = [
+            f"Status: {payload['status']}",
+            f"State root: {payload['state_root']}",
+            (
+                "State check: writable"
+                if payload["status"] == "ok"
+                else "State check: unavailable"
+            ),
+        ]
         lines.extend(f"Diagnostic: {item}" for item in diagnostics)
         return "\n".join(lines) + "\n"
     if args.command == "scan-project":

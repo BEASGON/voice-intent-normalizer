@@ -8,10 +8,15 @@ from pathlib import Path
 
 def main() -> int:
     repository = Path(__file__).resolve().parents[1]
-    _prioritize_source(repository / "src")
-    from voice_intent_normalizer.cli import main as cli_main
+    source = repository / "src"
+    _prioritize_source(source)
+    _clear_preloaded_package()
+    from voice_intent_normalizer import cli
 
-    return cli_main()
+    if not _is_below(cli.__file__, source):
+        raise RuntimeError("trusted repository CLI could not be imported")
+
+    return cli.main()
 
 
 def _prioritize_source(source: Path) -> None:
@@ -24,6 +29,22 @@ def _prioritize_source(source: Path) -> None:
 
 def _canonical_path(value: str | Path) -> str:
     return str(Path(value).expanduser().resolve()).casefold()
+
+
+def _clear_preloaded_package() -> None:
+    for name in tuple(sys.modules):
+        if name == "voice_intent_normalizer" or name.startswith(
+            "voice_intent_normalizer."
+        ):
+            del sys.modules[name]
+
+
+def _is_below(value: str | None, root: Path) -> bool:
+    if value is None:
+        return False
+    candidate = _canonical_path(value)
+    trusted = _canonical_path(root)
+    return candidate == trusted or candidate.startswith(trusted + "\\")
 
 
 if __name__ == "__main__":

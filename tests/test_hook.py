@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 from io import BytesIO, StringIO, TextIOWrapper
+from types import SimpleNamespace
+
+import pytest
 
 from voice_intent_normalizer.models import CorrectionDecision, DecisionAction
 
@@ -195,6 +198,23 @@ class BrokenStream:
         raise UnicodeEncodeError("ascii", value, 0, 1, "injected")
 
 
+class RecordingStream:
+    encoding = "utf-8"
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    def write(self, value: str) -> int:
+        self.writes.append(value)
+        return len(value)
+
+
+class PartialFailureStream(RecordingStream):
+    def write(self, value: str) -> int:
+        self.writes.append(value[:5])
+        raise OSError("injected partial write")
+
+
 def test_hook_reconfigures_utf8_streams_and_falls_back_to_ascii_json(monkeypatch):
     from voice_intent_normalizer import hook
 
@@ -236,3 +256,49 @@ def test_hook_output_write_failure_still_returns_zero():
         stdout=BrokenStream(),
         stderr=StringIO(),
     ) == 0
+
+
+def test_hook_writes_one_complete_json_frame_once():
+    from voice_intent_normalizer.hook import main
+
+    destination = RecordingStream()
+    assert main(
+        stdin=StringIO('{"hook_event_name":"Other","prompt":"ignored"}'),
+        stdout=destination,
+        stderr=StringIO(),
+    ) == 0
+
+    assert len(destination.writes) == 1
+    assert destination.writes[0].endswith("\n")
+    assert json.loads(destination.writes[0]) == {}
+
+
+def test_hook_does_not_retry_after_a_partial_write_failure():
+    from voice_intent_normalizer.hook import main
+
+    destination = PartialFailureStream()
+    assert main(
+        stdin=StringIO('{"hook_event_name":"Other","prompt":"secret"}'),
+        stdout=destination,
+        stderr=StringIO(),
+    ) == 0
+
+    assert destination.writes == ["{}\n"]
+
+
+@pytest.mark.parametrize("action", [None, "apply", "ask", object()])
+def test_hook_fails_open_for_unknown_action_values(action):
+    from voice_intent_normalizer.hook import handle_user_prompt_submit
+
+    service = SimpleNamespace(
+        normalize=lambda request: SimpleNamespace(
+            action=action,
+            corrected_text="dangerous candidate",
+            question="confirm?",
+        )
+    )
+
+    assert handle_user_prompt_submit(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "do thing"},
+        service,
+    ) == {}

@@ -47,6 +47,11 @@ def handle_user_prompt_submit(
         decision = service.normalize(request)
         if decision.action is DecisionAction.KEEP:
             return {}
+        if (
+            decision.action is not DecisionAction.APPLY
+            and decision.action is not DecisionAction.ASK
+        ):
+            return {}
         context = _context_for(
             decision.action, decision.corrected_text, decision.question
         )
@@ -142,12 +147,23 @@ def _configure_utf8(*streams: object) -> None:
 
 
 def _write_json_fail_open(destination: TextIO, payload: dict[str, object]) -> None:
-    for ensure_ascii in (False, True):
-        try:
-            destination.write(
-                json.dumps(payload, ensure_ascii=ensure_ascii, separators=(",", ":"))
-            )
-            destination.write("\n")
-            return
-        except Exception:
-            continue
+    try:
+        frame = json.dumps(
+            payload,
+            ensure_ascii=not _is_utf8_stream(destination),
+            separators=(",", ":"),
+        ) + "\n"
+    except Exception:
+        frame = "{}\n"
+    try:
+        destination.write(frame)
+    except Exception:
+        return
+
+
+def _is_utf8_stream(destination: TextIO) -> bool:
+    encoding = getattr(destination, "encoding", None)
+    return isinstance(encoding, str) and encoding.casefold().replace("_", "-") in {
+        "utf-8",
+        "utf8",
+    }
