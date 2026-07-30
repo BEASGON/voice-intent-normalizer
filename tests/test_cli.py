@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -201,6 +202,53 @@ def test_bootstrap_discards_a_preloaded_shadow_package_from_sitecustomize(tmp_pa
 
     assert result.returncode == 0
     assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
+
+
+@pytest.fixture
+def bootstrap_module():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "voice_intent.py"
+    spec = importlib.util.spec_from_file_location("test_voice_intent_bootstrap", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("candidate", "root", "expected"),
+    [
+        ("/repo/src/voice_intent_normalizer/cli.py", "/repo/src", True),
+        ("/repo/src", "/repo/src", True),
+        ("/repo/src-sibling/cli.py", "/repo/src", False),
+        ("/repo/src/../secret.py", "/repo/src", False),
+        ("/repo/SRC/cli.py", "/repo/src", False),
+    ],
+)
+def test_bootstrap_posix_containment_is_lexical_and_case_sensitive(
+    bootstrap_module, candidate, root, expected
+):
+    assert (
+        bootstrap_module._is_below(candidate, root, flavor="posix") is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("candidate", "root", "expected"),
+    [
+        (r"C:\Repo\src\voice_intent_normalizer\cli.py", r"C:\Repo\src", True),
+        (r"C:/REPO/src/voice_intent_normalizer/cli.py", r"C:\Repo\src", True),
+        (r"\\?\C:\repo\src\voice_intent_normalizer\cli.py", r"C:\Repo\src", True),
+        (r"C:\Repo\src-sibling\cli.py", r"C:\Repo\src", False),
+        (r"D:\Repo\src\cli.py", r"C:\Repo\src", False),
+        (r"\\server\share\src\cli.py", r"C:\Repo\src", False),
+    ],
+)
+def test_bootstrap_windows_containment_normalizes_equivalent_paths(
+    bootstrap_module, candidate, root, expected
+):
+    assert (
+        bootstrap_module._is_below(candidate, root, flavor="windows") is expected
+    )
 
 
 def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):
