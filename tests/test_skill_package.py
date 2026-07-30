@@ -39,15 +39,15 @@ def _markdown_matrix(text: str, heading: str) -> dict[str, str]:
         heading_index = lines.index(heading)
     except ValueError as exc:
         raise AssertionError(f"missing policy section: {heading}") from exc
-    table_start = next(
-        (
-            index
-            for index in range(heading_index + 1, len(lines) - 1)
-            if lines[index].startswith("|")
-            and lines[index + 1].replace(" ", "").startswith("|---")
-        ),
-        None,
-    )
+    table_start = None
+    for index in range(heading_index + 1, len(lines) - 1):
+        if lines[index].startswith("#"):
+            break
+        if lines[index].startswith("|") and lines[index + 1].replace(
+            " ", ""
+        ).startswith("|---"):
+            table_start = index
+            break
     assert table_start is not None, f"missing policy matrix: {heading}"
     headers = [cell.strip() for cell in lines[table_start].strip("|").split("|")]
     assert headers == ["Response state", "Host behavior"]
@@ -60,6 +60,35 @@ def _markdown_matrix(text: str, heading: str) -> dict[str, str]:
             assert cells[0] not in matrix, f"duplicate policy row: {cells[0]}"
             matrix[cells[0]] = cells[1]
     return matrix
+
+
+_RESPONSE_HANDLING_CONTRACT = {
+    "Valid `apply` action": (
+        "Interpret this turn using `corrected_text`; show returned notices."
+    ),
+    "Valid `ask` action": (
+        "Display `question` and wait; never execute the task or choose a candidate "
+        "first."
+    ),
+    "Valid `keep` action": "Use original text with no correction receipt.",
+    "Valid action with non-fatal diagnostics": (
+        "Honor the decision even with `personal_invalid`, `read_only_state`, or "
+        "another non-fatal diagnostic; show notices and report relevant diagnostics "
+        "briefly."
+    ),
+    "Command failure, invalid JSON, or no valid action": (
+        "Fail open: retain the original text and do not invent a correction."
+    ),
+    "`status=degraded` without a decision": (
+        "Fail open: retain the original text and report local correction as "
+        "unavailable."
+    ),
+}
+
+
+def _assert_response_handling_contract(matrix: dict[str, str]) -> None:
+    """Check the stable machine-readable contract with hand-authored literals."""
+    assert matrix == _RESPONSE_HANDLING_CONTRACT
 
 
 def _service(tmp_path: Path, repo_root: Path) -> NormalizerService:
@@ -281,20 +310,120 @@ def test_policy_reference_matches_skill_response_contract(repo_root: Path) -> No
         encoding="utf-8"
     )
     matrix = _markdown_matrix(policy, "## Response handling")
-    apply = matrix["Valid `apply` action"].casefold()
-    assert "corrected_text" in apply and "notices" in apply
-    ask = matrix["Valid `ask` action"].casefold()
-    assert "question" in ask and "wait" in ask
-    assert "never execute" in ask and "choose" in ask
-    keep = matrix["Valid `keep` action"].casefold()
-    assert "original" in keep and "no correction receipt" in keep
-    diagnostics = matrix["Valid action with non-fatal diagnostics"].casefold()
-    assert "honor" in diagnostics and "notices" in diagnostics
-    assert "personal_invalid" in diagnostics and "read_only_state" in diagnostics
-    assert "fail open" in matrix[
-        "Command failure, invalid JSON, or no valid action"
-    ].casefold()
-    assert "fail open" in matrix["`status=degraded` without a decision"].casefold()
+    _assert_response_handling_contract(matrix)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        (
+            "Interpret this turn using `corrected_text`; show returned notices.",
+            "Do not interpret `corrected_text`; show returned notices only after "
+            "execution.",
+        ),
+        (
+            "Display `question` and wait; never execute the task or choose a "
+            "candidate first.",
+            "Display `question` and wait only after you choose a candidate; never "
+            "execute safeguards, then execute the task.",
+        ),
+        (
+            "Use original text with no correction receipt.",
+            "Do not use original text; no correction receipt is forbidden.",
+        ),
+        (
+            "Honor the decision even with `personal_invalid`, `read_only_state`, "
+            "or another non-fatal diagnostic; show notices and report relevant "
+            "diagnostics briefly.",
+            "Do not honor the decision even with `personal_invalid`, "
+            "`read_only_state`, or another non-fatal diagnostic; show notices and "
+            "report relevant diagnostics briefly.",
+        ),
+        (
+            "Fail open: retain the original text and do not invent a correction.",
+            "Do not fail open: retain the original text only after inventing a "
+            "correction.",
+        ),
+        (
+            "Fail open: retain the original text and report local correction as "
+            "unavailable.",
+            "Do not fail open: retain the original text only after reporting local "
+            "correction as available.",
+        ),
+    ),
+)
+def test_response_matrix_contract_rejects_semantic_reversals(
+    repo_root: Path, before: str, after: str
+) -> None:
+    """Catch reversed instructions even when they retain the old keyword set."""
+    policy = (repo_root / "references" / "correction-policy.md").read_text(
+        encoding="utf-8"
+    )
+    mutated = policy.replace(before, after, 1)
+    assert mutated != policy
+    with pytest.raises(AssertionError):
+        _assert_response_handling_contract(
+            _markdown_matrix(mutated, "## Response handling")
+        )
+
+
+def test_response_matrix_contract_is_scoped_and_tolerates_safe_formatting(
+    repo_root: Path,
+) -> None:
+    """Catch a copied table in another section while allowing safe formatting."""
+    policy = (repo_root / "references" / "correction-policy.md").read_text(
+        encoding="utf-8"
+    )
+    moved = policy.replace(
+        "## Response handling\n\n",
+        "## Response handling\n\nNo response matrix belongs here.\n\n## Unrelated\n\n",
+        1,
+    )
+    with pytest.raises(AssertionError, match="missing policy matrix"):
+        _markdown_matrix(moved, "## Response handling")
+
+    unchanged_contract = policy.replace(
+        "High-impact text", "Editorial explanation"
+    )
+    _assert_response_handling_contract(
+        _markdown_matrix(unchanged_contract, "## Response handling")
+    )
+
+    reordered_rows = "\n".join(
+        f"| {key} | {value} |"
+        for key, value in reversed(tuple(_RESPONSE_HANDLING_CONTRACT.items()))
+    )
+    reordered = re.sub(
+        r"(?ms)(\| Response state \| Host behavior \|\n\| --- \| --- \|\n).*?(?=\n\n)",
+        rf"\1{reordered_rows}",
+        policy,
+        count=1,
+    )
+    _assert_response_handling_contract(
+        _markdown_matrix(reordered, "## Response handling")
+    )
+
+
+def test_response_matrix_contract_rejects_duplicate_and_missing_keys(
+    repo_root: Path,
+) -> None:
+    """Catch tables that silently lose or duplicate one required response rule."""
+    policy = (repo_root / "references" / "correction-policy.md").read_text(
+        encoding="utf-8"
+    )
+    apply_row = (
+        "| Valid `apply` action | Interpret this turn using `corrected_text`; "
+        "show returned notices. |"
+    )
+    duplicate = policy.replace(apply_row, f"{apply_row}\n{apply_row}", 1)
+    with pytest.raises(AssertionError, match="duplicate policy row"):
+        _markdown_matrix(duplicate, "## Response handling")
+
+    missing = policy.replace(f"{apply_row}\n", "", 1)
+    with pytest.raises(AssertionError):
+        _assert_response_handling_contract(
+            _markdown_matrix(missing, "## Response handling")
+        )
 
 
 def test_bootstrap_normalize_returns_stable_json(
