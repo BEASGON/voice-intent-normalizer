@@ -32,6 +32,20 @@ def _local_references(text: str) -> tuple[str, ...]:
     return tuple(re.findall(r"\]\((references/[^)]+\.md)\)", text))
 
 
+def _markdown_matrix(text: str, heading: str) -> dict[str, str]:
+    """Read one compact two-column policy matrix without snapshotting prose."""
+    lines = text.splitlines()
+    start = lines.index(heading) + 4
+    matrix: dict[str, str] = {}
+    for line in lines[start:]:
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) == 2:
+            matrix[cells[0]] = cells[1]
+    return matrix
+
+
 def _service(tmp_path: Path, repo_root: Path) -> NormalizerService:
     return NormalizerService(
         StatePaths(root=tmp_path / "state"), repo_root / "assets" / "lexicons"
@@ -243,6 +257,26 @@ def test_skill_contract_routes_learning_and_nonfatal_diagnostics(
     assert "personal or the active project" in text
     assert "valid `apply`, `ask`, or `keep`" in text
     assert "non-fatal diagnostics" in text
+
+
+def test_policy_reference_matches_skill_response_contract(repo_root: Path) -> None:
+    """Catch a policy reference that tells hosts to discard a valid decision."""
+    policy = (repo_root / "references" / "correction-policy.md").read_text(
+        encoding="utf-8"
+    )
+    matrix = _markdown_matrix(policy, "## Response handling")
+    valid = matrix["Valid `apply`, `ask`, or `keep` action"]
+    normalized_valid = valid.casefold()
+    assert (
+        "honor" in normalized_valid
+        and "notices" in normalized_valid
+        and "diagnostics" in normalized_valid
+    )
+    assert "personal_invalid" in valid and "read_only_state" in valid
+    assert "fail open" in matrix[
+        "Command failure, invalid JSON, or no valid action"
+    ].casefold()
+    assert "fail open" in matrix["`status=degraded` without a decision"].casefold()
 
 
 def test_bootstrap_normalize_returns_stable_json(
