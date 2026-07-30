@@ -32,33 +32,95 @@ def _local_references(text: str) -> tuple[str, ...]:
     return tuple(re.findall(r"\]\((references/[^)]+\.md)\)", text))
 
 
+_ATX_HEADING = re.compile(r" {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_SETEXT_UNDERLINE = re.compile(r" {0,3}(=+|-+)[ \t]*$")
+_TABLE_SEPARATOR = re.compile(r":?-{3,}:?$")
+
+
+def _markdown_headings(lines: list[str]) -> tuple[tuple[int, int, str], ...]:
+    """Find the small CommonMark heading subset used to bound policy sections."""
+    headings: list[tuple[int, int, str]] = []
+    for index, line in enumerate(lines):
+        atx = _ATX_HEADING.fullmatch(line)
+        if atx is not None:
+            headings.append((index, len(atx.group(1)), atx.group(2).strip()))
+        if (
+            index + 1 < len(lines)
+            and line.strip()
+            and not line.lstrip().startswith("|")
+            and (setext := _SETEXT_UNDERLINE.fullmatch(lines[index + 1]))
+            is not None
+        ):
+            level = 1 if setext.group(1).startswith("=") else 2
+            headings.append((index, level, line.strip()))
+    return tuple(headings)
+
+
+def _table_cells(line: str) -> tuple[str, ...]:
+    """Split one pipe row on unescaped separators and unescape cell contents."""
+    assert line.startswith("|"), "policy table rows must start with a pipe"
+    cells: list[str] = []
+    buffer: list[str] = []
+    escaped = False
+    for character in line:
+        if escaped:
+            buffer.append(character)
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "|":
+            cells.append("".join(buffer).strip())
+            buffer = []
+        else:
+            buffer.append(character)
+    assert not escaped, "policy table rows cannot end with an escape"
+    cells.append("".join(buffer).strip())
+    assert cells[0] == "" and cells[-1] == "", "policy table rows need edge pipes"
+    return tuple(cells[1:-1])
+
+
 def _markdown_matrix(text: str, heading: str) -> dict[str, str]:
-    """Read a named two-column policy matrix without relying on row offsets."""
+    """Read the strict response table inside one uniquely named Markdown section."""
     lines = text.splitlines()
-    try:
-        heading_index = lines.index(heading)
-    except ValueError as exc:
-        raise AssertionError(f"missing policy section: {heading}") from exc
-    table_start = None
-    for index in range(heading_index + 1, len(lines) - 1):
-        if lines[index].startswith("#"):
-            break
-        if lines[index].startswith("|") and lines[index + 1].replace(
-            " ", ""
-        ).startswith("|---"):
-            table_start = index
-            break
+    headings = _markdown_headings(lines)
+    target = [
+        index
+        for index, level, title in headings
+        if level == 2 and title == "Response handling" and lines[index] == heading
+    ]
+    assert len(target) == 1, f"missing or ambiguous policy section: {heading}"
+    assert sum(title == "Response handling" for _, _, title in headings) == 1
+    start = target[0]
+    section_end = next(
+        (index for index, _, _ in headings if index > start), len(lines)
+    )
+    table_start = next(
+        (
+            index
+            for index in range(start + 1, section_end)
+            if lines[index].startswith("|")
+        ),
+        None,
+    )
     assert table_start is not None, f"missing policy matrix: {heading}"
-    headers = [cell.strip() for cell in lines[table_start].strip("|").split("|")]
-    assert headers == ["Response state", "Host behavior"]
+    assert _table_cells(lines[table_start]) == ("Response state", "Host behavior")
+    separator = _table_cells(lines[table_start + 1])
+    assert len(separator) == 2 and all(
+        _TABLE_SEPARATOR.fullmatch(cell) for cell in separator
+    ), "invalid policy table separator"
+
     matrix: dict[str, str] = {}
-    for line in lines[table_start + 2 :]:
-        if not line.startswith("|"):
-            break
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) == 2:
-            assert cells[0] not in matrix, f"duplicate policy row: {cells[0]}"
-            matrix[cells[0]] = cells[1]
+    table_end = table_start + 2
+    while table_end < section_end and lines[table_end].startswith("|"):
+        cells = _table_cells(lines[table_end])
+        assert len(cells) == 2, "policy table rows must have exactly two cells"
+        key, value = cells
+        assert key not in matrix, f"duplicate policy row: {key}"
+        matrix[key] = value
+        table_end += 1
+    assert not any(
+        line.startswith("|") for line in lines[table_end:section_end]
+    ), "unexpected policy table row"
     return matrix
 
 
@@ -424,6 +486,66 @@ def test_response_matrix_contract_rejects_duplicate_and_missing_keys(
         _assert_response_handling_contract(
             _markdown_matrix(missing, "## Response handling")
         )
+
+
+@pytest.mark.parametrize(
+    "mutated",
+    (
+        lambda policy: policy.replace(
+            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
+            "show returned notices. |",
+            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
+            "show returned notices. |\n| Valid `apply` action | hostile \\| "
+            "conflicting instruction |",
+            1,
+        ),
+        lambda policy: policy.replace(
+            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
+            "show returned notices. |",
+            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
+            "show returned notices. |\n| Valid `apply` action | hostile conflict | "
+            "extra |",
+            1,
+        ),
+        lambda policy: policy.replace(
+            "## Response handling\n\n",
+            "## Response handling\n\n   ## Unrelated\n\n",
+            1,
+        ),
+        lambda policy: policy.replace(
+            "## Response handling\n\n",
+            "## Response handling\n\nUnrelated\n---\n\n",
+            1,
+        ),
+    ),
+)
+def test_response_matrix_parser_rejects_malformed_rows_and_section_escapes(
+    repo_root: Path, mutated: object
+) -> None:
+    """Catch malformed same-key rows and tables that escaped the target section."""
+    policy = (repo_root / "references" / "correction-policy.md").read_text(
+        encoding="utf-8"
+    )
+    altered = mutated(policy)
+    assert altered != policy
+    with pytest.raises(AssertionError):
+        _markdown_matrix(altered, "## Response handling")
+
+
+def test_response_matrix_parser_unescapes_a_normal_pipe_in_a_cell() -> None:
+    """Catch a tokenizer that mistakes an escaped pipe for a third table cell."""
+    text = "\n".join(
+        (
+            "## Response handling",
+            "",
+            "| Response state | Host behavior |",
+            "| --- | --- |",
+            "| Valid `apply` action | Show a receipt \\| keep it concise. |",
+        )
+    )
+    assert _markdown_matrix(text, "## Response handling") == {
+        "Valid `apply` action": "Show a receipt | keep it concise."
+    }
 
 
 def test_bootstrap_normalize_returns_stable_json(
