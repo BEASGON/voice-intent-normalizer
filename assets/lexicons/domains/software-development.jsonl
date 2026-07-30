@@ -1,2 +1,2 @@
-{"canonical":"Codex","scope":"industry","aliases":["code X","code ex"],"phonetics":[],"domains":["software-development"],"weight":0.95,"status":"curated","source":"public-curated-v1"}
-{"canonical":"WorkBuddy","scope":"industry","aliases":["work body"],"phonetics":[],"domains":["software-development"],"weight":0.8,"status":"curated","source":"public-curated-v1"}
+{"canonical":"Codex","scope":"industry","aliases":["codex cli"],"phonetics":[],"domains":["software-development"],"weight":0.95,"status":"curated","source":"codex-software-aliases-v1"}
+{"canonical":"WorkBuddy","scope":"industry","aliases":["work buddy dev"],"phonetics":[],"domains":["software-development"],"weight":0.8,"status":"curated","source":"workbuddy-software-aliases-v1"}

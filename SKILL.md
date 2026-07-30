@@ -22,9 +22,11 @@ correction/learning request.
 
    Add `--conversation-term "<term>"` for a term stated in this conversation.
    Add `--project-root "<direct local project path>"` only for the active project.
-   Consume the returned JSON fields `action`, `corrected_text`, `question`,
-   `notices`, and `diagnostics`; never invent a correction when the command
-   fails or returns degraded diagnostics.
+   Parse one JSON response. Fail open to the original text only when the command
+   fails, JSON is invalid, no valid `apply`, `ask`, or `keep` action is present,
+   or it returns `status=degraded` without a decision. When a valid decision has
+   non-fatal diagnostics (for example `read_only_state` or `personal_invalid`),
+   honor its action and notices, then report the relevant diagnostic briefly.
 
 2. If `action` is `apply`, use `corrected_text` as this turn's interpretation,
    then show every returned notice. Phrase it as “我将按 … 理解”, never as a
@@ -37,15 +39,23 @@ correction/learning request.
    that a correction occurred.
 
 5. Only learn after an explicit instruction such as “以后把 A 理解为 B” or
-   “不要把 A 改成 B”. Use the matching command below. Never infer learning
-   from normal conversation, read all history, or modify live voice input.
+   “不要把 A 改成 B”. For a cross-project personal preference, use `personal`.
+   For a name or repository term specific to the active project, use `project`
+   with its direct local root. If the user did not specify and the meaning does
+   not determine personal or the active project, ask which scope they want;
+   do not write a mapping. Never infer learning from normal conversation, read
+   all history, or modify live voice input.
 
    ```powershell
    python scripts/voice_intent.py learn --alias "A" --canonical "B" --scope personal --json
+   python scripts/voice_intent.py learn --alias "A" --canonical "B" --scope project --project-root "<direct active project>" --json
    python scripts/voice_intent.py reject --alias "A" --canonical "B" --json
    python scripts/voice_intent.py undo --json
    python scripts/voice_intent.py list --json
    ```
+
+   `reject` is a personal “do not correct A as B” rule. `undo` reverses the
+   latest effective explicit learning action; `list` shows recent local actions.
 
 ## Quick reference
 
@@ -53,13 +63,14 @@ correction/learning request.
 | --- | --- |
 | `code X` in an AI request | Normalize with `--domain ai`; honor the decision. |
 | “龙虾” / “小龙虾” | Treat as ambiguous; require the returned policy decision. |
-| Exact personal correction | Use `learn` or `reject`; confirm only its local result. |
-| CLI error or diagnostic degradation | Fail open to the original text. |
+| Explicit correction | Choose personal or project scope; ask if it is unclear. |
+| Invalid decision JSON or degraded-without-decision | Fail open to the original text. |
 
 ## Common mistakes
 
 - Do not silently learn preferences from an ordinary task.
-- Do not use a project path through a symlink, junction, network share, or alias.
+- Do not use a project path through a symlink, junction, network share, mapped
+  alias, or non-direct path.
 - Do not treat a likely product name as permission to execute destructive or
   publishing actions; honor an `ask` result first.
 

@@ -1,4 +1,3 @@
-{"canonical":"Codex","scope":"industry","aliases":["code X","code ex"],"phonetics":[],"domains":["ai","agent"],"weight":0.95,"status":"curated","source":"public-curated-v1"}
-{"canonical":"OpenClaw","scope":"industry","aliases":["Open Clow","Open Cloud"],"phonetics":[],"domains":["ai","agent"],"weight":0.95,"status":"curated","source":"public-curated-v1"}
-{"canonical":"OpenClaw","scope":"industry","aliases":["龙虾","小龙虾"],"phonetics":[],"domains":["ai","agent"],"weight":0.5,"status":"curated","source":"public-curated-v1","notes":"ambiguous-ai-alias"}
-{"canonical":"WorkBuddy","scope":"industry","aliases":["Work body","work body"],"phonetics":[],"domains":["ai","agent"],"weight":0.95,"status":"curated","source":"public-curated-v1"}
+{"canonical":"Codex","scope":"industry","aliases":["code X","code ex"],"phonetics":[],"domains":["ai","agent"],"weight":0.95,"status":"curated","source":"codex-ai-aliases-v1"}
+{"canonical":"OpenClaw","scope":"industry","aliases":["open clow","open cloud","龙虾","小龙虾"],"phonetics":[],"domains":["ai","agent"],"weight":0.95,"status":"curated","source":"openclaw-ai-aliases-v1","notes":"ambiguous-ai-aliases-require-ai-context"}
+{"canonical":"WorkBuddy","scope":"industry","aliases":["work body"],"phonetics":[],"domains":["ai","agent"],"weight":0.95,"status":"curated","source":"workbuddy-ai-aliases-v1"}
