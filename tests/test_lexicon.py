@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,7 +17,7 @@ from voice_intent_normalizer.lexicon import (
     write_jsonl_atomic,
 )
 from voice_intent_normalizer.models import Candidate, EntryStatus, Scope
-from voice_intent_normalizer.paths import StatePaths
+from voice_intent_normalizer.paths import StatePaths, StateRootLease
 
 
 def _raw_entry(**overrides: object) -> dict[str, object]:
@@ -253,6 +256,121 @@ def test_layered_entries_follow_precedence_and_exclude_other_projects(layer_fixt
     assert all(entry.canonical != "Other Project" for entry in lexicons.entries)
 
 
+def test_hotword_load_uses_the_bytes_validated_by_authority_resolution(
+    tmp_path, monkeypatch
+):
+    """Catch reopening a replaced cache after its authoritative pointer was read."""
+    paths = StatePaths(root=tmp_path / "state")
+    authoritative = _raw_entry(
+        canonical="Authoritative", scope="hot", aliases=["authority"]
+    )
+    replacement = _raw_entry(
+        canonical="Replacement", scope="hot", aliases=["replacement"]
+    )
+    from voice_intent_normalizer.updater import UpdateStatus, update_hotwords
+
+    data = (json.dumps(authoritative) + "\n").encode()
+
+    class _Response:
+        status = 200
+        location = None
+
+        def __init__(self, content):
+            self.content = content
+            self.offset = 0
+
+        def read(self, size):
+            chunk = self.content[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def close(self):
+            return None
+
+    class _Transport:
+        def open_no_redirect(self, url):
+            if url.endswith("manifest.json"):
+                content = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "version": "2026.07.30",
+                        "data_url": (
+                            "https://github.com/BEASGON/voice-intent-normalizer/"
+                            "releases/download/data/zh-ai.jsonl"
+                        ),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                ).encode()
+            else:
+                content = data
+            return _Response(content)
+
+    result = update_hotwords(
+        paths,
+        (
+            "https://github.com/BEASGON/voice-intent-normalizer/"
+            "releases/download/data/manifest.json"
+        ),
+        _Transport(),
+        datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    assert result.status is UpdateStatus.UPDATED
+    real_resolve = lexicon_module.resolve_hotword_file
+
+    def replace_after_resolution(authority):
+        resolved = real_resolve(authority)
+        (paths.hotwords_file.parent / "current.json").unlink()
+        _write_entries(paths.hotwords_file, replacement)
+        return resolved
+
+    monkeypatch.setattr(
+        lexicon_module, "resolve_hotword_file", replace_after_resolution
+    )
+
+    lexicons = LexiconSet.load(paths, tmp_path / "builtins")
+
+    assert [entry.canonical for entry in lexicons.entries] == ["Authoritative"]
+
+
+def test_missing_project_directory_stays_unavailable_for_the_whole_load(
+    tmp_path, monkeypatch
+):
+    """Catch a missing retained project layer degrading to an alias-following path."""
+    paths = StatePaths(root=tmp_path / "state")
+    paths.root.mkdir()
+    project_root = tmp_path / "workspace"
+    project = paths.for_project(project_root)
+    alias_target = tmp_path / "alias-project"
+    _write_entries(
+        alias_target / "project.jsonl",
+        _raw_entry(
+            canonical="Injected project",
+            scope="project",
+            project_id=project.project_id,
+            aliases=["injected"],
+        ),
+    )
+    real_guard = lexicon_module.guard_state_root
+
+    @contextmanager
+    def inject_after_acquisition(*args, **kwargs):
+        with real_guard(*args, **kwargs) as lease:
+            project.root.parent.mkdir(exist_ok=True)
+            try:
+                project.root.symlink_to(alias_target, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"directory symlinks unavailable: {exc}")
+            yield lease
+
+    monkeypatch.setattr(lexicon_module, "guard_state_root", inject_after_acquisition)
+
+    lexicons = LexiconSet.load(
+        paths, tmp_path / "builtins", project_root=project_root
+    )
+
+    assert lexicons.entries == ()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows retained root handle")
 def test_lexicon_load_never_follows_root_swap_to_alias(tmp_path, monkeypatch):
     direct_paths = StatePaths(root=tmp_path / "direct-state")
@@ -266,22 +384,22 @@ def test_lexicon_load_never_follows_root_swap_to_alias(tmp_path, monkeypatch):
         alias_root / "personal.jsonl",
         _raw_entry(canonical="Alias", scope="personal", aliases=["alias"]),
     )
-    real_load_jsonl = lexicon_module.load_jsonl
+    real_read_bytes = StateRootLease.read_bytes
     attempted = False
     blocked = False
 
-    def swap_before_personal_read(path, expected_scope=None):
+    def swap_before_personal_read(self, relative, limit, label):
         nonlocal attempted, blocked
-        if not attempted and Path(path) == direct_paths.personal_file:
+        if not attempted and Path(relative) == Path("personal.jsonl"):
             attempted = True
             try:
                 direct_paths.root.rename(moved_root)
                 direct_paths.root.symlink_to(alias_root, target_is_directory=True)
             except OSError:
                 blocked = True
-        return real_load_jsonl(path, expected_scope=expected_scope)
+        return real_read_bytes(self, relative, limit, label)
 
-    monkeypatch.setattr(lexicon_module, "load_jsonl", swap_before_personal_read)
+    monkeypatch.setattr(StateRootLease, "read_bytes", swap_before_personal_read)
 
     lexicons = LexiconSet.load(direct_paths, tmp_path / "builtins")
 

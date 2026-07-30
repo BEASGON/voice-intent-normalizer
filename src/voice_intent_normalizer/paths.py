@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import stat
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
@@ -21,26 +22,416 @@ class StateRootValidationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class _DirectoryBinding:
+    """One retained directory, represented without a reopenable POSIX path."""
+
+    path: Path | None = None
+    descriptor: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StateRootLease:
     """Retained direct directory identities for one protected state operation."""
 
     configured_root: Path
     root: Path
-    exists: bool
-    _directories: Mapping[tuple[str, ...], Path]
+    root_exists: bool
+    _directories: Mapping[tuple[str, ...], _DirectoryBinding]
+    _unavailable: frozenset[tuple[str, ...]]
+
+    def available(self, relative: str | Path = ".") -> bool:
+        """Return whether *relative* remained bound at lease acquisition."""
+        if not self.root_exists:
+            return False
+        parts = _relative_path_parts(relative)
+        return not any(
+            parts[: len(prefix)] == prefix for prefix in self._unavailable
+        )
 
     def path(self, relative: str | Path) -> Path:
-        """Resolve a state-relative path beneath its deepest retained directory."""
-        candidate = Path(relative)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            raise ValueError("state path must be relative")
-        parts = tuple(part for part in candidate.parts if part not in ("", "."))
+        """Return a guarded Windows path; POSIX callers must use lease I/O."""
+        parts = _relative_path_parts(relative)
+        if not self.available(relative):
+            raise FileNotFoundError(
+                f"state path was unavailable when lease was acquired: {relative}"
+            )
+        binding, remainder = self._binding_for(parts)
+        if len(remainder) > 1:
+            raise ValueError(
+                "state path parent must be explicitly retained"
+            )
+        if binding.path is None:
+            raise OSError(
+                "POSIX retained state has no reopenable path; use lease I/O helpers"
+            )
+        return binding.path.joinpath(*remainder)
+
+    def exists(self, relative: str | Path) -> bool:
+        """Check one bound entry without following aliases."""
+        if not self.available(relative):
+            return False
+        try:
+            self.stat(relative)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def stat(self, relative: str | Path) -> os.stat_result:
+        """Stat one bound entry without following symlinks."""
+        parts = _relative_path_parts(relative)
+        if not self.available(relative):
+            raise FileNotFoundError(
+                f"state path was unavailable when lease was acquired: {relative}"
+            )
+        retained = self._directories.get(parts)
+        if retained is not None:
+            if retained.path is not None:
+                return os.stat(retained.path, follow_symlinks=False)
+            if retained.descriptor is not None:
+                return os.fstat(retained.descriptor)
+            raise OSError("retained state directory has no usable identity")
+        binding, name = self._file_binding(parts)
+        if binding.path is not None:
+            return os.stat(binding.path / name, follow_symlinks=False)
+        if binding.descriptor is None:
+            raise OSError("retained state directory has no usable identity")
+        _require_posix_dir_fd_support()
+        return os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+
+    def read_bytes(self, relative: str | Path, limit: int, label: str) -> bytes:
+        """Read one exact regular-file identity through a bounded handle."""
+        if limit < 0:
+            raise ValueError("read limit must be non-negative")
+        with self.open_regular(relative, label) as descriptor:
+            info = os.fstat(descriptor)
+            if info.st_size > limit:
+                raise ValueError(f"{label} exceeds size limit")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - total))
+                if not chunk:
+                    return b"".join(chunks)
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError(f"{label} exceeds size limit")
+                chunks.append(chunk)
+
+    @contextmanager
+    def open_regular(
+        self, relative: str | Path, label: str = "state file"
+    ) -> Iterator[int]:
+        """Yield a no-follow descriptor for one exact retained regular file."""
+        parts = _relative_path_parts(relative)
+        binding, name = self._file_binding(parts)
+        descriptor = self._open_regular_file(binding, name, label)
+        try:
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def mkdir(
+        self,
+        relative: str | Path,
+        *,
+        mode: int = 0o700,
+        exist_ok: bool = False,
+    ) -> None:
+        """Securely create one component beneath a retained parent directory."""
+        parts = _relative_path_parts(relative)
+        binding, name = self._file_binding(parts)
+        if binding.path is not None:
+            try:
+                os.mkdir(binding.path / name, mode)
+            except FileExistsError:
+                if not exist_ok:
+                    raise
+            info = os.lstat(binding.path / name)
+            attributes = getattr(info, "st_file_attributes", 0)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or attributes & _WINDOWS_REPARSE_POINT
+            ):
+                raise StateRootValidationError(_DIRECT_STATE_ROOT_ERROR)
+            return
+        if binding.descriptor is None:
+            raise OSError("retained state directory has no usable identity")
+        _require_posix_dir_fd_support()
+        try:
+            os.mkdir(name, mode, dir_fd=binding.descriptor)
+        except FileExistsError:
+            if not exist_ok:
+                raise
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        child = os.open(name, flags, dir_fd=binding.descriptor)
+        try:
+            _verify_posix_directory(child)
+        finally:
+            os.close(child)
+
+    def write_bytes_atomic(self, relative: str | Path, data: bytes) -> None:
+        """Fsync and atomically replace one file inside a retained directory."""
+        if not isinstance(data, bytes):
+            raise TypeError("state data must be bytes")
+        parts = _relative_path_parts(relative)
+        binding, name = self._file_binding(parts)
+        if binding.path is not None:
+            _write_windows_bytes_atomic(binding.path, name, data)
+            return
+        if binding.descriptor is None:
+            raise OSError("retained state directory has no usable identity")
+        _write_posix_bytes_atomic(binding.descriptor, name, data)
+
+    def unlink(self, relative: str | Path, *, missing_ok: bool = False) -> None:
+        """Remove one bound directory entry without following it."""
+        parts = _relative_path_parts(relative)
+        binding, name = self._file_binding(parts)
+        try:
+            if binding.path is not None:
+                os.unlink(binding.path / name)
+            elif binding.descriptor is not None:
+                _require_posix_dir_fd_support()
+                os.unlink(name, dir_fd=binding.descriptor)
+            else:
+                raise OSError("retained state directory has no usable identity")
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
+    def listdir(self, relative: str | Path) -> tuple[str, ...]:
+        """List an exactly retained directory identity."""
+        parts = _relative_path_parts(relative)
+        if not self.available(relative):
+            raise FileNotFoundError(
+                f"state path was unavailable when lease was acquired: {relative}"
+            )
+        binding = self._directories.get(parts)
+        if binding is None:
+            raise ValueError("state directory was not retained")
+        if binding.path is not None:
+            return tuple(os.listdir(binding.path))
+        if binding.descriptor is None:
+            raise OSError("retained state directory has no usable identity")
+        return tuple(os.listdir(binding.descriptor))
+
+    def _binding_for(
+        self, parts: tuple[str, ...]
+    ) -> tuple[_DirectoryBinding, tuple[str, ...]]:
+        if not self.available(Path(*parts) if parts else Path(".")):
+            raise FileNotFoundError("state path was unavailable at lease acquisition")
         for length in range(len(parts), -1, -1):
-            prefix = parts[:length]
-            retained = self._directories.get(prefix)
-            if retained is not None:
-                return retained.joinpath(*parts[length:])
-        return self.root.joinpath(*parts)
+            binding = self._directories.get(parts[:length])
+            if binding is not None:
+                return binding, parts[length:]
+        raise FileNotFoundError("state root identity was not retained")
+
+    def _file_binding(
+        self, parts: tuple[str, ...]
+    ) -> tuple[_DirectoryBinding, str]:
+        if not parts:
+            raise ValueError("state file path must not be empty")
+        binding, remainder = self._binding_for(parts)
+        if len(remainder) != 1:
+            raise ValueError(
+                "state file parent must be an explicitly retained directory"
+            )
+        return binding, remainder[0]
+
+    @staticmethod
+    def _open_regular_file(
+        binding: _DirectoryBinding, name: str, label: str
+    ) -> int:
+        try:
+            if binding.path is not None:
+                descriptor = _open_windows_regular_file(binding.path / name)
+            elif binding.descriptor is not None:
+                _require_posix_dir_fd_support()
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                descriptor = os.open(name, flags, dir_fd=binding.descriptor)
+            else:
+                raise OSError("retained state directory has no usable identity")
+        except OSError as exc:
+            raise ValueError(f"unable to read {label}") from exc
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError(f"{label} must be a regular file")
+        return descriptor
+
+
+def _relative_path_parts(value: str | Path) -> tuple[str, ...]:
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("state path must be relative")
+    return tuple(part for part in candidate.parts if part not in ("", "."))
+
+
+def _require_posix_dir_fd_support() -> None:
+    """Fail closed when Python cannot express descriptor-relative state I/O."""
+    # CPython's ``supports_dir_fd`` records the underlying renameat capability
+    # under os.rename, although os.replace exposes the same src/dst dir_fd API.
+    required = (os.open, os.mkdir, os.stat, os.unlink, os.rename)
+    unsupported = [
+        operation.__name__
+        for operation in required
+        if operation not in os.supports_dir_fd
+    ]
+    if unsupported:
+        raise OSError(
+            "secure POSIX state roots require dir_fd support for "
+            + ", ".join(unsupported)
+        )
+    if os.listdir not in os.supports_fd:
+        raise OSError("secure POSIX state roots require fd support for listdir")
+    if not hasattr(os, "replace"):
+        raise OSError("secure POSIX state roots require atomic replace")
+    for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+        if not hasattr(os, name):
+            raise OSError(f"secure POSIX state roots require {name}")
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("state write made no progress")
+        view = view[written:]
+
+
+def _write_windows_bytes_atomic(directory: Path, name: str, data: bytes) -> None:
+    target = directory / name
+    try:
+        if stat.S_ISLNK(os.lstat(target).st_mode):
+            raise ValueError("update target must not be a symlink")
+    except FileNotFoundError:
+        pass
+    temporary = directory / f".{name}.{secrets.token_hex(12)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, target)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_posix_bytes_atomic(directory: int, name: str, data: bytes) -> None:
+    _require_posix_dir_fd_support()
+    try:
+        target = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISLNK(target.st_mode):
+            raise ValueError("update target must not be a symlink")
+    except FileNotFoundError:
+        pass
+    temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW
+    )
+    descriptor = os.open(temporary, flags, 0o600, dir_fd=directory)
+    try:
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _open_windows_regular_file(path: Path) -> int:
+    """Open one no-follow Windows file handle and convert it to a Python fd."""
+    if os.name != "nt":
+        raise OSError("Windows file opening is unavailable on this platform")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x80000000,  # GENERIC_READ
+        0x7,  # allow readers, writers, and atomic replacement
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            raise FileNotFoundError(error, os.strerror(error), path)
+        raise ctypes.WinError(error)
+    try:
+        attributes = _FileAttributeTagInfo()
+        ctypes.set_last_error(0)
+        if not kernel32.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.file_attributes & (0x10 | _WINDOWS_REPARSE_POINT):
+            raise ValueError("state entry must be a direct regular file")
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        handle = None
+        return descriptor
+    finally:
+        if handle is not None:
+            kernel32.CloseHandle(handle)
 
 
 def validate_state_root(root: str | Path) -> Path:
@@ -125,7 +516,9 @@ def _guard_windows_state_root(
             break
         except FileNotFoundError:
             if not create:
-                yield StateRootLease(root, root, False, {})
+                yield StateRootLease(
+                    root, root, False, {}, frozenset(retained_dirs)
+                )
                 return
             if existing == existing.parent:
                 raise StateRootValidationError(_DIRECT_STATE_ROOT_ERROR)
@@ -145,7 +538,10 @@ def _guard_windows_state_root(
         if current != root:
             raise StateRootValidationError(_DIRECT_STATE_ROOT_ERROR)
 
-        retained: dict[tuple[str, ...], Path] = {(): root}
+        retained: dict[tuple[str, ...], _DirectoryBinding] = {
+            (): _DirectoryBinding(path=root)
+        }
+        unavailable: set[tuple[str, ...]] = set()
         for parts in sorted(set(retained_dirs), key=lambda item: (len(item), item)):
             current = root
             prefix: tuple[str, ...] = ()
@@ -153,7 +549,10 @@ def _guard_windows_state_root(
             for component in parts:
                 prefix += (component,)
                 if prefix in retained:
-                    current = retained[prefix]
+                    retained_path = retained[prefix].path
+                    if retained_path is None:
+                        raise OSError("Windows directory binding lost its path")
+                    current = retained_path
                     continue
                 current /= component
                 if create_retained:
@@ -166,11 +565,12 @@ def _guard_windows_state_root(
                 except FileNotFoundError:
                     available = False
                     break
-                retained[prefix] = current
+                retained[prefix] = _DirectoryBinding(path=current)
             if not available:
+                unavailable.add(parts)
                 continue
         validate_state_root(root)
-        yield StateRootLease(root, root, True, retained)
+        yield StateRootLease(root, root, True, retained, frozenset(unavailable))
 
 
 @contextmanager
@@ -209,7 +609,7 @@ def _windows_directory_guard(path: Path) -> Iterator[None]:
     ctypes.set_last_error(0)
     handle = kernel32.CreateFileW(
         _extended_windows_path(path),
-        0x10080,  # DELETE | FILE_READ_ATTRIBUTES
+        0x81,  # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES; no DELETE access
         0x3,  # FILE_SHARE_READ | FILE_SHARE_WRITE; deny FILE_SHARE_DELETE
         None,
         3,  # OPEN_EXISTING
@@ -261,6 +661,7 @@ def _guard_posix_state_root(
     retained_dirs: tuple[tuple[str, ...], ...],
     create_retained: bool,
 ) -> Iterator[StateRootLease]:
+    _require_posix_dir_fd_support()
     flags = os.O_RDONLY
     for required_flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
         if not hasattr(os, required_flag):
@@ -278,7 +679,9 @@ def _guard_posix_state_root(
                 child = os.open(component, flags, dir_fd=descriptor)
             except FileNotFoundError:
                 if not create:
-                    yield StateRootLease(root, root, False, {})
+                    yield StateRootLease(
+                        root, root, False, {}, frozenset(retained_dirs)
+                    )
                     return
                 try:
                     os.mkdir(component, 0o700, dir_fd=descriptor)
@@ -289,6 +692,7 @@ def _guard_posix_state_root(
             descriptors.append(child)
             descriptor = child
         retained_fds[()] = descriptor
+        unavailable: set[tuple[str, ...]] = set()
 
         for parts in sorted(set(retained_dirs), key=lambda item: (len(item), item)):
             current = retained_fds[()]
@@ -315,6 +719,7 @@ def _guard_posix_state_root(
                 retained_fds[prefix] = child
                 current = child
             if not available:
+                unavailable.add(parts)
                 continue
 
         configured_info = os.stat(root, follow_symlinks=False)
@@ -325,11 +730,13 @@ def _guard_posix_state_root(
         ) != (descriptor_info.st_dev, descriptor_info.st_ino):
             raise StateRootValidationError(_DIRECT_STATE_ROOT_ERROR)
         bound = {
-            parts: _posix_descriptor_path(fd)
+            parts: _DirectoryBinding(descriptor=fd)
             for parts, fd in retained_fds.items()
         }
         acquired = True
-        yield StateRootLease(root, bound[()], True, bound)
+        yield StateRootLease(
+            root, root, True, bound, frozenset(unavailable)
+        )
     except (NotADirectoryError, OSError) as exc:
         if acquired:
             raise
@@ -344,13 +751,6 @@ def _guard_posix_state_root(
 def _verify_posix_directory(descriptor: int) -> None:
     if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
         raise StateRootValidationError(_DIRECT_STATE_ROOT_ERROR)
-
-
-def _posix_descriptor_path(descriptor: int) -> Path:
-    for base in (Path("/proc/self/fd"), Path("/dev/fd")):
-        if base.is_dir():
-            return base / str(descriptor)
-    raise OSError("secure POSIX state roots require descriptor filesystem paths")
 
 
 def _validate_windows_root_spelling(raw: str) -> str:

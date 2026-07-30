@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import threading
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
 import voice_intent_normalizer.paths as paths_module
-from voice_intent_normalizer.paths import StatePaths
+from voice_intent_normalizer.paths import StatePaths, guard_state_root
 
 
 def test_voice_intent_home_overrides_default(tmp_path):
@@ -135,3 +137,141 @@ def test_state_paths_expose_shared_and_project_files_without_creating_them(tmp_p
         paths.root / "projects" / project.project_id / "scan-state.json"
     )
     assert not paths.root.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory share semantics")
+def test_windows_read_guards_coexist_and_release_every_handle(tmp_path):
+    """Catch read guards requesting DELETE access and excluding one another."""
+    root = tmp_path / "state"
+    root.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+    failures: list[BaseException] = []
+
+    def hold_second_guard() -> None:
+        try:
+            with guard_state_root(root):
+                entered.set()
+                release.wait(5)
+        except BaseException as exc:
+            failures.append(exc)
+
+    with guard_state_root(root):
+        holder = threading.Thread(target=hold_second_guard)
+        holder.start()
+        assert entered.wait(3)
+        release.set()
+        holder.join(5)
+
+    assert not holder.is_alive()
+    assert failures == []
+    moved = tmp_path / "moved-state"
+    root.rename(moved)
+    assert moved.is_dir()
+
+
+def test_create_guard_retains_each_new_component_for_lease_io(tmp_path):
+    """Catch create=True returning reopenable names instead of bound directories."""
+    root = tmp_path / "state"
+
+    with guard_state_root(
+        root,
+        create=True,
+        retained_dirs=("hotwords", "hotwords/payloads"),
+        create_retained=True,
+    ) as lease:
+        assert lease.root_exists
+        assert lease.exists("hotwords")
+        assert lease.exists("hotwords/payloads")
+        lease.write_bytes_atomic("hotwords/current.json", b"pointer")
+        with lease.open_regular("hotwords/current.json") as descriptor:
+            assert os.read(descriptor, 7) == b"pointer"
+        lease.mkdir("hotwords/staging")
+        assert lease.exists("hotwords/staging")
+
+    assert (root / "hotwords" / "current.json").read_bytes() == b"pointer"
+    assert (root / "hotwords" / "staging").is_dir()
+
+
+def test_missing_retained_directory_never_degrades_to_a_later_alias(tmp_path):
+    """Catch path() falling back through the root after a requested dir was absent."""
+    root = tmp_path / "state"
+    root.mkdir()
+    alias_target = tmp_path / "alias-target"
+    alias_target.mkdir()
+
+    with guard_state_root(root, retained_dirs=("projects/example",)) as lease:
+        (root / "projects").mkdir()
+        try:
+            (root / "projects" / "example").symlink_to(
+                alias_target, target_is_directory=True
+            )
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        assert not lease.available("projects/example/project.jsonl")
+        with pytest.raises(FileNotFoundError):
+            lease.path("projects/example/project.jsonl")
+
+
+def test_guarded_path_rejects_an_unretained_intermediate_directory(tmp_path):
+    """Catch path() exposing multi-component traversal outside a retained parent."""
+    root = tmp_path / "state"
+    root.mkdir()
+
+    with guard_state_root(root) as lease:
+        with pytest.raises(ValueError, match="parent must be explicitly retained"):
+            lease.path("unretained/file.json")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative I/O")
+def test_posix_lease_io_does_not_require_proc_or_dev_fd(tmp_path, monkeypatch):
+    """Catch descriptor retention depending on optional descriptor filesystems."""
+    original_is_dir = Path.is_dir
+
+    def hide_descriptor_filesystems(path: Path) -> bool:
+        if path in {Path("/proc/self/fd"), Path("/dev/fd")}:
+            return False
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", hide_descriptor_filesystems)
+    root = tmp_path / "state"
+
+    with guard_state_root(
+        root,
+        create=True,
+        retained_dirs=("hotwords",),
+        create_retained=True,
+    ) as lease:
+        lease.write_bytes_atomic("hotwords/current.json", b'{"version":1}')
+        assert lease.exists("hotwords/current.json")
+        assert lease.read_bytes(
+            "hotwords/current.json", 1024, "current pointer"
+        ) == b'{"version":1}'
+        assert lease.stat("hotwords/current.json").st_size == 13
+
+    assert (root / "hotwords" / "current.json").read_bytes() == b'{"version":1}'
+
+
+def test_posix_capability_check_uses_renameat_signal_for_replace(monkeypatch):
+    """Catch rejecting POSIX because CPython omits replace from supports_dir_fd."""
+    monkeypatch.setattr(
+        paths_module.os,
+        "supports_dir_fd",
+        {
+            paths_module.os.open,
+            paths_module.os.mkdir,
+            paths_module.os.stat,
+            paths_module.os.unlink,
+            paths_module.os.rename,
+        },
+    )
+    monkeypatch.setattr(
+        paths_module.os,
+        "supports_fd",
+        {paths_module.os.listdir},
+    )
+    for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+        monkeypatch.setattr(paths_module.os, flag, 1, raising=False)
+
+    paths_module._require_posix_dir_fd_support()

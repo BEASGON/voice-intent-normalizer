@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -14,6 +15,7 @@ from typing import Any
 from .models import EntryStatus, LexiconEntry, Scope
 from .paths import (
     StatePaths,
+    StateRootLease,
     StateRootValidationError,
     guard_state_root,
     state_root_identity,
@@ -35,6 +37,7 @@ _OPTIONAL_FIELDS = frozenset(
     }
 )
 _ALL_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
+_MAX_STATE_LEXICON_BYTES = 10 * 1024 * 1024
 
 
 def _normalized_alias(value: str) -> str:
@@ -57,6 +60,22 @@ def _load_if_present(path: Path, scope: Scope) -> tuple[LexiconEntry, ...]:
     if not path.is_file():
         return ()
     return _deduplicate(load_jsonl(path, expected_scope=scope))
+
+
+def _load_lease_if_present(
+    lease: StateRootLease,
+    relative: str | Path,
+    scope: Scope,
+) -> tuple[LexiconEntry, ...]:
+    """Load one optional state lexicon through its retained directory identity."""
+    if not lease.available(relative) or not lease.exists(relative):
+        return ()
+    if not stat.S_ISREG(lease.stat(relative).st_mode):
+        return ()
+    data = lease.read_bytes(relative, _MAX_STATE_LEXICON_BYTES, "lexicon")
+    return _deduplicate(
+        load_jsonl_bytes(data, relative, expected_scope=scope)
+    )
 
 
 def _first_existing(paths: Sequence[Path]) -> Path | None:
@@ -103,13 +122,16 @@ class LexiconSet:
             if project_root is None
             else state_paths.for_project(project_root)
         )
-        retained_dirs: list[Path] = [Path("hotwords")]
+        retained_dirs: list[Path] = [
+            Path("hotwords"),
+            Path("hotwords/payloads"),
+        ]
         if project_paths is not None:
             retained_dirs.append(
                 Path("projects") / project_paths.project_id
             )
         layers: list[LexiconEntry] = []
-        authoritative_hotword = resolve_hotword_file(state_paths) is not None
+        hotword_data = resolve_hotword_file(state_paths)
         if initial_root_identity is None:
             initial_root_identity = state_root_identity(state_paths.root)
 
@@ -124,21 +146,27 @@ class LexiconSet:
                 raise StateRootValidationError(
                     "state root rejected: direct canonical local path required"
                 )
-            if lease.exists:
+            if lease.root_exists:
                 layers.extend(
-                    _load_if_present(
-                        lease.path("personal.jsonl"), Scope.PERSONAL
+                    _load_lease_if_present(
+                        lease, "personal.jsonl", Scope.PERSONAL
                     )
                 )
 
-            if project_paths is not None and lease.exists:
-                project_entries = _load_if_present(
-                    lease.path(
-                        Path("projects")
-                        / project_paths.project_id
-                        / "project.jsonl"
-                    ),
-                    Scope.PROJECT,
+            if project_paths is not None and lease.root_exists:
+                project_relative = (
+                    Path("projects")
+                    / project_paths.project_id
+                    / "project.jsonl"
+                )
+                project_entries = (
+                    _load_lease_if_present(
+                        lease,
+                        project_relative,
+                        Scope.PROJECT,
+                    )
+                    if lease.available(project_relative)
+                    else ()
                 )
                 layers.extend(
                     entry
@@ -162,17 +190,25 @@ class LexiconSet:
                         _load_if_present(industry_path, Scope.INDUSTRY)
                     )
 
-            hotword_path = (
-                lease.path("hotwords/zh-ai.jsonl")
-                if authoritative_hotword and lease.exists
-                else _first_existing(
+            hotword_path = None
+            if hotword_data is None:
+                hotword_path = _first_existing(
                     (
                         builtin_paths / "hotwords-snapshot.jsonl",
                         builtin_paths / "hot.jsonl",
                     )
                 )
-            )
-            if hotword_path is not None:
+            if hotword_data is not None:
+                layers.extend(
+                    _deduplicate(
+                        load_jsonl_bytes(
+                            hotword_data,
+                            "hotwords/authoritative",
+                            expected_scope=Scope.HOT,
+                        )
+                    )
+                )
+            elif hotword_path is not None:
                 layers.extend(_load_if_present(hotword_path, Scope.HOT))
 
             base_path = _first_existing(
@@ -274,12 +310,25 @@ def load_jsonl(
     """Load a strict UTF-8 JSONL lexicon, adding location details to every error."""
     source = Path(path)
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        data = source.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"{source}: line 1: unable to read lexicon: {exc}") from exc
+    return load_jsonl_bytes(data, source, expected_scope=expected_scope)
+
+
+def load_jsonl_bytes(
+    data: bytes,
+    source: str | Path,
+    expected_scope: Scope | None = None,
+) -> tuple[LexiconEntry, ...]:
+    """Parse strict UTF-8 JSONL bytes already bound to an exact file identity."""
+    if not isinstance(data, bytes):
+        raise TypeError("lexicon data must be bytes")
+    try:
+        lines = data.decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
         line_number = exc.object[: exc.start].count(b"\n") + 1
         raise ValueError(f"{source}: line {line_number}: invalid UTF-8") from exc
-    except OSError as exc:
-        raise ValueError(f"{source}: line 1: unable to read lexicon: {exc}") from exc
 
     entries: list[LexiconEntry] = []
     for line_number, line in enumerate(lines, start=1):

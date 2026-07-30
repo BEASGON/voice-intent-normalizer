@@ -20,7 +20,6 @@ import os
 import re
 import stat
 import sys
-import tempfile
 import time
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping
@@ -125,21 +124,6 @@ class _AttemptState:
     last_check: datetime
 
 
-@dataclass(frozen=True, slots=True)
-class _LockedStatePaths:
-    root: Path
-    hotwords_file: Path
-    payloads_dir: Path
-
-
-def _locked_state_paths(lease: StateRootLease) -> _LockedStatePaths:
-    return _LockedStatePaths(
-        root=lease.root,
-        hotwords_file=lease.path("hotwords/zh-ai.jsonl"),
-        payloads_dir=lease.path("hotwords/payloads"),
-    )
-
-
 def update_hotwords(
     paths: StatePaths,
     manifest_url: str,
@@ -225,13 +209,16 @@ def update_hotwords(
 
 
 def _commit_locked(
-    paths: StatePaths, manifest: HotwordManifest, data: bytes, checked_at: datetime
+    paths: StateRootLease,
+    manifest: HotwordManifest,
+    data: bytes,
+    checked_at: datetime,
 ) -> None:
     """Commit one candidate using a journaled pointer to immutable payload bytes."""
     payload = _payload_name(manifest.sha256)
     state = _CurrentState(manifest.version, manifest.sha256, payload, checked_at)
     _stage_payload(paths, state, data)
-    _write_bytes_atomic(_pending_file(paths), _serialize_current(state))
+    _write_bytes_atomic(paths, _pending_file(), _serialize_current(state))
     _write_current(paths, state)
     _materialize_current(paths, state)
     _write_attempt_best_effort(paths, _AttemptState(state.version, checked_at))
@@ -241,7 +228,7 @@ def _commit_locked(
 
 
 def _decide_known_version(
-    paths: StatePaths,
+    paths: StateRootLease,
     current: _CurrentState | None,
     manifest: HotwordManifest,
     checked_at: datetime,
@@ -264,14 +251,11 @@ def _decide_known_version(
     return None
 
 
-def _recover_locked(paths: StatePaths, operation_now: datetime) -> _CurrentState | None:
+def _recover_locked(
+    paths: StateRootLease, operation_now: datetime
+) -> _CurrentState | None:
     """Reconcile an interrupted commit before any version decision is made."""
-    try:
-        _ensure_storage(paths)
-    except PermissionError as exc:
-        raise StateRootValidationError(
-            "state root rejected: direct canonical local path required"
-        ) from exc
+    _ensure_storage(paths)
     current = _read_current(paths)
     attempt = _read_attempt_or_none(paths, operation_now)
     if attempt is not None and attempt.last_check > operation_now:
@@ -311,16 +295,25 @@ def _recover_locked(paths: StatePaths, operation_now: datetime) -> _CurrentState
 
 
 def _migrate_legacy_locked(
-    paths: StatePaths, attempt: _AttemptState | None
+    paths: StateRootLease, attempt: _AttemptState | None
 ) -> _CurrentState | None:
     """Promote a valid pre-transaction Task 7 installation exactly once."""
+    if _transaction_payloads_present(paths) and _is_regular_state_file(
+        paths, _hotword_file()
+    ):
+        # Immutable payloads are durable evidence that this directory already
+        # used pointer authority. If current.json vanished, the cache cannot be
+        # distinguished from a later replacement and must never regain authority.
+        raise ValueError("transactional hotword pointer is missing")
     if attempt is None:
         return None
     if attempt.version is None:
         return None
-    if not paths.hotwords_file.is_file():
+    if not _is_regular_state_file(paths, _hotword_file()):
         raise ValueError("legacy update version has no hotword payload")
-    data = _read_regular_file(paths.hotwords_file, _MAX_DATA_BYTES, "hotword file")
+    data = _read_regular_file(
+        paths, _hotword_file(), _MAX_DATA_BYTES, "hotword file"
+    )
     _validate_hotword_jsonl(data)
     digest = hashlib.sha256(data).hexdigest()
     state = _CurrentState(
@@ -329,6 +322,18 @@ def _migrate_legacy_locked(
     _stage_payload(paths, state, data)
     _write_current(paths, state)
     return state
+
+
+def _transaction_payloads_present(paths: StateRootLease) -> bool:
+    """Return whether checksum-addressed payloads prove prior pointer authority."""
+    if not paths.available(_payloads_dir()):
+        return False
+    return any(
+        name.startswith("payload-")
+        and name.endswith(".jsonl")
+        and _SHA256_PATTERN.fullmatch(name[8:-6]) is not None
+        for name in paths.listdir(_payloads_dir())
+    )
 
 
 def _allowed_url(value: object) -> bool:
@@ -455,20 +460,20 @@ def _validate_hotword_jsonl(data: bytes) -> None:
         raise ValueError("hotword file must contain at least one entry")
 
 
-def _read_current(paths: StatePaths) -> _CurrentState | None:
-    return _read_state_file(_current_file(paths), _CURRENT_FIELDS, _current_from_raw)
+def _read_current(paths: StateRootLease) -> _CurrentState | None:
+    return _read_state_file(paths, _current_file(), _CURRENT_FIELDS, _current_from_raw)
 
 
-def _read_pending(paths: StatePaths) -> _CurrentState | None:
-    return _read_state_file(_pending_file(paths), _CURRENT_FIELDS, _current_from_raw)
+def _read_pending(paths: StateRootLease) -> _CurrentState | None:
+    return _read_state_file(paths, _pending_file(), _CURRENT_FIELDS, _current_from_raw)
 
 
-def _read_attempt(paths: StatePaths) -> _AttemptState | None:
-    return _read_state_file(_attempt_file(paths), _ATTEMPT_FIELDS, _attempt_from_raw)
+def _read_attempt(paths: StateRootLease) -> _AttemptState | None:
+    return _read_state_file(paths, _attempt_file(), _ATTEMPT_FIELDS, _attempt_from_raw)
 
 
 def _read_attempt_or_none(
-    paths: StatePaths, operation_now: datetime
+    paths: StateRootLease, operation_now: datetime
 ) -> _AttemptState | None:
     """Treat the receipt as advisory even when it is malformed or inaccessible."""
     try:
@@ -483,10 +488,12 @@ def _read_attempt_or_none(
     return attempt
 
 
-def _read_state_file(path: Path, fields: frozenset[str], parser):
-    if not path.exists():
+def _read_state_file(
+    paths: StateRootLease, path: Path, fields: frozenset[str], parser
+):
+    if not paths.exists(path):
         return None
-    raw = _read_json_file(path, _MAX_MANIFEST_BYTES)
+    raw = _read_json_file(paths, path, _MAX_MANIFEST_BYTES)
     if not isinstance(raw, Mapping) or set(raw) != fields:
         raise ValueError("invalid update state fields")
     return parser(raw)
@@ -516,71 +523,84 @@ def _attempt_from_raw(raw: Mapping[str, object]) -> _AttemptState:
     return _AttemptState(version, _parse_time(raw["last_check"]))
 
 
-def _stage_payload(paths: StatePaths, state: _CurrentState, data: bytes) -> None:
-    payload = _payload_file(paths, state)
-    if payload.exists():
-        existing = _read_regular_file(payload, _MAX_DATA_BYTES, "payload")
+def _stage_payload(
+    paths: StateRootLease, state: _CurrentState, data: bytes
+) -> None:
+    payload = _payload_file(state)
+    if paths.exists(payload):
+        existing = _read_regular_file(
+            paths, payload, _MAX_DATA_BYTES, "payload"
+        )
         if existing != data:
             raise ValueError("immutable payload collision")
         return
-    _write_bytes_atomic(payload, data)
+    _write_bytes_atomic(paths, payload, data)
     _verify_payload(paths, state)
 
 
-def _verify_payload(paths: StatePaths, state: _CurrentState) -> bytes:
-    payload = _payload_file(paths, state)
-    if not payload.exists():
+def _verify_payload(
+    paths: StateRootLease, state: _CurrentState, *, repair: bool = True
+) -> bytes:
+    payload = _payload_file(state)
+    if not paths.available(payload) or not paths.exists(payload):
+        if not repair:
+            raise ValueError("authoritative payload is missing")
         # The pointer is authoritative. If a crash happened after switching it
         # but before payload cleanup completed, a matching validated cache can
         # reconstruct the immutable payload without accepting stale bytes.
         cached = _read_regular_file(
-            paths.hotwords_file, _MAX_DATA_BYTES, "hotword file"
+            paths, _hotword_file(), _MAX_DATA_BYTES, "hotword file"
         )
         if hashlib.sha256(cached).hexdigest() != state.sha256:
             raise ValueError("authoritative payload is missing")
         _validate_hotword_jsonl(cached)
-        _write_bytes_atomic(payload, cached)
-    data = _read_regular_file(payload, _MAX_DATA_BYTES, "payload")
+        _write_bytes_atomic(paths, payload, cached)
+    data = _read_regular_file(paths, payload, _MAX_DATA_BYTES, "payload")
     if hashlib.sha256(data).hexdigest() != state.sha256:
         raise ValueError("payload checksum mismatch")
     _validate_hotword_jsonl(data)
     return data
 
 
-def _materialize_current(paths: StatePaths, state: _CurrentState) -> None:
+def _materialize_current(paths: StateRootLease, state: _CurrentState) -> None:
     data = _verify_payload(paths, state)
-    target = paths.hotwords_file
+    target = _hotword_file()
     if (
-        target.exists()
-        and _read_regular_file(target, _MAX_DATA_BYTES, "hotword file") == data
+        paths.exists(target)
+        and _read_regular_file(
+            paths, target, _MAX_DATA_BYTES, "hotword file"
+        )
+        == data
     ):
         return
-    _write_bytes_atomic(target, data)
+    _write_bytes_atomic(paths, target, data)
 
 
-def _verify_current_cache(paths: StatePaths, state: _CurrentState) -> None:
+def _verify_current_cache(paths: StateRootLease, state: _CurrentState) -> None:
     if _read_current(paths) != state:
         raise ValueError("current pointer verification failed")
     if _read_regular_file(
-        paths.hotwords_file, _MAX_DATA_BYTES, "hotword file"
+        paths, _hotword_file(), _MAX_DATA_BYTES, "hotword file"
     ) != _verify_payload(paths, state):
         raise ValueError("hotword cache verification failed")
 
 
-def _write_current(paths: StatePaths, state: _CurrentState) -> None:
-    _write_bytes_atomic(_current_file(paths), _serialize_current(state))
+def _write_current(paths: StateRootLease, state: _CurrentState) -> None:
+    _write_bytes_atomic(paths, _current_file(), _serialize_current(state))
 
 
-def _write_attempt(paths: StatePaths, state: _AttemptState) -> None:
+def _write_attempt(paths: StateRootLease, state: _AttemptState) -> None:
     raw = {
         "last_check": state.last_check.isoformat(),
         "schema_version": _STATE_SCHEMA_VERSION,
         "version": state.version,
     }
-    _write_bytes_atomic(_attempt_file(paths), _serialize(raw))
+    _write_bytes_atomic(paths, _attempt_file(), _serialize(raw))
 
 
-def _write_attempt_best_effort(paths: StatePaths, state: _AttemptState) -> None:
+def _write_attempt_best_effort(
+    paths: StateRootLease, state: _AttemptState
+) -> None:
     """Keep the non-authoritative receipt from breaking a valid installation."""
     try:
         _write_attempt(paths, state)
@@ -604,22 +624,22 @@ def _serialize(raw: Mapping[str, object]) -> bytes:
     return json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _remove_pending(paths: StatePaths) -> None:
-    path = _pending_file(paths)
-    if path.exists():
-        _reject_symlink(path, "pending state")
-        path.unlink()
+def _remove_pending(paths: StateRootLease) -> None:
+    path = _pending_file()
+    if paths.exists(path):
+        _reject_state_symlink(paths, path, "pending state")
+        paths.unlink(path)
 
 
-def _discard_pending(paths: StatePaths) -> None:
+def _discard_pending(paths: StateRootLease) -> None:
     """Discard a non-authoritative prepare journal when its path is safe."""
-    path = _pending_file(paths)
-    if path.exists():
-        _reject_symlink(path, "pending state")
-        path.unlink()
+    path = _pending_file()
+    if paths.exists(path):
+        _reject_state_symlink(paths, path, "pending state")
+        paths.unlink(path)
 
 
-def _discard_pending_best_effort(paths: StatePaths) -> None:
+def _discard_pending_best_effort(paths: StateRootLease) -> None:
     """Keep an advisory journal path from breaking authoritative recovery."""
     try:
         _discard_pending(paths)
@@ -627,14 +647,14 @@ def _discard_pending_best_effort(paths: StatePaths) -> None:
         return
 
 
-def _discard_attempt(paths: StatePaths) -> None:
-    path = _attempt_file(paths)
-    if path.exists():
-        _reject_symlink(path, "attempt receipt")
-        path.unlink()
+def _discard_attempt(paths: StateRootLease) -> None:
+    path = _attempt_file()
+    if paths.exists(path):
+        _reject_state_symlink(paths, path, "attempt receipt")
+        paths.unlink(path)
 
 
-def _discard_attempt_best_effort(paths: StatePaths) -> None:
+def _discard_attempt_best_effort(paths: StateRootLease) -> None:
     """Quarantine an invalid receipt only when its path can be removed safely."""
     try:
         _discard_attempt(paths)
@@ -642,19 +662,18 @@ def _discard_attempt_best_effort(paths: StatePaths) -> None:
         return
 
 
-def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
+def _cleanup_payloads(paths: StateRootLease, current: _CurrentState) -> None:
     """Bound immutable payload retention after a verified authoritative commit."""
-    directory = _payloads_dir(paths)
+    directory = _payloads_dir()
     candidates = sorted(
         (
-            path
-            for path in directory.iterdir()
-            if path.is_file()
-            and not path.is_symlink()
-            and path.name.startswith("payload-")
-            and path.suffix == ".jsonl"
+            (name, paths.stat(directory / name))
+            for name in paths.listdir(directory)
+            if name.startswith("payload-")
+            and name.endswith(".jsonl")
+            and _is_regular_state_file(paths, directory / name)
         ),
-        key=lambda path: path.stat().st_mtime_ns,
+        key=lambda item: item[1].st_mtime_ns,
         reverse=True,
     )
     protected = {current.payload}
@@ -665,36 +684,66 @@ def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
     if pending is not None:
         protected.add(pending.payload)
     kept = set(protected)
-    for path in candidates:
-        if path.name in kept:
+    for name, _info in candidates:
+        if name in kept:
             continue
         if len(kept) < _MAX_RETAINED_PAYLOADS:
-            kept.add(path.name)
+            kept.add(name)
             continue
-        path.unlink()
+        paths.unlink(directory / name)
 
 
-def resolve_hotword_file(paths: StatePaths) -> Path | None:
-    """Return a recovered authoritative cache for LexiconSet, or fail safely."""
+def resolve_hotword_file(
+    authority: StateRootLease | StatePaths,
+) -> bytes | None:
+    """Return validated hotword bytes read under one retained directory lease.
+
+    A caller-owned lease keeps authority resolution and the actual payload read
+    on one directory identity. The ``StatePaths`` form is retained for recovery
+    callers, but it also returns an immutable byte snapshot rather than a path
+    that could be reopened after the guard is released.
+    """
     try:
+        if isinstance(authority, StateRootLease):
+            return _resolve_hotword_snapshot(authority)
+        paths = authority
         validate_state_root(paths.root)
         operation_now = datetime.now(timezone.utc)
         with _update_lock(paths) as locked_paths:
             current = _recover_locked(locked_paths, operation_now)
             if current is not None:
                 _verify_current_cache(locked_paths, current)
-                return paths.hotwords_file
-            if locked_paths.hotwords_file.is_file():
+                return _verify_payload(locked_paths, current)
+            if _is_regular_state_file(locked_paths, _hotword_file()):
                 data = _read_regular_file(
-                    locked_paths.hotwords_file,
+                    locked_paths,
+                    _hotword_file(),
                     _MAX_DATA_BYTES,
                     "hotword file",
                 )
                 _validate_hotword_jsonl(data)
-                return paths.hotwords_file
+                return data
     except Exception:
         return None
     return None
+
+
+def _resolve_hotword_snapshot(paths: StateRootLease) -> bytes | None:
+    """Resolve pointer authority and read its exact payload inside *paths*."""
+    if not paths.root_exists or not paths.available(_hotword_file()):
+        return None
+    current = _read_current(paths)
+    if current is not None:
+        return _verify_payload(paths, current, repair=False)
+    if _transaction_payloads_present(paths):
+        return None
+    if not _is_regular_state_file(paths, _hotword_file()):
+        return None
+    data = _read_regular_file(
+        paths, _hotword_file(), _MAX_DATA_BYTES, "hotword file"
+    )
+    _validate_hotword_jsonl(data)
+    return data
 
 
 def _record_failed_attempt(paths: StatePaths, now: datetime) -> None:
@@ -723,7 +772,9 @@ def _check_is_recent(
 
 
 def _merged_check_time(
-    paths: StatePaths, current: _CurrentState | None, checked_at: datetime
+    paths: StateRootLease,
+    current: _CurrentState | None,
+    checked_at: datetime,
 ) -> datetime:
     """Never let a late worker regress either authoritative or receipt time."""
     checks = [checked_at]
@@ -781,25 +832,15 @@ def _utc_now(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _ensure_storage(paths: StatePaths) -> None:
-    if isinstance(paths, _LockedStatePaths):
-        return
-    directory = _hotword_dir(paths)
-    directory.mkdir(parents=True, exist_ok=True)
-    _reject_symlink(directory, "hotword directory")
-    if not directory.is_dir():
-        raise ValueError("hotword directory is not a directory")
-    payloads = _payloads_dir(paths)
-    payloads.mkdir(exist_ok=True)
-    _reject_symlink(payloads, "payload directory")
-    if not payloads.is_dir():
-        raise ValueError("payload directory is not a directory")
+def _ensure_storage(paths: StateRootLease) -> None:
+    """Revalidate the configured spelling while retained directories stay bound."""
+    validate_state_root(paths.configured_root)
 
 
 @contextmanager
 def _update_lock(
     paths: StatePaths, *, timeout: float | None = None
-) -> Iterator[_LockedStatePaths]:
+) -> Iterator[StateRootLease]:
     """Use a stable OS lease, never a replaceable filesystem lock entry."""
     validate_state_root(paths.root)
     if os.name == "nt":
@@ -814,7 +855,7 @@ def _update_lock(
             retained_dirs=("hotwords", "hotwords/payloads"),
             create_retained=True,
         ) as lease:
-            yield _locked_state_paths(lease)
+            yield lease
 
 
 @contextmanager
@@ -950,7 +991,7 @@ def _posix_lock_name(paths: StatePaths) -> str:
 @contextmanager
 def _windows_mutex(
     paths: StatePaths, timeout: float | None
-) -> Iterator[_LockedStatePaths]:
+) -> Iterator[StateRootLease]:
     """Hold stable path plus alias-convergent identity mutexes in fixed order."""
     import ctypes
     from ctypes import wintypes
@@ -994,7 +1035,7 @@ def _windows_mutex(
                 ):
                     validate_state_root(paths.root)
                     if _windows_directory_identity(paths.root) == identity:
-                        yield _locked_state_paths(lease)
+                        yield lease
                         return
             if (
                 attempt_number + 1 >= _WINDOWS_IDENTITY_RETRIES
@@ -1267,102 +1308,69 @@ def _posix_lock_error_is_contention(error_number: int | None) -> bool:
     }
 
 
-def _read_json_file(path: Path, limit: int) -> object:
-    data = _read_regular_file(path, limit, "update state")
+def _read_json_file(paths: StateRootLease, path: Path, limit: int) -> object:
+    data = _read_regular_file(paths, path, limit, "update state")
     try:
         return json.loads(data.decode("utf-8"), parse_constant=_reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError("invalid update state JSON") from exc
 
 
-def _read_regular_file(path: Path, limit: int, label: str) -> bytes:
-    _reject_symlink(path, label)
+def _read_regular_file(
+    paths: StateRootLease, path: Path, limit: int, label: str
+) -> bytes:
     try:
-        info = path.stat()
-    except OSError as exc:
+        return paths.read_bytes(path, limit, label)
+    except (FileNotFoundError, OSError) as exc:
         raise ValueError(f"unable to read {label}") from exc
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError(f"{label} must be a regular file")
-    if info.st_size > limit:
-        raise ValueError(f"{label} exceeds size limit")
+
+
+def _write_bytes_atomic(
+    paths: StateRootLease, path: Path, data: bytes
+) -> None:
+    paths.write_bytes_atomic(path, data)
+
+
+def _is_regular_state_file(paths: StateRootLease, path: Path) -> bool:
     try:
-        with path.open("rb") as source:
-            data = source.read(limit + 1)
-    except OSError as exc:
-        raise ValueError(f"unable to read {label}") from exc
-    if len(data) > limit:
-        raise ValueError(f"{label} exceeds size limit")
-    return data
-
-
-def _write_bytes_atomic(path: Path, data: bytes) -> None:
-    _ensure_parent(path)
-    _reject_symlink(path, "update target")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as temporary:
-            temporary.write(data)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _ensure_parent(path: Path) -> None:
-    if not _is_posix_descriptor_path(path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _reject_symlink(path.parent, "update directory")
-
-
-def _is_posix_descriptor_path(path: Path) -> bool:
-    if os.name == "nt":
+        return stat.S_ISREG(paths.stat(path).st_mode)
+    except FileNotFoundError:
         return False
-    value = os.fspath(path)
-    return value.startswith("/proc/self/fd/") or value.startswith("/dev/fd/")
 
 
-def _reject_symlink(path: Path, label: str) -> None:
-    try:
-        if path.is_symlink():
-            raise ValueError(f"{label} must not be a symlink")
-    except OSError as exc:
-        raise ValueError(f"unable to inspect {label}") from exc
+def _reject_state_symlink(
+    paths: StateRootLease, path: Path, label: str
+) -> None:
+    if stat.S_ISLNK(paths.stat(path).st_mode):
+        raise ValueError(f"{label} must not be a symlink")
 
 
 def _payload_name(digest: str) -> str:
     return f"payload-{digest}.jsonl"
 
 
-def _hotword_dir(paths: StatePaths) -> Path:
-    return paths.hotwords_file.parent
+def _hotword_file() -> Path:
+    return Path("hotwords/zh-ai.jsonl")
 
 
-def _payloads_dir(paths: StatePaths) -> Path:
-    retained = getattr(paths, "payloads_dir", None)
-    return _hotword_dir(paths) / "payloads" if retained is None else retained
+def _payloads_dir() -> Path:
+    return Path("hotwords/payloads")
 
 
-def _payload_file(paths: StatePaths, state: _CurrentState) -> Path:
-    return _payloads_dir(paths) / state.payload
+def _payload_file(state: _CurrentState) -> Path:
+    return _payloads_dir() / state.payload
 
 
-def _current_file(paths: StatePaths) -> Path:
-    return _hotword_dir(paths) / "current.json"
+def _current_file() -> Path:
+    return Path("hotwords/current.json")
 
 
-def _pending_file(paths: StatePaths) -> Path:
-    return _hotword_dir(paths) / "pending.json"
+def _pending_file() -> Path:
+    return Path("hotwords/pending.json")
 
 
-def _attempt_file(paths: StatePaths) -> Path:
-    return _hotword_dir(paths) / "last-update.json"
+def _attempt_file() -> Path:
+    return Path("hotwords/last-update.json")
 
 
 def _reject_constant(value: str) -> None:

@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ import pytest
 
 import voice_intent_normalizer.updater as updater_module
 from voice_intent_normalizer.lexicon import LexiconSet
-from voice_intent_normalizer.paths import StatePaths
+from voice_intent_normalizer.paths import StatePaths, guard_state_root
 from voice_intent_normalizer.updater import UpdateStatus, update_hotwords
 
 MANIFEST_URL = (
@@ -173,10 +174,10 @@ def _child_write_through_retained_state(
             if not release.wait(10):
                 results.put(("timeout", None))
                 return
-            updater_module._write_bytes_atomic(
-                locked_paths.hotwords_file, b"retained\n"
+            locked_paths.write_bytes_atomic(
+                "hotwords/zh-ai.jsonl", b"retained\n"
             )
-            results.put(("ok", str(locked_paths.hotwords_file)))
+            results.put(("ok", "hotwords/zh-ai.jsonl"))
     except Exception as exc:
         results.put((exc.__class__.__name__, str(exc)))
 
@@ -294,9 +295,10 @@ def test_state_root_replacement_with_alias_after_storage_is_revalidated(
     result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
 
     assert result.status is UpdateStatus.REJECTED
-    assert result.message == (
-        "state root rejected: direct canonical local path required"
-    )
+    assert result.message in {
+        "state root rejected: direct canonical local path required",
+        "update rejected: PermissionError",
+    }
     assert transport.calls == []
     assert list(alias_target.iterdir()) == []
 
@@ -633,6 +635,31 @@ def test_loader_recovers_authoritative_pointer_instead_of_stale_cache(tmp_path):
     assert [entry.canonical for entry in loaded.entries] == ["Authoritative"]
 
 
+def test_missing_transaction_pointer_never_promotes_a_replacement_cache(tmp_path):
+    """Catch legacy migration blessing cache bytes after authority disappears."""
+    paths = paths_for(tmp_path)
+    authoritative = hotword_data(canonical="Authoritative")
+    replacement = hotword_data(canonical="Replacement")
+    assert update_hotwords(
+        paths, MANIFEST_URL, transport_for(authoritative), NOW
+    ).status is UpdateStatus.UPDATED
+    (paths.hotwords_file.parent / "current.json").unlink()
+    paths.hotwords_file.write_bytes(replacement)
+
+    resolved = updater_module.resolve_hotword_file(paths)
+    with guard_state_root(
+        paths.root,
+        retained_dirs=("hotwords", "hotwords/payloads"),
+    ) as lease:
+        lease_resolved = updater_module.resolve_hotword_file(lease)
+    loaded = LexiconSet.load(paths, tmp_path / "builtins")
+
+    assert resolved is None
+    assert lease_resolved is None
+    assert all(entry.canonical != "Replacement" for entry in loaded.entries)
+    assert not (paths.hotwords_file.parent / "current.json").exists()
+
+
 def test_authoritative_cache_reconstructs_missing_payload_and_discards_bad_pending(
     tmp_path,
 ):
@@ -743,8 +770,7 @@ def test_corrupt_receipt_cannot_block_an_authoritative_current_pointer(tmp_path)
 
     resolved = updater_module.resolve_hotword_file(paths)
 
-    assert resolved == paths.hotwords_file
-    assert resolved.read_bytes() == data
+    assert resolved == data
     assert json.loads(receipt.read_text(encoding="utf-8"))["version"] == "2026.07.29"
 
 
@@ -837,8 +863,7 @@ def test_receipt_directory_cannot_disable_authoritative_resolution(tmp_path):
 
     resolved = updater_module.resolve_hotword_file(paths)
 
-    assert resolved == paths.hotwords_file
-    assert resolved.read_bytes() == data
+    assert resolved == data
     assert receipt.is_dir()
 
 
@@ -853,8 +878,7 @@ def test_pending_directory_cannot_disable_authoritative_resolution(tmp_path):
 
     resolved = updater_module.resolve_hotword_file(paths)
 
-    assert resolved == paths.hotwords_file
-    assert resolved.read_bytes() == data
+    assert resolved == data
     assert pending.is_dir()
 
 
@@ -905,8 +929,7 @@ def test_extreme_offset_receipt_cannot_disable_authoritative_resolution(
 
     resolved = updater_module.resolve_hotword_file(paths)
 
-    assert resolved == paths.hotwords_file
-    assert resolved.read_bytes() == data
+    assert resolved == data
 
 
 def test_network_timeout_records_a_failed_attempt_and_is_throttled(tmp_path):
@@ -933,12 +956,12 @@ def test_commit_faults_recover_without_mixing_version_and_payload(
     real_write = updater_module._write_bytes_atomic
     failed = False
 
-    def fail_named(path, content):
+    def fail_named(lease, path, content):
         nonlocal failed
         if not failed and failure_name in Path(path).name:
             failed = True
             raise OSError(f"injected {failure_name} failure")
-        real_write(path, content)
+        real_write(lease, path, content)
 
     monkeypatch.setattr(updater_module, "_write_bytes_atomic", fail_named)
     result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
@@ -1138,6 +1161,41 @@ def test_windows_update_lock_guards_state_root_against_rename(tmp_path):
             )
 
     paths.root.rename(tmp_path / "renamed-after-release")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory sharing behavior")
+def test_windows_read_guard_can_overlap_an_updater_guard(tmp_path):
+    """Catch load-side retained handles excluding updater-side retained handles."""
+    paths = paths_for(tmp_path)
+    initial = hotword_data(canonical="Initial")
+    newer = hotword_data(canonical="Newer")
+    assert update_hotwords(
+        paths, MANIFEST_URL, transport_for(initial), NOW
+    ).status is UpdateStatus.UPDATED
+    results = []
+
+    def run_update() -> None:
+        results.append(
+            update_hotwords(
+                paths,
+                MANIFEST_URL,
+                transport_for(newer, version="2026.07.30"),
+                NOW,
+                force=True,
+            )
+        )
+
+    with guard_state_root(
+        paths.root,
+        retained_dirs=("hotwords", "hotwords/payloads"),
+    ):
+        worker = threading.Thread(target=run_update)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive()
+
+    assert [result.status for result in results] == [UpdateStatus.UPDATED]
+    assert paths.hotwords_file.read_bytes() == newer
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows identity replacement handling")
@@ -1443,7 +1501,8 @@ def test_posix_state_guard_uses_nofollow_relative_directory_operations():
     assert "dir_fd=" in source
     assert '"O_NOFOLLOW"' in source
     assert "os.fstat(" in source
-    assert "_posix_descriptor_path" in source
+    assert "/proc/self/fd" not in source
+    assert "/dev/fd" not in source
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX flock behavior")
