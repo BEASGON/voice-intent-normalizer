@@ -85,23 +85,27 @@ def main(
     """Run one command with validation errors separated from degraded results."""
     output = sys.stdout if stdout is None else stdout
     errors = sys.stderr if stderr is None else stderr
+    source = sys.stdin if stdin is None else stdin
+    _configure_utf8(source, output, errors)
     try:
         args = build_parser().parse_args(argv)
     except _UsageError as exc:
-        errors.write(f"voice-intent: {exc}\n")
+        _write_text(errors, f"voice-intent: {exc}\n")
+        return 2
+    try:
+        _validate_args(args)
+    except _UsageError as exc:
+        _write_text(errors, f"voice-intent: {exc}\n")
         return 2
     if args.command == "hook":
         from .hook import main as hook_main
 
-        return hook_main(stdin=stdin, stdout=output, stderr=errors, service=service)
+        return hook_main(stdin=source, stdout=output, stderr=errors, service=service)
     try:
         active_service = default_service() if service is None else service
         return _dispatch(args, active_service, output)
-    except (OSError, PermissionError, RuntimeError) as exc:
-        return _degraded(args, output, str(exc) or "local operation unavailable")
-    except (TypeError, ValueError) as exc:
-        errors.write(f"voice-intent: {exc}\n")
-        return 2
+    except Exception:
+        return _degraded(args, output, "local_operation_unavailable")
 
 
 def _dispatch(
@@ -122,8 +126,6 @@ def _dispatch(
         scope = Scope(args.scope)
         project_id = None
         if scope is Scope.PROJECT:
-            if not args.project_root:
-                raise ValueError("--project-root is required for project learning")
             with guard_project_root(args.project_root) as authority:
                 project_id = service.paths.for_project(authority).project_id
         event = service.learning.confirm(args.alias, args.canonical, scope, project_id)
@@ -139,8 +141,6 @@ def _dispatch(
             {"status": "ok", "event": None if event is None else _event(event)},
         )
     if args.command == "list":
-        if args.limit < 1:
-            raise ValueError("--limit must be positive")
         return _write_result(
             output,
             args,
@@ -189,7 +189,7 @@ def _write_decision(
         _write_json(output, _decision_payload(decision))
         return
     value = decision.question or decision.corrected_text
-    output.write(f"{value}\n")
+    _write_text(output, f"{value}\n")
 
 
 def _decision_payload(decision: CorrectionDecision) -> dict[str, object]:
@@ -228,7 +228,7 @@ def _write_result(
     if args.json:
         _write_json(output, payload)
     else:
-        output.write(f"{payload['status']}\n")
+        _write_text(output, _human_result(args, payload))
     return 0
 
 
@@ -237,13 +237,71 @@ def _degraded(args: argparse.Namespace, output: TextIO, diagnostic: str) -> int:
     if getattr(args, "json", False):
         _write_json(output, payload)
     else:
-        output.write(f"{diagnostic}\n")
+        _write_text(output, f"Status: degraded\nDiagnostic: {diagnostic}\n")
     return 0
 
 
 def _write_json(output: TextIO, payload: dict[str, object]) -> None:
-    output.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    output.write("\n")
+    for ensure_ascii in (False, True):
+        try:
+            _write_text(
+                output,
+                json.dumps(payload, ensure_ascii=ensure_ascii, separators=(",", ":"))
+                + "\n",
+                fallback=False,
+            )
+            return
+        except UnicodeError:
+            continue
+
+
+def _human_result(args: argparse.Namespace, payload: dict[str, object]) -> str:
+    if args.command == "list":
+        events = payload["events"]
+        if not events:
+            return "No learned mappings.\n"
+        return "".join(
+            f"{event['alias']} → {event['canonical']} ({event['scope']})\n"
+            for event in events
+        )
+    if args.command == "doctor":
+        diagnostics = payload["diagnostics"]
+        lines = [f"Status: {payload['status']}"]
+        lines.extend(f"Diagnostic: {item}" for item in diagnostics)
+        return "\n".join(lines) + "\n"
+    if args.command == "scan-project":
+        suffix = " (truncated)" if payload["truncated"] else ""
+        return (
+            f"Scanned {payload['files_scanned']} files; found "
+            f"{payload['entries']} terms{suffix}.\n"
+        )
+    return f"{payload['status']}\n"
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.command == "list" and args.limit < 1:
+        raise _UsageError("--limit must be positive")
+    if args.command == "learn" and args.scope == "project" and not args.project_root:
+        raise _UsageError("--project-root is required for project learning")
+
+
+def _configure_utf8(*streams: object) -> None:
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except Exception:
+                continue
+
+
+def _write_text(output: TextIO, value: str, *, fallback: bool = True) -> None:
+    try:
+        output.write(value)
+    except UnicodeError:
+        if not fallback:
+            raise
+        output.write(value.encode("ascii", "backslashreplace").decode("ascii"))
 
 
 def _state_writable(root: Path) -> bool:

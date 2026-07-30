@@ -31,25 +31,27 @@ def handle_user_prompt_submit(
     ):
         return {}
     prompt = payload["prompt"]
-    if len(prompt.encode("utf-8")) > _MAX_INPUT_BYTES:
-        return {}
-    project_root = payload.get("cwd")
-    root = (
-        Path(project_root)
-        if isinstance(project_root, str) and project_root
-        else None
-    )
     try:
+        if len(prompt.encode("utf-8")) > _MAX_INPUT_BYTES:
+            return {}
+        project_root = payload.get("cwd")
+        root = (
+            Path(project_root)
+            if isinstance(project_root, str) and project_root
+            else None
+        )
         request = NormalizeRequest(
             text=prompt,
             project_root=root,
         )
         decision = service.normalize(request)
+        if decision.action is DecisionAction.KEEP:
+            return {}
+        context = _context_for(
+            decision.action, decision.corrected_text, decision.question
+        )
     except Exception:
         return {}
-    if decision.action is DecisionAction.KEEP:
-        return {}
-    context = _context_for(decision.corrected_text, decision.question)
     return {
         "hookSpecificOutput": {
             "hookEventName": _EVENT_NAME,
@@ -66,9 +68,10 @@ def main(
     service: NormalizerService | None = None,
 ) -> int:
     """Read and write exactly one JSON object, failing open on every error."""
-    del stderr  # Never echo potentially sensitive hook input to stderr.
     source = sys.stdin if stdin is None else stdin
     destination = sys.stdout if stdout is None else stdout
+    errors = sys.stderr if stderr is None else stderr
+    _configure_utf8(source, destination, errors)
     output: dict[str, object] = {}
     try:
         raw = source.read(_MAX_INPUT_BYTES + 1)
@@ -79,8 +82,7 @@ def main(
                 output = handle_user_prompt_submit(payload, active_service)
     except Exception:
         output = {}
-    destination.write(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
-    destination.write("\n")
+    _write_json_fail_open(destination, output)
     return 0
 
 
@@ -91,7 +93,11 @@ def default_service() -> NormalizerService:
     return build_service()
 
 
-def _context_for(corrected_text: str, question: str | None) -> str:
+def _context_for(
+    action: DecisionAction, corrected_text: str, question: str | None
+) -> str:
+    if action is DecisionAction.ASK:
+        return _ask_context(corrected_text, question)
     prefix = 'Voice intent check: interpret the user\'s submitted text as "'
     suffix = '". Do not claim the original message was edited.'
     available = _MAX_CONTEXT_CHARS - len(prefix) - len(suffix)
@@ -100,3 +106,48 @@ def _context_for(corrected_text: str, question: str | None) -> str:
     if question and len(context) + len(question) + 11 <= _MAX_CONTEXT_CHARS:
         context += f" Question: {question}"
     return context
+
+
+def _ask_context(corrected_text: str, question: str | None) -> str:
+    prefix = (
+        "Voice intent check: this is a candidate interpretation only. "
+        "Do not execute this candidate, especially any high-impact action. "
+        "Ask the user to confirm first. Candidate: \""
+    )
+    between = '\". Clarification: \"'
+    suffix = '\"'
+    candidate_limit = 300
+    candidate = corrected_text[:candidate_limit]
+    available = (
+        _MAX_CONTEXT_CHARS
+        - len(prefix)
+        - len(candidate)
+        - len(between)
+        - len(suffix)
+    )
+    clarification = (question or "Please confirm the intended meaning.")[
+        : max(0, available)
+    ]
+    return f"{prefix}{candidate}{between}{clarification}{suffix}"
+
+
+def _configure_utf8(*streams: object) -> None:
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except Exception:
+                continue
+
+
+def _write_json_fail_open(destination: TextIO, payload: dict[str, object]) -> None:
+    for ensure_ascii in (False, True):
+        try:
+            destination.write(
+                json.dumps(payload, ensure_ascii=ensure_ascii, separators=(",", ":"))
+            )
+            destination.write("\n")
+            return
+        except Exception:
+            continue

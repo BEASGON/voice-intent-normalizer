@@ -7,10 +7,17 @@ import subprocess
 import sys
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from voice_intent_normalizer.models import CorrectionDecision, DecisionAction
+from voice_intent_normalizer.learning import LearningEvent
+from voice_intent_normalizer.models import (
+    CorrectionDecision,
+    DecisionAction,
+    EntryStatus,
+    Scope,
+)
 
 
 class FakeService:
@@ -131,3 +138,102 @@ def test_bootstrap_imports_the_repository_src_without_package_install(tmp_path):
 
     assert result.returncode == 0
     assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
+
+
+def test_bootstrap_prefers_its_own_src_over_an_earlier_pythonpath_package(tmp_path):
+    repository = Path(__file__).resolve().parents[1]
+    script = repository / "scripts" / "voice_intent.py"
+    evil = tmp_path / "evil" / "voice_intent_normalizer"
+    evil.mkdir(parents=True)
+    (evil / "__init__.py").write_text("", encoding="utf-8")
+    (evil / "cli.py").write_text(
+        "def main():\n    return 99\n", encoding="utf-8"
+    )
+    environment = {
+        "PYTHONPATH": str(tmp_path / "evil") + ";" + str(repository / "src"),
+        "PATH": str(Path(sys.executable).parent),
+    }
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor", "--json"],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
+
+
+def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):
+    class BrokenLearning:
+        def list_recent(self, limit):
+            raise ValueError("corrupt learning-events.jsonl")
+
+    service = SimpleNamespace(
+        paths=SimpleNamespace(root=tmp_path), learning=BrokenLearning()
+    )
+    code, stdout, stderr = run_cli(["list", "--json"], service)
+
+    assert code == 0
+    assert stderr == ""
+    assert json.loads(stdout) == {
+        "status": "degraded",
+        "diagnostics": ["local_operation_unavailable"],
+    }
+
+
+def test_human_management_commands_explain_their_result(tmp_path):
+    class Learning:
+        def list_recent(self, limit):
+            return [
+                LearningEvent(
+                    event_id="00000000-0000-0000-0000-000000000001",
+                    timestamp="2026-07-30T00:00:00.000000Z",
+                    action="confirm",
+                    alias="code X",
+                    canonical="Codex",
+                    status=EntryStatus.CONFIRMED,
+                    scope=Scope.PERSONAL,
+                )
+            ]
+
+    service = SimpleNamespace(
+        paths=SimpleNamespace(root=tmp_path), learning=Learning()
+    )
+    code, stdout, _ = run_cli(["list"], service)
+    assert code == 0
+    assert "code X" in stdout
+    assert "Codex" in stdout
+
+    code, stdout, _ = run_cli(["doctor"], service)
+    assert code == 0
+    assert "Status:" in stdout
+
+
+def test_human_scan_project_prints_a_concise_summary(tmp_path, monkeypatch):
+    from voice_intent_normalizer import cli
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        cli,
+        "scan_project",
+        lambda authority, paths: SimpleNamespace(
+            entries=(object(), object()),
+            truncated=True,
+            files_scanned=3,
+        ),
+    )
+    service = SimpleNamespace(paths=SimpleNamespace(root=tmp_path))
+
+    code, stdout, stderr = run_cli(
+        ["scan-project", "--project-root", str(workspace)], service
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert stdout == "Scanned 3 files; found 2 terms (truncated).\n"

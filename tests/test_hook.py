@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
 
 from voice_intent_normalizer.models import CorrectionDecision, DecisionAction
 
@@ -81,6 +81,36 @@ def test_hook_fails_open_when_prompt_exceeds_service_bounds():
     assert output == {}
 
 
+def test_hook_fails_open_when_prompt_cannot_be_utf8_encoded():
+    from voice_intent_normalizer.hook import handle_user_prompt_submit
+
+    output = handle_user_prompt_submit(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "\ud800"},
+        FakeService(
+            CorrectionDecision(
+                action=DecisionAction.APPLY,
+                original_text="",
+                corrected_text="",
+            )
+        ),
+    )
+
+    assert output == {}
+
+
+def test_hook_fails_open_when_service_returns_an_invalid_decision():
+    from voice_intent_normalizer.hook import handle_user_prompt_submit
+
+    class InvalidService:
+        def normalize(self, request):
+            return object()
+
+    assert handle_user_prompt_submit(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "open cloud"},
+        InvalidService(),
+    ) == {}
+
+
 def test_hook_main_fails_open_for_invalid_payload_without_echoing_prompt():
     from voice_intent_normalizer.hook import main
 
@@ -125,3 +155,84 @@ def test_hook_main_reads_and_writes_exactly_one_json_object(monkeypatch):
     output = json.loads(stdout.getvalue())
     assert list(output) == ["hookSpecificOutput"]
     assert "OpenClaw" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_ask_context_requires_confirmation_without_directing_execution():
+    from voice_intent_normalizer.hook import handle_user_prompt_submit
+
+    output = handle_user_prompt_submit(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "删除生产数据库"},
+        FakeService(
+            CorrectionDecision(
+                action=DecisionAction.ASK,
+                original_text="删除生产数据库",
+                corrected_text="删除 production database",
+                question="请确认你是否真的要执行这个高风险操作？" + "很长" * 1_000,
+            )
+        ),
+    )
+
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "interpret the user's submitted text as" not in context
+    assert "Do not execute this candidate" in context
+    assert "confirm" in context.casefold()
+    assert "请确认" in context
+    assert len(context) <= 1_000
+
+
+class AsciiOnlyStream:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def write(self, value: str) -> int:
+        value.encode("ascii")
+        self.value += value
+        return len(value)
+
+
+class BrokenStream:
+    def write(self, value: str) -> int:
+        raise UnicodeEncodeError("ascii", value, 0, 1, "injected")
+
+
+def test_hook_reconfigures_utf8_streams_and_falls_back_to_ascii_json(monkeypatch):
+    from voice_intent_normalizer import hook
+
+    service = FakeService(
+        CorrectionDecision(
+            action=DecisionAction.APPLY,
+            original_text="使用 code X",
+            corrected_text="使用 Codex",
+        )
+    )
+    monkeypatch.setattr(hook, "default_service", lambda: service)
+    bytes_stream = BytesIO()
+    utf8_stream = TextIOWrapper(bytes_stream, encoding="cp1252")
+
+    assert hook.main(
+        stdin=StringIO('{"hook_event_name":"UserPromptSubmit","prompt":"使用 code X"}'),
+        stdout=utf8_stream,
+        stderr=StringIO(),
+    ) == 0
+    utf8_stream.flush()
+    assert json.loads(bytes_stream.getvalue().decode("utf-8"))
+
+    narrow_stream = AsciiOnlyStream()
+    assert hook.main(
+        stdin=StringIO('{"hook_event_name":"UserPromptSubmit","prompt":"使用 code X"}'),
+        stdout=narrow_stream,
+        stderr=StringIO(),
+        service=service,
+    ) == 0
+    assert "\\u" in narrow_stream.value
+    assert json.loads(narrow_stream.value)
+
+
+def test_hook_output_write_failure_still_returns_zero():
+    from voice_intent_normalizer.hook import main
+
+    assert main(
+        stdin=StringIO('{"hook_event_name":"Other","prompt":"secret token"}'),
+        stdout=BrokenStream(),
+        stderr=StringIO(),
+    ) == 0
