@@ -112,6 +112,8 @@ def test_project_ids_are_stable_and_isolated(tmp_path):
     """Catch project state collisions or path-dependent identifiers."""
     paths = StatePaths.resolve(environ={}, home=tmp_path)
     alpha = tmp_path / "alpha"
+    alpha.mkdir()
+    (tmp_path / "beta").mkdir()
     first = paths.for_project(alpha)
     second = paths.for_project(tmp_path / "beta")
 
@@ -121,10 +123,54 @@ def test_project_ids_are_stable_and_isolated(tmp_path):
     assert first.project_id == expected_id
 
 
+def test_missing_project_root_has_no_project_identity(tmp_path):
+    """Catch project IDs being minted before a direct root is retained."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path)
+
+    with pytest.raises(ValueError, match="project root"):
+        paths.for_project(tmp_path / "missing-project")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows project identity aliases")
+def test_windows_project_id_uses_retained_canonical_handle_spelling(tmp_path):
+    """Catch case, separator, or extended aliases minting different IDs."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "MixedCaseProject"
+    project_root.mkdir()
+    canonical = project_root.resolve()
+    expected_id = sha256(str(canonical).encode("utf-8")).hexdigest()[:16]
+    spellings = (
+        project_root,
+        Path(str(project_root).swapcase()),
+        Path(str(project_root).replace("\\", "/")),
+        Path("\\\\?\\" + str(project_root)),
+    )
+
+    projects = tuple(paths.for_project(spelling) for spelling in spellings)
+
+    assert {project.project_id for project in projects} == {expected_id}
+    assert {project.project_root for project in projects} == {canonical}
+
+
+def test_project_identity_lookup_releases_its_root_handle(tmp_path):
+    """Catch one-shot project identity derivation leaking a retained handle."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+
+    paths.for_project(project_root)
+    moved = tmp_path / "moved-project"
+    project_root.rename(moved)
+
+    assert moved.is_dir()
+
+
 def test_state_paths_expose_shared_and_project_files_without_creating_them(tmp_path):
     """Catch a path contract that cannot support adapters or project scanning."""
     paths = StatePaths.resolve(environ={}, home=tmp_path)
-    project = paths.for_project(tmp_path / "workspace")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = paths.for_project(workspace)
 
     assert paths.personal_file == paths.root / "personal.jsonl"
     assert paths.preferences_file == paths.root / "preferences.json"

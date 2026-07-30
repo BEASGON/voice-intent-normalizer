@@ -13,7 +13,12 @@ from .learning import LearningEvent, LearningStore, parse_control
 from .lexicon import LexiconSet, load_jsonl
 from .matching import MatchContext, generate_candidates
 from .models import CorrectionDecision, DecisionAction, Scope
-from .paths import StatePaths, validate_state_root
+from .paths import (
+    ProjectRootAuthority,
+    StatePaths,
+    guard_project_root,
+    validate_state_root,
+)
 from .policy import decide
 from .project_scan import project_cache_is_stale, scan_project
 
@@ -103,7 +108,9 @@ class NormalizerService:
         builtins_root: str | Path,
         *,
         hotword_updater: Callable[[StatePaths], Any] | None = None,
-        project_scanner: Callable[[str | Path, StatePaths], Any] = scan_project,
+        project_scanner: Callable[
+            [str | Path | ProjectRootAuthority, StatePaths], Any
+        ] = scan_project,
         learning: LearningStore | None = None,
     ) -> None:
         self.paths = paths
@@ -118,24 +125,55 @@ class NormalizerService:
         """Return a deterministic correction without silently learning it."""
         if not isinstance(request, NormalizeRequest):
             raise TypeError("request must be a NormalizeRequest")
+        if request.project_root is None:
+            return self._normalize_with_project(request, None, ())
+        try:
+            authority_context = guard_project_root(request.project_root)
+            project_authority = authority_context.__enter__()
+        except (OSError, ValueError):
+            return self._normalize_with_project(
+                request,
+                None,
+                ("project_root_invalid",),
+            )
+        try:
+            return self._normalize_with_project(
+                request,
+                project_authority,
+                (),
+            )
+        finally:
+            authority_context.__exit__(None, None, None)
 
+    def _normalize_with_project(
+        self,
+        request: NormalizeRequest,
+        project_authority: ProjectRootAuthority | None,
+        initial_diagnostics: tuple[str, ...],
+    ) -> CorrectionDecision:
         if parse_control(request.text) is not None:
             return CorrectionDecision(
                 action=DecisionAction.KEEP,
                 original_text=request.text,
                 corrected_text=request.text,
-                diagnostics=(_EXPLICIT_CONTROL,),
+                diagnostics=_unique(
+                    (_EXPLICIT_CONTROL, *initial_diagnostics)
+                ),
             )
 
-        diagnostics: list[str] = []
+        diagnostics = list(initial_diagnostics)
         state_writable = self._state_is_writable()
         if not state_writable:
             diagnostics.append(_READ_ONLY_STATE)
         else:
             self._attempt_hotword_update(diagnostics)
-            self._refresh_missing_project_cache(request.project_root, diagnostics)
+            self._refresh_missing_project_cache(
+                project_authority, diagnostics
+            )
 
-        lexicons = self._load_layers(request, diagnostics)
+        lexicons = self._load_layers(
+            request, project_authority, diagnostics
+        )
         project_terms = tuple(
             entry.canonical
             for entry in lexicons.entries
@@ -158,13 +196,32 @@ class NormalizerService:
         )
 
     def apply_control(
-        self, text: str, project_root: Path | None = None
+        self,
+        text: str,
+        project_root: Path | ProjectRootAuthority | None = None,
     ) -> ControlResult | None:
         """Apply only a positively parsed V1 learning-control sentence."""
         command = parse_control(text)
         if command is None:
             return None
+        if project_root is not None and not isinstance(
+            project_root, ProjectRootAuthority
+        ):
+            try:
+                with guard_project_root(project_root) as authority:
+                    return self.apply_control(text, authority)
+            except (OSError, ValueError):
+                return ControlResult(
+                    True,
+                    "\u672a\u80fd\u4fdd\u5b58\u660e\u786e\u66f4\u6b63"
+                    "\uff1b\u73b0\u6709\u72b6\u6001\u4fdd\u6301\u4e0d\u53d8\u3002",
+                )
         try:
+            project_paths = (
+                self.paths.for_project(project_root)
+                if project_root is not None
+                else None
+            )
             if command.kind == "list_recent":
                 return ControlResult(
                     True,
@@ -173,10 +230,14 @@ class NormalizerService:
             if not self._state_is_writable():
                 return ControlResult(True, "状态目录为只读，未保存明确更正。")
             if command.kind == "confirm":
-                scope = Scope.PROJECT if project_root is not None else Scope.PERSONAL
+                scope = (
+                    Scope.PROJECT
+                    if project_paths is not None
+                    else Scope.PERSONAL
+                )
                 project_id = (
-                    self.paths.for_project(project_root).project_id
-                    if project_root is not None
+                    project_paths.project_id
+                    if project_paths is not None
                     else None
                 )
                 event = self.learning.confirm(
@@ -213,27 +274,34 @@ class NormalizerService:
             diagnostics.append("hotword_update_failed")
 
     def _refresh_missing_project_cache(
-        self, project_root: Path | None, diagnostics: list[str]
+        self,
+        project_authority: ProjectRootAuthority | None,
+        diagnostics: list[str],
     ) -> None:
         """Refresh only scanner-owned cache, leaving V1 learning authoritative."""
-        if project_root is None:
+        if project_authority is None:
             return
         try:
             if project_cache_is_stale(
-                project_root, self.paths, diagnostics=diagnostics
+                project_authority,
+                self.paths,
+                diagnostics=diagnostics,
             ):
-                self.project_scanner(project_root, self.paths)
+                self.project_scanner(project_authority, self.paths)
         except (OSError, PermissionError, RuntimeError, ValueError):
             diagnostics.append("project_scan_failed")
 
     def _load_layers(
-        self, request: NormalizeRequest, diagnostics: list[str]
+        self,
+        request: NormalizeRequest,
+        project_authority: ProjectRootAuthority | None,
+        diagnostics: list[str],
     ) -> LexiconSet:
         try:
             lexicons, layer_diagnostics = LexiconSet.load_with_diagnostics(
                 self.paths,
                 self.builtins_root,
-                project_root=request.project_root,
+                project_root=project_authority,
                 domains=request.domains,
             )
             diagnostics.extend(layer_diagnostics)

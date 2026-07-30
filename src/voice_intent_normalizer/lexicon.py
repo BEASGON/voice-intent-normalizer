@@ -14,8 +14,11 @@ from typing import Any
 
 from .models import EntryStatus, LexiconEntry, Scope
 from .paths import (
+    ProjectRootAuthority,
+    ProjectRootValidationError,
     StatePaths,
     StateRootLease,
+    guard_project_root,
     guard_state_root,
     validate_state_root,
 )
@@ -123,7 +126,7 @@ class LexiconSet:
         cls,
         state_paths: StatePaths,
         builtins_root: str | Path,
-        project_root: str | Path | None = None,
+        project_root: str | Path | ProjectRootAuthority | None = None,
         domains: Sequence[str] = (),
     ) -> LexiconSet:
         """Load layers in personal, project, industry, hot, then base precedence."""
@@ -137,11 +140,32 @@ class LexiconSet:
         cls,
         state_paths: StatePaths,
         builtins_root: str | Path,
-        project_root: str | Path | None = None,
+        project_root: str | Path | ProjectRootAuthority | None = None,
         domains: Sequence[str] = (),
     ) -> tuple[LexiconSet, tuple[str, ...]]:
         """Load independent mutable layers without discarding valid siblings."""
         validate_state_root(state_paths.root)
+        if project_root is not None and not isinstance(
+            project_root, ProjectRootAuthority
+        ):
+            try:
+                with guard_project_root(project_root) as authority:
+                    return cls.load_with_diagnostics(
+                        state_paths,
+                        builtins_root,
+                        authority,
+                        domains,
+                    )
+            except ProjectRootValidationError:
+                lexicons, diagnostics = cls.load_with_diagnostics(
+                    state_paths,
+                    builtins_root,
+                    None,
+                    domains,
+                )
+                return lexicons, tuple(
+                    dict.fromkeys(("project_root_invalid", *diagnostics))
+                )
         builtin_paths = Path(builtins_root)
         project_paths = (
             None
@@ -197,7 +221,7 @@ class LexiconSet:
                 from .project_scan import load_project_scan_entries
 
                 scanner_entries, scan_diagnostic = load_project_scan_entries(
-                    lease, project_paths.project_root, project_paths.project_id
+                    lease, project_root, project_paths.project_id
                 )
                 if scan_diagnostic is not None:
                     diagnostics.append(scan_diagnostic)

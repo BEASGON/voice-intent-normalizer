@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,21 @@ from voice_intent_normalizer.lexicon import (
 from voice_intent_normalizer.models import Candidate, EntryStatus, Scope
 from voice_intent_normalizer.paths import StatePaths, StateRootLease
 from voice_intent_normalizer.project_scan import scan_project
+
+
+def _replace_project_root_with_directory_alias(root: Path, target: Path) -> None:
+    root.rmdir()
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(root), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(f"cannot create Windows junction: {created.stderr}")
+        return
+    root.symlink_to(target, target_is_directory=True)
 
 
 def _raw_entry(**overrides: object) -> dict[str, object]:
@@ -418,10 +434,54 @@ def test_missing_pointer_payload_without_raw_still_reports_transaction_invalid(
     assert "hotword_invalid" not in diagnostics
 
 
+def test_invalid_project_alias_omits_every_project_layer(tmp_path):
+    """Catch project.jsonl loading before direct-root authority is retained."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    project = paths.for_project(project_root)
+    _write_entries(
+        paths.personal_file,
+        _raw_entry(
+            canonical="PersonalSafe",
+            scope="personal",
+            aliases=["personal safe"],
+            domains=[],
+            weight=1.0,
+            status="confirmed",
+        ),
+    )
+    _write_entries(
+        project.lexicon_file,
+        _raw_entry(
+            canonical="OldProjectAuthority",
+            scope="project",
+            aliases=["old project"],
+            domains=[],
+            weight=1.0,
+            status="confirmed",
+            project_id=project.project_id,
+        ),
+    )
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+    _replace_project_root_with_directory_alias(project_root, outside)
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths,
+        tmp_path / "builtins",
+        project_root,
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == ["PersonalSafe"]
+    assert diagnostics.count("project_root_invalid") == 1
+
+
 def test_unverified_scanner_cache_is_not_loaded(tmp_path):
     """Catch scanner bytes being parsed without transaction metadata/hash proof."""
     paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
     project_root = tmp_path / "project"
+    project_root.mkdir()
     project = paths.for_project(project_root)
     _write_entries(
         project.scan_lexicon_file,
@@ -550,6 +610,7 @@ def layer_fixture(tmp_path):
     paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
     builtins_root = tmp_path / "builtins"
     project_root = tmp_path / "project"
+    project_root.mkdir()
     project = paths.for_project(project_root)
 
     _write_entries(
@@ -772,6 +833,7 @@ def test_missing_project_directory_stays_unavailable_for_the_whole_load(
     paths = StatePaths(root=tmp_path / "state")
     paths.root.mkdir()
     project_root = tmp_path / "workspace"
+    project_root.mkdir()
     project = paths.for_project(project_root)
     alias_target = tmp_path / "alias-project"
     _write_entries(

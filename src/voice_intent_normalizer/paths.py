@@ -9,16 +9,25 @@ import stat
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 _DIRECT_STATE_ROOT_ERROR = (
     "state root rejected: direct canonical local path required"
 )
+_DIRECT_PROJECT_ROOT_ERROR = (
+    "project root rejected: direct canonical local path required"
+)
 _WINDOWS_REPARSE_POINT = 0x400
+_PROJECT_ROOT_AUTHORITY_TOKEN = object()
 
 
 class StateRootValidationError(ValueError):
     """The configured state root is not a direct canonical local path."""
+
+
+class ProjectRootValidationError(ValueError):
+    """The supplied project root is not a retained direct local directory."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,11 +856,13 @@ def _normalize_windows_project_root(raw: str) -> str:
 
     path = raw.replace("/", "\\")
     folded = path.casefold()
-    if (
-        folded.startswith("\\\\?\\")
-        or folded.startswith("\\\\.\\")
-        or path.startswith("\\\\")
-    ):
+    if folded.startswith("\\\\?\\unc\\") or folded.startswith("\\\\.\\"):
+        raise ValueError("project root must be a direct local path")
+    if folded.startswith("\\\\?\\"):
+        path = path[4:]
+        if len(path) < 3 or path[1:3] != ":\\" or not path[0].isalpha():
+            raise ValueError("project root must be a direct local path")
+    elif path.startswith("\\\\"):
         raise ValueError("project root must be a direct local path")
     drive, tail = ntpath.splitdrive(path)
     if drive and not tail.startswith("\\"):
@@ -1017,6 +1028,362 @@ def _windows_final_path(path: Path) -> Path:
     return final_path
 
 
+@dataclass(slots=True)
+class ProjectRootAuthority:
+    """One verified direct project directory retained by an open handle."""
+
+    canonical_root: Path
+    project_id: str
+    descriptor: int
+    identity: tuple[int, int]
+    root_key: str | None
+    _verification_token: object
+
+
+@contextmanager
+def guard_project_root(
+    project_root: str | Path | ProjectRootAuthority,
+) -> Iterator[ProjectRootAuthority]:
+    """Retain one direct project root without following any path component."""
+    if isinstance(project_root, ProjectRootAuthority):
+        _verify_project_root_authority(project_root)
+        yield project_root
+        return
+    authority: ProjectRootAuthority | None = None
+    try:
+        normalized = normalize_project_root(project_root)
+        authority = (
+            _acquire_windows_project_root(normalized)
+            if os.name == "nt"
+            else _acquire_posix_project_root(normalized)
+        )
+    except ProjectRootValidationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR) from exc
+    try:
+        yield authority
+    finally:
+        _close_project_root_authority(authority)
+
+
+def duplicate_project_root_descriptor(authority: ProjectRootAuthority) -> int:
+    """Duplicate a verified authority handle for an independent consumer."""
+    _verify_project_root_authority(authority)
+    return os.dup(authority.descriptor)
+
+
+def _project_id(canonical_root: Path) -> str:
+    return hashlib.sha256(
+        str(canonical_root).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _acquire_posix_project_root(root: Path) -> ProjectRootAuthority:
+    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required):
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    if not root.is_absolute() or root.anchor != "/":
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        descriptor = os.open("/", flags)
+        descriptors.append(descriptor)
+        for component in root.parts[1:]:
+            descriptor = os.open(component, flags, dir_fd=descriptor)
+            descriptors.append(descriptor)
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+        final_descriptor = descriptors[-1]
+        info = os.fstat(final_descriptor)
+        authority = ProjectRootAuthority(
+            canonical_root=root,
+            project_id=_project_id(root),
+            descriptor=final_descriptor,
+            identity=(info.st_dev, info.st_ino),
+            root_key=None,
+            _verification_token=_PROJECT_ROOT_AUTHORITY_TOKEN,
+        )
+        descriptors.pop()
+        return authority
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _acquire_windows_project_root(root: Path) -> ProjectRootAuthority:
+    import ntpath
+
+    normalized = ntpath.normpath(os.fspath(root))
+    drive, tail = ntpath.splitdrive(normalized)
+    if not drive or not tail.startswith("\\"):
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    current = Path(f"{drive}\\")
+    descriptors: list[int] = []
+    final_path: Path | None = None
+    final_identity: tuple[int, int] | None = None
+    try:
+        descriptor, final_path, final_identity = (
+            _open_windows_project_directory(current)
+        )
+        descriptors.append(descriptor)
+        for component in (part for part in tail.split("\\") if part):
+            current /= component
+            descriptor, final_path, final_identity = (
+                _open_windows_project_directory(current)
+            )
+            descriptors.append(descriptor)
+        if final_path is None or final_identity is None:
+            raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+        final_descriptor = descriptors[-1]
+        canonical_root = final_path
+        authority = ProjectRootAuthority(
+            canonical_root=canonical_root,
+            project_id=_project_id(canonical_root),
+            descriptor=final_descriptor,
+            identity=final_identity,
+            root_key=_windows_path_key(canonical_root),
+            _verification_token=_PROJECT_ROOT_AUTHORITY_TOKEN,
+        )
+        descriptors.pop()
+        return authority
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _open_windows_project_directory(
+    path: Path,
+) -> tuple[int, Path, tuple[int, int]]:
+    import ctypes
+    import msvcrt
+
+    kernel32, attributes_type, information_type = (
+        _windows_project_authority_api()
+    )
+    ctypes.set_last_error(0)
+    native_handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x81,  # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+        0x3,  # share read/write but deny delete/rename
+        None,
+        3,  # OPEN_EXISTING
+        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if native_handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    descriptor: int | None = None
+    try:
+        attributes = attributes_type()
+        if not kernel32.GetFileInformationByHandleEx(
+            native_handle,
+            9,
+            ctypes.byref(attributes),
+            ctypes.sizeof(attributes),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if (
+            not attributes.file_attributes & 0x10
+            or attributes.file_attributes & _WINDOWS_REPARSE_POINT
+        ):
+            raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+        information = information_type()
+        if not kernel32.GetFileInformationByHandle(
+            native_handle, ctypes.byref(information)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        identity = (
+            int(information.volume_serial_number),
+            int(
+                (information.file_index_high << 32)
+                | information.file_index_low
+            ),
+        )
+        final_path = Path(
+            _plain_windows_handle_path(
+                _windows_handle_path(kernel32, native_handle)
+            )
+        )
+        if _windows_path_key(final_path) != _windows_path_key(path):
+            raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+        descriptor = msvcrt.open_osfhandle(
+            native_handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        native_handle = None
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+        return descriptor, final_path, identity
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    finally:
+        if native_handle is not None:
+            kernel32.CloseHandle(native_handle)
+
+
+def _verify_project_root_authority(authority: ProjectRootAuthority) -> None:
+    if (
+        authority._verification_token is not _PROJECT_ROOT_AUTHORITY_TOKEN
+        or authority.project_id != _project_id(authority.canonical_root)
+        or authority.descriptor < 0
+    ):
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    try:
+        info = os.fstat(authority.descriptor)
+    except OSError as exc:
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    if os.name != "nt":
+        if (
+            authority.root_key is not None
+            or (info.st_dev, info.st_ino) != authority.identity
+        ):
+            raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+        return
+    import ctypes
+    import msvcrt
+
+    if (
+        authority.root_key is None
+        or authority.root_key
+        != _windows_path_key(authority.canonical_root)
+    ):
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    kernel32, attributes_type, information_type = (
+        _windows_project_authority_api()
+    )
+    native_handle = msvcrt.get_osfhandle(authority.descriptor)
+    attributes = attributes_type()
+    if not kernel32.GetFileInformationByHandleEx(
+        native_handle,
+        9,
+        ctypes.byref(attributes),
+        ctypes.sizeof(attributes),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if (
+        not attributes.file_attributes & 0x10
+        or attributes.file_attributes & _WINDOWS_REPARSE_POINT
+    ):
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+    information = information_type()
+    if not kernel32.GetFileInformationByHandle(
+        native_handle, ctypes.byref(information)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    identity = (
+        int(information.volume_serial_number),
+        int(
+            (information.file_index_high << 32)
+            | information.file_index_low
+        ),
+    )
+    final_key = _windows_path_key(
+        _plain_windows_handle_path(
+            _windows_handle_path(kernel32, native_handle)
+        )
+    )
+    if identity != authority.identity or final_key != authority.root_key:
+        raise ProjectRootValidationError(_DIRECT_PROJECT_ROOT_ERROR)
+
+
+def _close_project_root_authority(authority: ProjectRootAuthority) -> None:
+    descriptor = authority.descriptor
+    if descriptor < 0:
+        return
+    authority.descriptor = -1
+    try:
+        os.close(descriptor)
+    except OSError:
+        return
+
+
+@lru_cache(maxsize=1)
+def _windows_project_authority_api():
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32, _FileAttributeTagInfo, _ByHandleFileInformation
+
+
+def _windows_handle_path(kernel32, native_handle: int) -> str:
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        native_handle, buffer, len(buffer), 0
+    )
+    if length == 0 or length >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error() or 206)
+    return buffer.value
+
+
+def _plain_windows_handle_path(value: str) -> str:
+    folded = value.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        return "\\\\" + value[8:]
+    if folded.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectPaths:
     """All shared-state paths belonging to one normalized project root."""
@@ -1082,14 +1449,14 @@ class StatePaths:
         """Return one adapter's status document location without creating it."""
         return self.root / "adapters" / f"{adapter}.json"
 
-    def for_project(self, project_root: str | Path) -> ProjectPaths:
-        """Resolve deterministic project paths without creating them."""
-        normalized_root = normalize_project_root(project_root)
-        project_id = hashlib.sha256(
-            str(normalized_root).encode("utf-8")
-        ).hexdigest()[:16]
-        return ProjectPaths(
-            project_root=normalized_root,
-            project_id=project_id,
-            root=self.root / "projects" / project_id,
-        )
+    def for_project(
+        self,
+        project_root: str | Path | ProjectRootAuthority,
+    ) -> ProjectPaths:
+        """Derive project state only from a retained direct-root authority."""
+        with guard_project_root(project_root) as authority:
+            return ProjectPaths(
+                project_root=authority.canonical_root,
+                project_id=authority.project_id,
+                root=self.root / "projects" / authority.project_id,
+            )

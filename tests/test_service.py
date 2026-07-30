@@ -2,11 +2,28 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
 from voice_intent_normalizer.models import DecisionAction, Scope
 from voice_intent_normalizer.paths import StatePaths
+
+
+def _replace_project_root_with_directory_alias(root: Path, target: Path) -> None:
+    root.rmdir()
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(root), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(f"cannot create Windows junction: {created.stderr}")
+        return
+    root.symlink_to(target, target_is_directory=True)
 
 
 def _write_entry(path, **overrides):
@@ -74,6 +91,138 @@ def test_service_corrects_project_aware_term(service, project_root):
 
     assert decision.action is DecisionAction.APPLY
     assert decision.corrected_text == "打开星河工作台的配置"
+
+
+def test_invalid_project_alias_disables_project_evidence_but_keeps_personal(
+    service, project_root, tmp_path
+):
+    """Catch a junction/symlink reusing an old project's learned authority."""
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    project_id = service.paths.for_project(project_root).project_id
+    service.learning.confirm(
+        "old project",
+        "ProjectCanonical",
+        Scope.PROJECT,
+        project_id=project_id,
+    )
+    service.learning.confirm(
+        "personal old",
+        "PersonalCanonical",
+        Scope.PERSONAL,
+    )
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+    _replace_project_root_with_directory_alias(project_root, outside)
+
+    decision = service.normalize(
+        NormalizeRequest(
+            text="delete old project and personal old",
+            project_root=project_root,
+        )
+    )
+
+    assert decision.corrected_text == "delete old project and PersonalCanonical"
+    assert decision.diagnostics.count("project_root_invalid") == 1
+    assert all(
+        candidate.entry.scope is not Scope.PROJECT
+        for candidate in decision.candidates
+    )
+
+
+def test_missing_project_root_is_nonfatal_and_diagnostic(service, tmp_path):
+    """Catch missing roots silently deriving a reusable project identity."""
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    decision = service.normalize(
+        NormalizeRequest(
+            text="ordinary text",
+            project_root=tmp_path / "missing-project",
+        )
+    )
+
+    assert decision.corrected_text == "ordinary text"
+    assert decision.diagnostics.count("project_root_invalid") == 1
+
+
+@pytest.mark.parametrize(
+    "control_text",
+    (
+        "\u6211\u8bf4\u7684\u662f ProjectCanonical"
+        "\uff0c\u4e0d\u662f old project",
+        "\u4e0d\u8981\u628a old project "
+        "\u6539\u6210 ProjectCanonical",
+    ),
+)
+def test_invalid_project_alias_blocks_learning_controls(
+    service, project_root, tmp_path, control_text
+):
+    """Catch project-associated controls reading or writing without authority."""
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+    _replace_project_root_with_directory_alias(project_root, outside)
+
+    result = service.apply_control(control_text, project_root=project_root)
+
+    assert result is not None
+    assert result.handled is True
+    assert result.event is None
+    assert not service.learning.events_file.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows project path aliases")
+@pytest.mark.parametrize("spelling", ("case", "separator", "extended"))
+def test_windows_project_aliases_share_learning_and_high_risk_evidence(
+    service, project_root, spelling
+):
+    """Catch Windows caller spelling selecting a different project identity."""
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    project_id = service.paths.for_project(project_root).project_id
+    service.learning.confirm(
+        "old project",
+        "ProjectCanonical",
+        Scope.PROJECT,
+        project_id=project_id,
+    )
+    if spelling == "case":
+        supplied = Path(str(project_root).swapcase())
+    elif spelling == "separator":
+        supplied = Path(str(project_root).replace("\\", "/"))
+    else:
+        supplied = Path("\\\\?\\" + str(project_root))
+
+    decision = service.normalize(
+        NormalizeRequest(
+            text="delete old project",
+            project_root=supplied,
+        )
+    )
+
+    assert decision.corrected_text == "delete ProjectCanonical"
+    assert "project_root_invalid" not in decision.diagnostics
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained-handle cleanup")
+def test_service_releases_project_authority_after_normalize_and_control(
+    service, project_root, tmp_path
+):
+    """Catch service or control paths leaking a root handle after returning."""
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    service.normalize(
+        NormalizeRequest(text="ordinary text", project_root=project_root)
+    )
+    result = service.apply_control(
+        "\u6211\u8bf4\u7684\u662f ProjectCanonical"
+        "\uff0c\u4e0d\u662f old project",
+        project_root=project_root,
+    )
+    moved = tmp_path / "moved-project"
+    project_root.rename(moved)
+
+    assert result is not None and result.event is not None
+    assert moved.is_dir()
 
 
 def test_service_continues_when_update_fails(service_with_failed_update):

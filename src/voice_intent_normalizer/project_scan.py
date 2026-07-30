@@ -16,10 +16,13 @@ from pathlib import Path
 from .lexicon import _entry_data, load_jsonl_bytes
 from .models import EntryStatus, LexiconEntry, Scope
 from .paths import (
+    ProjectRootAuthority,
+    ProjectRootValidationError,
     StatePaths,
     StateRootLease,
+    duplicate_project_root_descriptor,
+    guard_project_root,
     guard_state_root,
-    normalize_project_root,
 )
 
 _EXCLUDED_DIRECTORY_NAMES = frozenset(
@@ -259,7 +262,7 @@ def _entries_from_observations(
 
 
 def scan_project(
-    root: str | Path,
+    root: str | Path | ProjectRootAuthority,
     state_paths: StatePaths,
     max_files: int = 5_000,
     max_text_bytes: int = 2_000_000,
@@ -273,12 +276,17 @@ def scan_project(
     _validate_scan_limits(max_files, max_text_bytes)
 
     try:
-        project_root = normalize_project_root(root)
-        root_authority = _open_retained_project_root(project_root)
+        authority_context, project_authority, root_authority = (
+            _acquire_project_scan_root(root)
+        )
     except (OSError, ValueError):
         return ScanResult((), False, 0, 0)
     try:
-        project_paths = state_paths.for_project(project_root)
+        project_paths = state_paths.for_project(project_authority)
+    except (OSError, ValueError):
+        authority_context.__exit__(None, None, None)
+        return ScanResult((), False, 0, 0)
+    try:
         # A source can change while it is read. Only publish a cache after a
         # matching bounded metadata snapshot, otherwise retry and leave old
         # state stale. Every snapshot is duplicated from the same retained root
@@ -336,10 +344,11 @@ def scan_project(
         raise RuntimeError("project changed during bounded scan")
     finally:
         _close_retained_project_handle(root_authority)
+        authority_context.__exit__(None, None, None)
 
 
 def project_cache_is_stale(
-    root: str | Path,
+    root: str | Path | ProjectRootAuthority,
     state_paths: StatePaths,
     max_files: int = 5_000,
     max_text_bytes: int = 2_000_000,
@@ -349,12 +358,14 @@ def project_cache_is_stale(
     """Return whether the bounded scanner cache needs a safe refresh."""
     _validate_scan_limits(max_files, max_text_bytes)
     try:
-        project_root = normalize_project_root(root)
-        root_authority = _open_retained_project_root(project_root)
+        authority_context, project_authority, root_authority = (
+            _acquire_project_scan_root(root)
+        )
     except (OSError, ValueError):
+        _append_project_root_diagnostic(diagnostics)
         return False
     try:
-        project_paths = state_paths.for_project(project_root)
+        project_paths = state_paths.for_project(project_authority)
         relative_dir = Path("projects") / project_paths.project_id
         with guard_state_root(state_paths.root, retained_dirs=(relative_dir,)) as lease:
             cache_relative = relative_dir / "project-scan.jsonl"
@@ -394,11 +405,12 @@ def project_cache_is_stale(
         return True
     finally:
         _close_retained_project_handle(root_authority)
+        authority_context.__exit__(None, None, None)
 
 
 def load_project_scan_entries(
     lease: StateRootLease,
-    project_root: Path,
+    project_authority: ProjectRootAuthority,
     project_id: str,
 ) -> tuple[tuple[LexiconEntry, ...], str | None]:
     """Resolve one hash-coherent scanner cache through the caller's lease."""
@@ -427,9 +439,10 @@ def load_project_scan_entries(
         )
         if any(entry.project_id != project_id for entry in entries):
             return (), "project_scan_invalid"
+        if project_authority.project_id != project_id:
+            return (), "project_scan_invalid"
         try:
-            normalized_root = normalize_project_root(project_root)
-            root_authority = _open_retained_project_root(normalized_root)
+            root_authority = _retained_project_root(project_authority)
         except (OSError, ValueError):
             return (), "project_scan_invalid"
         try:
@@ -493,11 +506,21 @@ def _append_scan_diagnostic(diagnostics: list[str] | None) -> None:
         diagnostics.append("project_scan_invalid")
 
 
-def _project_fingerprint(root: Path, *, max_files: int) -> str:
+def _append_project_root_diagnostic(diagnostics: list[str] | None) -> None:
+    if diagnostics is not None and "project_root_invalid" not in diagnostics:
+        diagnostics.append("project_root_invalid")
+
+
+def _project_fingerprint(
+    root: str | Path | ProjectRootAuthority,
+    *,
+    max_files: int,
+) -> str:
     """Hash bounded metadata only; source content never enters state."""
     try:
-        normalized_root = normalize_project_root(root)
-        root_authority = _open_retained_project_root(normalized_root)
+        authority_context, _project_authority, root_authority = (
+            _acquire_project_scan_root(root)
+        )
     except (OSError, ValueError):
         return _fingerprint_snapshot(_ProjectSnapshot((), False, 0, 0))
     try:
@@ -506,6 +529,7 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
         )
     finally:
         _close_retained_project_handle(root_authority)
+        authority_context.__exit__(None, None, None)
 
 
 def _project_fingerprint_retained(
@@ -535,11 +559,15 @@ def _fingerprint_snapshot(snapshot: _ProjectSnapshot) -> str:
 
 
 def _scan_once(
-    root: Path, project_id: str, max_files: int, max_text_bytes: int
+    root: str | Path | ProjectRootAuthority,
+    project_id: str,
+    max_files: int,
+    max_text_bytes: int,
 ) -> ScanResult:
     try:
-        normalized_root = normalize_project_root(root)
-        root_authority = _open_retained_project_root(normalized_root)
+        authority_context, _project_authority, root_authority = (
+            _acquire_project_scan_root(root)
+        )
     except (OSError, ValueError):
         return ScanResult((), False, 0, 0)
     try:
@@ -548,6 +576,7 @@ def _scan_once(
         )
     finally:
         _close_retained_project_handle(root_authority)
+        authority_context.__exit__(None, None, None)
 
 
 def _scan_once_retained(
@@ -706,15 +735,44 @@ def _secure_project_snapshot(
     )
 
 
-def _open_retained_project_root(root: Path) -> _RetainedProjectHandle:
-    if os.name == "nt":
-        retained = _open_windows_project_root(root)
-    else:
-        retained = _open_posix_project_root(root)
-    if not retained.is_directory:
-        _close_retained_project_handle(retained)
-        raise ValueError("project root must be a direct directory")
-    return retained
+def _acquire_project_scan_root(
+    root: str | Path | ProjectRootAuthority,
+):
+    """Enter shared authority and duplicate it without leaking partial opens."""
+    authority_context = guard_project_root(root)
+    project_authority: ProjectRootAuthority | None = None
+    try:
+        project_authority = authority_context.__enter__()
+        retained = _retained_project_root(project_authority)
+    except BaseException:
+        if project_authority is not None:
+            authority_context.__exit__(None, None, None)
+        raise
+    return authority_context, project_authority, retained
+
+
+def _retained_project_root(
+    authority: ProjectRootAuthority,
+) -> _RetainedProjectHandle:
+    descriptor = duplicate_project_root_descriptor(authority)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ProjectRootValidationError(
+                "project root authority must remain a direct directory"
+            )
+        return _retained_from_stat(
+            authority.canonical_root,
+            Path(),
+            descriptor,
+            True,
+            info,
+            root_key=authority.root_key,
+            identity=authority.identity,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def _duplicate_retained_project_handle(
@@ -756,38 +814,6 @@ def _open_retained_project_child(
             parent.root_key,
         )
     return _open_posix_project_child(parent, name)
-
-
-def _open_posix_project_root(root: Path) -> _RetainedProjectHandle:
-    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
-    if any(not hasattr(os, name) for name in required):
-        raise OSError("secure project traversal requires POSIX no-follow flags")
-    if not root.is_absolute() or root.anchor != "/":
-        raise ValueError("POSIX project root must be an absolute direct path")
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptors: list[int] = []
-    try:
-        descriptor = os.open("/", flags)
-        descriptors.append(descriptor)
-        for component in root.parts[1:]:
-            descriptor = os.open(component, flags, dir_fd=descriptor)
-            descriptors.append(descriptor)
-            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-                raise ValueError("project root must be a direct directory")
-        final_descriptor = descriptors[-1]
-        info = os.fstat(final_descriptor)
-        retained = _retained_from_stat(
-            root,
-            Path(),
-            final_descriptor,
-            True,
-            info,
-        )
-        descriptors.pop()
-        return retained
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
 
 
 def _open_posix_project_child(
@@ -901,35 +927,6 @@ def _close_retained_project_handles(
 ) -> None:
     for handle in handles:
         _close_retained_project_handle(handle)
-
-
-def _open_windows_project_root(root: Path) -> _RetainedProjectHandle:
-    """Acquire each direct DOS-path component while ancestors stay retained."""
-    import ntpath
-
-    normalized = ntpath.normpath(os.fspath(root))
-    drive, tail = ntpath.splitdrive(normalized)
-    if not drive or not tail.startswith("\\"):
-        raise ValueError("Windows project root must be an absolute direct path")
-    root_key = ntpath.normcase(normalized)
-    current = Path(f"{drive}\\")
-    retained_components: list[_RetainedProjectHandle] = []
-    try:
-        retained_components.append(
-            _open_windows_project_path(current, Path(), None)
-        )
-        for component in (part for part in tail.split("\\") if part):
-            current /= component
-            retained_components.append(
-                _open_windows_project_path(current, Path(), None)
-            )
-        retained = retained_components.pop()
-        retained.path = root
-        retained.relative = Path()
-        retained.root_key = root_key
-        return retained
-    finally:
-        _close_retained_project_handles(reversed(retained_components))
 
 
 def _open_windows_project_path(
