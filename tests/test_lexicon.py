@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+import voice_intent_normalizer.lexicon as lexicon_module
 from voice_intent_normalizer.lexicon import (
     LexiconSet,
     load_jsonl,
@@ -249,6 +251,43 @@ def test_layered_entries_follow_precedence_and_exclude_other_projects(layer_fixt
         Scope.BASE,
     ]
     assert all(entry.canonical != "Other Project" for entry in lexicons.entries)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained root handle")
+def test_lexicon_load_never_follows_root_swap_to_alias(tmp_path, monkeypatch):
+    direct_paths = StatePaths(root=tmp_path / "direct-state")
+    alias_root = tmp_path / "alias-state"
+    moved_root = tmp_path / "moved-direct-state"
+    _write_entries(
+        direct_paths.personal_file,
+        _raw_entry(canonical="Direct", scope="personal", aliases=["direct"]),
+    )
+    _write_entries(
+        alias_root / "personal.jsonl",
+        _raw_entry(canonical="Alias", scope="personal", aliases=["alias"]),
+    )
+    real_load_jsonl = lexicon_module.load_jsonl
+    attempted = False
+    blocked = False
+
+    def swap_before_personal_read(path, expected_scope=None):
+        nonlocal attempted, blocked
+        if not attempted and Path(path) == direct_paths.personal_file:
+            attempted = True
+            try:
+                direct_paths.root.rename(moved_root)
+                direct_paths.root.symlink_to(alias_root, target_is_directory=True)
+            except OSError:
+                blocked = True
+        return real_load_jsonl(path, expected_scope=expected_scope)
+
+    monkeypatch.setattr(lexicon_module, "load_jsonl", swap_before_personal_read)
+
+    lexicons = LexiconSet.load(direct_paths, tmp_path / "builtins")
+
+    assert attempted
+    assert blocked
+    assert [entry.canonical for entry in lexicons.entries] == ["Direct"]
 
 
 def test_layer_loader_keeps_last_duplicate_record_inside_one_file(layer_fixture):

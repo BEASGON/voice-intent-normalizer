@@ -27,6 +27,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.data-files]
+"share/voice-intent-normalizer/docs" = ["docs/state-root-v1.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

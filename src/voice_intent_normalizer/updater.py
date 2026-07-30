@@ -33,7 +33,13 @@ from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
 from .models import Scope
-from .paths import StatePaths, StateRootValidationError, validate_state_root
+from .paths import (
+    StatePaths,
+    StateRootLease,
+    StateRootValidationError,
+    guard_state_root,
+    validate_state_root,
+)
 
 
 class Response(Protocol):
@@ -119,6 +125,21 @@ class _AttemptState:
     last_check: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _LockedStatePaths:
+    root: Path
+    hotwords_file: Path
+    payloads_dir: Path
+
+
+def _locked_state_paths(lease: StateRootLease) -> _LockedStatePaths:
+    return _LockedStatePaths(
+        root=lease.root,
+        hotwords_file=lease.path("hotwords/zh-ai.jsonl"),
+        payloads_dir=lease.path("hotwords/payloads"),
+    )
+
+
 def update_hotwords(
     paths: StatePaths,
     manifest_url: str,
@@ -140,10 +161,12 @@ def update_hotwords(
             return UpdateResult(
                 UpdateStatus.REJECTED, message="manifest source rejected"
             )
-        with _update_lock(paths):
-            current = _recover_locked(paths, checked_at)
+        with _update_lock(paths) as locked_paths:
+            current = _recover_locked(locked_paths, checked_at)
             if not force and _check_is_recent(
-                current, _read_attempt_or_none(paths, checked_at), checked_at
+                current,
+                _read_attempt_or_none(locked_paths, checked_at),
+                checked_at,
             ):
                 return UpdateResult(
                     UpdateStatus.SKIPPED,
@@ -155,10 +178,12 @@ def update_hotwords(
             _fetch_limited(fetcher, manifest_url, _MAX_MANIFEST_BYTES)
         )
         candidate_version = manifest.version
-        with _update_lock(paths):
-            current = _recover_locked(paths, checked_at)
-            checked_at = _merged_check_time(paths, current, checked_at)
-            immediate = _decide_known_version(paths, current, manifest, checked_at)
+        with _update_lock(paths) as locked_paths:
+            current = _recover_locked(locked_paths, checked_at)
+            checked_at = _merged_check_time(locked_paths, current, checked_at)
+            immediate = _decide_known_version(
+                locked_paths, current, manifest, checked_at
+            )
             if immediate is not None:
                 return immediate
 
@@ -167,14 +192,16 @@ def update_hotwords(
             raise ValueError("hotword checksum mismatch")
         _validate_hotword_jsonl(data)
 
-        with _update_lock(paths):
-            current = _recover_locked(paths, checked_at)
-            checked_at = _merged_check_time(paths, current, checked_at)
-            immediate = _decide_known_version(paths, current, manifest, checked_at)
+        with _update_lock(paths) as locked_paths:
+            current = _recover_locked(locked_paths, checked_at)
+            checked_at = _merged_check_time(locked_paths, current, checked_at)
+            immediate = _decide_known_version(
+                locked_paths, current, manifest, checked_at
+            )
             if immediate is not None:
                 return immediate
 
-            _commit_locked(paths, manifest, data, checked_at)
+            _commit_locked(locked_paths, manifest, data, checked_at)
             return UpdateResult(UpdateStatus.UPDATED, version=manifest.version)
     except Exception as exc:
         invalid_root = isinstance(exc, StateRootValidationError)
@@ -184,8 +211,8 @@ def update_hotwords(
             and not isinstance(exc, UpdateLockTimeout)
         ):
             try:
-                with _update_lock(paths):
-                    current = _recover_locked(paths, checked_at)
+                with _update_lock(paths) as locked_paths:
+                    current = _recover_locked(locked_paths, checked_at)
                     if current is not None and current.version == candidate_version:
                         return UpdateResult(
                             UpdateStatus.UPDATED, version=candidate_version
@@ -239,7 +266,12 @@ def _decide_known_version(
 
 def _recover_locked(paths: StatePaths, operation_now: datetime) -> _CurrentState | None:
     """Reconcile an interrupted commit before any version decision is made."""
-    _ensure_storage(paths)
+    try:
+        _ensure_storage(paths)
+    except PermissionError as exc:
+        raise StateRootValidationError(
+            "state root rejected: direct canonical local path required"
+        ) from exc
     current = _read_current(paths)
     attempt = _read_attempt_or_none(paths, operation_now)
     if attempt is not None and attempt.last_check > operation_now:
@@ -647,14 +679,16 @@ def resolve_hotword_file(paths: StatePaths) -> Path | None:
     try:
         validate_state_root(paths.root)
         operation_now = datetime.now(timezone.utc)
-        with _update_lock(paths):
-            current = _recover_locked(paths, operation_now)
+        with _update_lock(paths) as locked_paths:
+            current = _recover_locked(locked_paths, operation_now)
             if current is not None:
-                _verify_current_cache(paths, current)
+                _verify_current_cache(locked_paths, current)
                 return paths.hotwords_file
-            if paths.hotwords_file.is_file():
+            if locked_paths.hotwords_file.is_file():
                 data = _read_regular_file(
-                    paths.hotwords_file, _MAX_DATA_BYTES, "hotword file"
+                    locked_paths.hotwords_file,
+                    _MAX_DATA_BYTES,
+                    "hotword file",
                 )
                 _validate_hotword_jsonl(data)
                 return paths.hotwords_file
@@ -666,11 +700,11 @@ def resolve_hotword_file(paths: StatePaths) -> Path | None:
 def _record_failed_attempt(paths: StatePaths, now: datetime) -> None:
     try:
         checked_at = _utc_now(now)
-        with _update_lock(paths, timeout=0.05):
-            current = _recover_locked(paths, checked_at)
-            checked_at = _merged_check_time(paths, current, checked_at)
+        with _update_lock(paths, timeout=0.05) as locked_paths:
+            current = _recover_locked(locked_paths, checked_at)
+            checked_at = _merged_check_time(locked_paths, current, checked_at)
             _write_attempt_best_effort(
-                paths,
+                locked_paths,
                 _AttemptState(None if current is None else current.version, checked_at),
             )
     except Exception:
@@ -748,6 +782,8 @@ def _utc_now(value: datetime) -> datetime:
 
 
 def _ensure_storage(paths: StatePaths) -> None:
+    if isinstance(paths, _LockedStatePaths):
+        return
     directory = _hotword_dir(paths)
     directory.mkdir(parents=True, exist_ok=True)
     _reject_symlink(directory, "hotword directory")
@@ -761,19 +797,24 @@ def _ensure_storage(paths: StatePaths) -> None:
 
 
 @contextmanager
-def _update_lock(paths: StatePaths, *, timeout: float | None = None) -> Iterator[None]:
+def _update_lock(
+    paths: StatePaths, *, timeout: float | None = None
+) -> Iterator[_LockedStatePaths]:
     """Use a stable OS lease, never a replaceable filesystem lock entry."""
     validate_state_root(paths.root)
     if os.name == "nt":
-        with _windows_mutex(paths, timeout):
-            yield
+        with _windows_mutex(paths, timeout) as locked_paths:
+            yield locked_paths
         return
 
     with _posix_control_lock(paths, timeout):
-        validate_state_root(paths.root)
-        _ensure_storage(paths)
-        validate_state_root(paths.root)
-        yield
+        with guard_state_root(
+            paths.root,
+            create=True,
+            retained_dirs=("hotwords", "hotwords/payloads"),
+            create_retained=True,
+        ) as lease:
+            yield _locked_state_paths(lease)
 
 
 @contextmanager
@@ -907,7 +948,9 @@ def _posix_lock_name(paths: StatePaths) -> str:
 
 
 @contextmanager
-def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
+def _windows_mutex(
+    paths: StatePaths, timeout: float | None
+) -> Iterator[_LockedStatePaths]:
     """Hold stable path plus alias-convergent identity mutexes in fixed order."""
     import ctypes
     from ctypes import wintypes
@@ -938,13 +981,12 @@ def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
         validate_state_root(paths.root)
         for attempt_number in range(_WINDOWS_IDENTITY_RETRIES):
             remaining = max(0.0, deadline - time.monotonic())
-            _ensure_storage(paths)
-            validate_state_root(paths.root)
-            with (
-                _windows_directory_guard(paths.root),
-                _windows_directory_guard(_hotword_dir(paths)),
-                _windows_directory_guard(_payloads_dir(paths)),
-            ):
+            with guard_state_root(
+                paths.root,
+                create=True,
+                retained_dirs=("hotwords", "hotwords/payloads"),
+                create_retained=True,
+            ) as lease:
                 identity = _windows_directory_identity(paths.root)
                 identity_name = _windows_identity_mutex_name(identity)
                 with _acquire_windows_mutex_names(
@@ -952,84 +994,13 @@ def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
                 ):
                     validate_state_root(paths.root)
                     if _windows_directory_identity(paths.root) == identity:
-                        yield
+                        yield _locked_state_paths(lease)
                         return
             if (
                 attempt_number + 1 >= _WINDOWS_IDENTITY_RETRIES
                 or time.monotonic() >= deadline
             ):
                 raise OSError("Windows state path changed during lock acquisition")
-
-
-@contextmanager
-def _windows_directory_guard(path: Path) -> Iterator[None]:
-    """Prevent replacement of one validated state directory during an operation."""
-    import ctypes
-    from ctypes import wintypes
-
-    class _FileAttributeTagInfo(ctypes.Structure):
-        _fields_ = [
-            ("file_attributes", wintypes.DWORD),
-            ("reparse_tag", wintypes.DWORD),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.GetFileInformationByHandleEx.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    )
-    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    ctypes.set_last_error(0)
-    handle = kernel32.CreateFileW(
-        _extended_windows_path(path),
-        0x10080,  # DELETE | FILE_READ_ATTRIBUTES
-        0x3,  # FILE_SHARE_READ | FILE_SHARE_WRITE; intentionally deny DELETE
-        None,
-        3,  # OPEN_EXISTING
-        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
-        None,
-    )
-    if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-
-    active_exception = False
-    try:
-        attributes = _FileAttributeTagInfo()
-        ctypes.set_last_error(0)
-        if not kernel32.GetFileInformationByHandleEx(
-            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if not attributes.file_attributes & 0x10 or (
-            attributes.file_attributes & 0x400
-        ):
-            raise StateRootValidationError(
-                "state root rejected: direct canonical local path required"
-            )
-        validate_state_root(path)
-        yield
-    except BaseException:
-        active_exception = True
-        raise
-    finally:
-        ctypes.set_last_error(0)
-        if not kernel32.CloseHandle(handle) and not active_exception:
-            raise ctypes.WinError(ctypes.get_last_error())
 
 
 @contextmanager
@@ -1345,8 +1316,16 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
 
 
 def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink(path.parent, "update directory")
+    if not _is_posix_descriptor_path(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _reject_symlink(path.parent, "update directory")
+
+
+def _is_posix_descriptor_path(path: Path) -> bool:
+    if os.name == "nt":
+        return False
+    value = os.fspath(path)
+    return value.startswith("/proc/self/fd/") or value.startswith("/dev/fd/")
 
 
 def _reject_symlink(path: Path, label: str) -> None:
@@ -1366,7 +1345,8 @@ def _hotword_dir(paths: StatePaths) -> Path:
 
 
 def _payloads_dir(paths: StatePaths) -> Path:
-    return _hotword_dir(paths) / "payloads"
+    retained = getattr(paths, "payloads_dir", None)
+    return _hotword_dir(paths) / "payloads" if retained is None else retained
 
 
 def _payload_file(paths: StatePaths, state: _CurrentState) -> Path:

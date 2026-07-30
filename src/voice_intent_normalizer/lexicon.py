@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from .models import EntryStatus, LexiconEntry, Scope
-from .paths import StatePaths, validate_state_root
+from .paths import (
+    StatePaths,
+    StateRootValidationError,
+    guard_state_root,
+    state_root_identity,
+    validate_state_root,
+)
 from .updater import resolve_hotword_file
 
 _REQUIRED_FIELDS = frozenset(
@@ -90,52 +96,90 @@ class LexiconSet:
     ) -> LexiconSet:
         """Load layers in personal, project, industry, hot, then base precedence."""
         validate_state_root(state_paths.root)
+        initial_root_identity = state_root_identity(state_paths.root)
         builtin_paths = Path(builtins_root)
-        layers: list[LexiconEntry] = []
-
-        layers.extend(_load_if_present(state_paths.personal_file, Scope.PERSONAL))
-
-        if project_root is not None:
-            project_paths = state_paths.for_project(project_root)
-            project_entries = _load_if_present(
-                project_paths.lexicon_file, Scope.PROJECT
-            )
-            layers.extend(
-                entry
-                for entry in project_entries
-                if entry.project_id == project_paths.project_id
-            )
-
-        seen_domains: set[str] = set()
-        for domain in domains:
-            if domain in seen_domains:
-                continue
-            seen_domains.add(domain)
-            industry_path = _first_existing(
-                (
-                    builtin_paths / "domains" / f"{domain}.jsonl",
-                    builtin_paths / "industry" / f"{domain}.jsonl",
-                )
-            )
-            if industry_path is not None:
-                layers.extend(_load_if_present(industry_path, Scope.INDUSTRY))
-
-        hotword_path = resolve_hotword_file(state_paths)
-        if hotword_path is None:
-            hotword_path = _first_existing(
-                (
-                    builtin_paths / "hotwords-snapshot.jsonl",
-                    builtin_paths / "hot.jsonl",
-                )
-            )
-        if hotword_path is not None:
-            layers.extend(_load_if_present(hotword_path, Scope.HOT))
-
-        base_path = _first_existing(
-            (builtin_paths / "base-zh.jsonl", builtin_paths / "base.jsonl")
+        project_paths = (
+            None
+            if project_root is None
+            else state_paths.for_project(project_root)
         )
-        if base_path is not None:
-            layers.extend(_load_if_present(base_path, Scope.BASE))
+        retained_dirs: list[Path] = [Path("hotwords")]
+        if project_paths is not None:
+            retained_dirs.append(
+                Path("projects") / project_paths.project_id
+            )
+        layers: list[LexiconEntry] = []
+        authoritative_hotword = resolve_hotword_file(state_paths) is not None
+        if initial_root_identity is None:
+            initial_root_identity = state_root_identity(state_paths.root)
+
+        with guard_state_root(
+            state_paths.root, retained_dirs=retained_dirs
+        ) as lease:
+            if (
+                initial_root_identity is not None
+                and state_root_identity(state_paths.root)
+                != initial_root_identity
+            ):
+                raise StateRootValidationError(
+                    "state root rejected: direct canonical local path required"
+                )
+            if lease.exists:
+                layers.extend(
+                    _load_if_present(
+                        lease.path("personal.jsonl"), Scope.PERSONAL
+                    )
+                )
+
+            if project_paths is not None and lease.exists:
+                project_entries = _load_if_present(
+                    lease.path(
+                        Path("projects")
+                        / project_paths.project_id
+                        / "project.jsonl"
+                    ),
+                    Scope.PROJECT,
+                )
+                layers.extend(
+                    entry
+                    for entry in project_entries
+                    if entry.project_id == project_paths.project_id
+                )
+
+            seen_domains: set[str] = set()
+            for domain in domains:
+                if domain in seen_domains:
+                    continue
+                seen_domains.add(domain)
+                industry_path = _first_existing(
+                    (
+                        builtin_paths / "domains" / f"{domain}.jsonl",
+                        builtin_paths / "industry" / f"{domain}.jsonl",
+                    )
+                )
+                if industry_path is not None:
+                    layers.extend(
+                        _load_if_present(industry_path, Scope.INDUSTRY)
+                    )
+
+            hotword_path = (
+                lease.path("hotwords/zh-ai.jsonl")
+                if authoritative_hotword and lease.exists
+                else _first_existing(
+                    (
+                        builtin_paths / "hotwords-snapshot.jsonl",
+                        builtin_paths / "hot.jsonl",
+                    )
+                )
+            )
+            if hotword_path is not None:
+                layers.extend(_load_if_present(hotword_path, Scope.HOT))
+
+            base_path = _first_existing(
+                (builtin_paths / "base-zh.jsonl", builtin_paths / "base.jsonl")
+            )
+            if base_path is not None:
+                layers.extend(_load_if_present(base_path, Scope.BASE))
 
         return cls(entries=tuple(layers))
 

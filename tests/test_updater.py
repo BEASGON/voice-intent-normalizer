@@ -162,6 +162,25 @@ def _child_hold_lock_with_xdg(root: str, runtime: str, ready, release) -> None:
     _child_hold_lock(root, ready, release)
 
 
+def _child_write_through_retained_state(
+    root: str, ready, release, results
+) -> None:
+    try:
+        with updater_module._update_lock(
+            StatePaths(root=Path(root))
+        ) as locked_paths:
+            ready.set()
+            if not release.wait(10):
+                results.put(("timeout", None))
+                return
+            updater_module._write_bytes_atomic(
+                locked_paths.hotwords_file, b"retained\n"
+            )
+            results.put(("ok", str(locked_paths.hotwords_file)))
+    except Exception as exc:
+        results.put((exc.__class__.__name__, str(exc)))
+
+
 def test_valid_update_replaces_hotwords_and_records_check(tmp_path):
     data = hotword_data()
     paths = paths_for(tmp_path)
@@ -278,6 +297,73 @@ def test_state_root_replacement_with_alias_after_storage_is_revalidated(
     assert result.message == (
         "state root rejected: direct canonical local path required"
     )
+    assert transport.calls == []
+    assert list(alias_target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory creation race")
+def test_windows_absent_root_symlink_swap_cannot_mutate_target(
+    tmp_path, monkeypatch
+):
+    paths = paths_for(tmp_path)
+    alias_target = tmp_path / "alias-target"
+    alias_target.mkdir()
+    real_mkdir = os.mkdir
+    injected = False
+
+    def replace_root_instead_of_creating(path, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if (
+            not injected
+            and dir_fd is None
+            and Path(path) == paths.root
+        ):
+            injected = True
+            paths.root.symlink_to(alias_target, target_is_directory=True)
+            return None
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", replace_root_instead_of_creating)
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
+
+    assert result.status is UpdateStatus.REJECTED
+    assert result.message == (
+        "state root rejected: direct canonical local path required"
+    )
+    assert transport.calls == []
+    assert list(alias_target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction creation race")
+def test_windows_preexisting_hotwords_junction_cannot_create_payloads(tmp_path):
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    alias_target = tmp_path / "alias-target"
+    alias_target.mkdir()
+    junction = paths.hotwords_file.parent
+    created = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(junction),
+            str(alias_target),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {created.stderr.strip()}")
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
+
+    assert result.status is UpdateStatus.REJECTED
     assert transport.calls == []
     assert list(alias_target.iterdir()) == []
 
@@ -1306,6 +1392,58 @@ def test_posix_lock_loop_raises_noncontention_native_error_without_retry():
 
     assert exc_info.value.errno == errno.EIO
     assert calls == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX retained directory descriptors")
+@pytest.mark.parametrize("replaced_directory", ("root", "hotwords"))
+def test_posix_guarded_write_never_follows_replaced_state_directory(
+    tmp_path, replaced_directory
+):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    results = context.Queue()
+    paths = paths_for(tmp_path)
+    alias_target = tmp_path / f"{replaced_directory}-alias-target"
+    alias_target.mkdir()
+    writer = context.Process(
+        target=_child_write_through_retained_state,
+        args=(str(paths.root), ready, release, results),
+    )
+    writer.start()
+    assert ready.wait(10)
+
+    if replaced_directory == "root":
+        moved = tmp_path / "retained-root"
+        paths.root.rename(moved)
+        paths.root.symlink_to(alias_target, target_is_directory=True)
+        expected = moved / "hotwords" / "zh-ai.jsonl"
+    else:
+        moved = paths.root / "retained-hotwords"
+        paths.hotwords_file.parent.rename(moved)
+        paths.hotwords_file.parent.symlink_to(
+            alias_target, target_is_directory=True
+        )
+        expected = moved / "zh-ai.jsonl"
+
+    release.set()
+    writer.join(15)
+
+    assert writer.exitcode == 0
+    assert results.get(timeout=3)[0] == "ok"
+    assert expected.read_bytes() == b"retained\n"
+    assert list(alias_target.iterdir()) == []
+
+
+def test_posix_state_guard_uses_nofollow_relative_directory_operations():
+    source = Path(updater_module.__file__).with_name("paths.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "dir_fd=" in source
+    assert '"O_NOFOLLOW"' in source
+    assert "os.fstat(" in source
+    assert "_posix_descriptor_path" in source
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX flock behavior")
