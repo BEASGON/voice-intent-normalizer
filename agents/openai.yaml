@@ -1,0 +1,4 @@
+interface:
+  display_name: "Voice Intent Normalizer"
+  short_description: "Correct Chinese voice-input terms safely"
+  default_prompt: "Use $voice-intent-normalizer to interpret this Chinese voice-transcribed request safely."
