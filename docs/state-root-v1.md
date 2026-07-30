@@ -48,6 +48,14 @@ share-compatible directory handles, then identity mutex. Directory handles do
 not exclude one another, so an updater that already holds the path mutex can
 finish and release it before the loader proceeds.
 
+Every lease captures its coordination key from the normalized lexical
+configured-root spelling at acquisition. V1 has already rejected path aliases,
+so this key is common to all supported actors targeting that configured path
+and is independent of later directory replacement. The initial updater lock
+and retained-lease recovery assert that their captured keys match. Retained
+recovery derives its POSIX control-lock or Windows path-mutex name directly
+from the captured key and never recomputes it through the live filesystem.
+
 An invalid root is rejected before hotword network access, journal recovery,
 or state mutation. `update_hotwords` returns `REJECTED` with:
 

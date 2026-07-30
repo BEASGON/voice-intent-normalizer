@@ -37,6 +37,7 @@ from .paths import (
     StateRootLease,
     StateRootValidationError,
     guard_state_root,
+    state_root_lock_key,
     validate_state_root,
 )
 
@@ -861,18 +862,21 @@ def _update_lock(
 ) -> Iterator[StateRootLease]:
     """Use a stable OS lease, never a replaceable filesystem lock entry."""
     validate_state_root(paths.root)
+    lock_key = state_root_lock_key(paths.root)
     if os.name == "nt":
-        with _windows_mutex(paths, timeout) as locked_paths:
+        with _windows_mutex(paths, lock_key, timeout) as locked_paths:
             yield locked_paths
         return
 
-    with _posix_control_lock(paths, timeout):
+    with _posix_control_lock(lock_key, timeout):
         with guard_state_root(
             paths.root,
             create=True,
             retained_dirs=("hotwords", "hotwords/payloads"),
             create_retained=True,
         ) as lease:
+            if lease.captured_lock_key != lock_key:
+                raise OSError("state lock key changed during lease acquisition")
             yield lease
 
 
@@ -888,9 +892,8 @@ def _retained_lease_update_lock(
     identity; because directory handles do not exclude one another, an updater
     already holding the path mutex can always finish before this loader enters.
     """
-    paths = StatePaths(root=lease.configured_root)
     if os.name != "nt":
-        with _posix_control_lock(paths, timeout):
+        with _posix_control_lock(lease.captured_lock_key, timeout):
             yield
         return
 
@@ -899,19 +902,19 @@ def _retained_lease_update_lock(
     deadline = time.monotonic() + lease_timeout
     with _acquire_windows_mutex_names(
         kernel32,
-        (_windows_path_mutex_name(paths),),
+        (_windows_path_mutex_name_from_key(lease.captured_lock_key),),
         timeout=lease_timeout,
     ):
-        validate_state_root(paths.root)
-        identity = _windows_directory_identity(paths.root)
+        validate_state_root(lease.configured_root)
+        identity = _windows_directory_identity(lease.configured_root)
         remaining = max(0.0, deadline - time.monotonic())
         with _acquire_windows_mutex_names(
             kernel32,
             (_windows_identity_mutex_name(identity),),
             timeout=remaining,
         ):
-            validate_state_root(paths.root)
-            if _windows_directory_identity(paths.root) != identity:
+            validate_state_root(lease.configured_root)
+            if _windows_directory_identity(lease.configured_root) != identity:
                 raise OSError(
                     "Windows state path changed during lock acquisition"
                 )
@@ -919,7 +922,7 @@ def _retained_lease_update_lock(
 
 
 @contextmanager
-def _posix_control_lock(paths: StatePaths, timeout: float | None) -> Iterator[None]:
+def _posix_control_lock(lock_key: str, timeout: float | None) -> Iterator[None]:
     """Lock a permanent owner-only control entry outside replaceable state."""
     control_descriptor = _open_posix_control_directory()
     lock_descriptor: int | None = None
@@ -930,7 +933,7 @@ def _posix_control_lock(paths: StatePaths, timeout: float | None) -> Iterator[No
             if not hasattr(os, required_flag):
                 raise OSError(f"secure POSIX locks require {required_flag}")
             flags |= getattr(os, required_flag)
-        name = _posix_lock_name(paths)
+        name = _posix_lock_name_from_key(lock_key)
         lock_descriptor = os.open(name, flags, 0o600, dir_fd=control_descriptor)
         descriptor_info = os.fstat(lock_descriptor)
         entry_info = os.stat(
@@ -1040,23 +1043,25 @@ def _verify_posix_lock_file(info: os.stat_result) -> None:
 
 
 def _posix_lock_name(paths: StatePaths) -> str:
-    """Key the external lock by the canonical configured state-root identity."""
-    identity = os.path.normpath(
-        os.path.realpath(os.path.abspath(os.fspath(paths.root)))
-    )
-    digest = hashlib.sha256(os.fsencode(identity)).hexdigest()
+    """Key the external lock by the stable lexical configured-root key."""
+    return _posix_lock_name_from_key(state_root_lock_key(paths.root))
+
+
+def _posix_lock_name_from_key(lock_key: str) -> str:
+    """Derive a POSIX control filename without reopening the configured path."""
+    digest = hashlib.sha256(os.fsencode(lock_key)).hexdigest()
     return f"update-{digest}.lock"
 
 
 @contextmanager
 def _windows_mutex(
-    paths: StatePaths, timeout: float | None
+    paths: StatePaths, lock_key: str, timeout: float | None
 ) -> Iterator[StateRootLease]:
     """Hold stable path plus alias-convergent identity mutexes in fixed order."""
     kernel32 = _windows_mutex_api()
     lease_timeout = _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
     deadline = time.monotonic() + lease_timeout
-    path_name = _windows_path_mutex_name(paths)
+    path_name = _windows_path_mutex_name_from_key(lock_key)
     with _acquire_windows_mutex_names(kernel32, (path_name,), timeout=lease_timeout):
         validate_state_root(paths.root)
         for attempt_number in range(_WINDOWS_IDENTITY_RETRIES):
@@ -1067,6 +1072,10 @@ def _windows_mutex(
                 retained_dirs=("hotwords", "hotwords/payloads"),
                 create_retained=True,
             ) as lease:
+                if lease.captured_lock_key != lock_key:
+                    raise OSError(
+                        "state lock key changed during lease acquisition"
+                    )
                 identity = _windows_directory_identity(paths.root)
                 identity_name = _windows_identity_mutex_name(identity)
                 with _acquire_windows_mutex_names(
@@ -1189,9 +1198,13 @@ def _windows_mutex_name(paths: StatePaths) -> str:
 
 def _windows_path_mutex_name(paths: StatePaths) -> str:
     """Name the replacement-stable mutex for one canonical configured path."""
-    canonical_path = _normalize_windows_path_for_lock(paths.root)
+    return _windows_path_mutex_name_from_key(state_root_lock_key(paths.root))
+
+
+def _windows_path_mutex_name_from_key(lock_key: str) -> str:
+    """Derive a Windows path mutex without reopening the configured path."""
     digest = hashlib.sha256(
-        f"voice-intent-normalizer-path-v1:{canonical_path}".encode()
+        f"voice-intent-normalizer-path-v1:{lock_key}".encode()
     ).hexdigest()
     return f"Global\\voice-intent-normalizer-update-0-path-{digest}"
 

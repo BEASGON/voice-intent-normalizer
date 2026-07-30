@@ -36,6 +36,7 @@ class StateRootLease:
     configured_root: Path
     root: Path
     root_exists: bool
+    captured_lock_key: str
     _directories: Mapping[tuple[str, ...], _DirectoryBinding]
     _unavailable: frozenset[tuple[str, ...]]
 
@@ -460,6 +461,13 @@ def state_root_identity(root: str | Path) -> tuple[int, int] | None:
     return info.st_dev, info.st_ino
 
 
+def state_root_lock_key(root: str | Path) -> str:
+    """Return the lexical configured-root key used for external coordination."""
+    if os.name == "nt":
+        return _windows_path_key(root)
+    return os.path.normpath(os.path.abspath(os.fspath(root)))
+
+
 @contextmanager
 def guard_state_root(
     root: str | Path,
@@ -470,10 +478,12 @@ def guard_state_root(
 ) -> Iterator[StateRootLease]:
     """Retain direct root identities and bind requested subdirectories to them."""
     validated = validate_state_root(root)
+    captured_lock_key = state_root_lock_key(validated)
     requested = tuple(_relative_directory_parts(value) for value in retained_dirs)
     if os.name == "nt":
         with _guard_windows_state_root(
             validated,
+            captured_lock_key=captured_lock_key,
             create=create,
             retained_dirs=requested,
             create_retained=create_retained,
@@ -482,6 +492,7 @@ def guard_state_root(
         return
     with _guard_posix_state_root(
         validated,
+        captured_lock_key=captured_lock_key,
         create=create,
         retained_dirs=requested,
         create_retained=create_retained,
@@ -504,6 +515,7 @@ def _relative_directory_parts(value: str | Path) -> tuple[str, ...]:
 def _guard_windows_state_root(
     root: Path,
     *,
+    captured_lock_key: str,
     create: bool,
     retained_dirs: tuple[tuple[str, ...], ...],
     create_retained: bool,
@@ -517,7 +529,12 @@ def _guard_windows_state_root(
         except FileNotFoundError:
             if not create:
                 yield StateRootLease(
-                    root, root, False, {}, frozenset(retained_dirs)
+                    root,
+                    root,
+                    False,
+                    captured_lock_key,
+                    {},
+                    frozenset(retained_dirs),
                 )
                 return
             if existing == existing.parent:
@@ -570,7 +587,14 @@ def _guard_windows_state_root(
                 unavailable.add(parts)
                 continue
         validate_state_root(root)
-        yield StateRootLease(root, root, True, retained, frozenset(unavailable))
+        yield StateRootLease(
+            root,
+            root,
+            True,
+            captured_lock_key,
+            retained,
+            frozenset(unavailable),
+        )
 
 
 @contextmanager
@@ -657,6 +681,7 @@ def _extended_windows_path(value: str | Path) -> str:
 def _guard_posix_state_root(
     root: Path,
     *,
+    captured_lock_key: str,
     create: bool,
     retained_dirs: tuple[tuple[str, ...], ...],
     create_retained: bool,
@@ -680,7 +705,12 @@ def _guard_posix_state_root(
             except FileNotFoundError:
                 if not create:
                     yield StateRootLease(
-                        root, root, False, {}, frozenset(retained_dirs)
+                        root,
+                        root,
+                        False,
+                        captured_lock_key,
+                        {},
+                        frozenset(retained_dirs),
                     )
                     return
                 try:
@@ -735,7 +765,12 @@ def _guard_posix_state_root(
         }
         acquired = True
         yield StateRootLease(
-            root, root, True, bound, frozenset(unavailable)
+            root,
+            root,
+            True,
+            captured_lock_key,
+            bound,
+            frozenset(unavailable),
         )
     except (NotADirectoryError, OSError) as exc:
         if acquired:

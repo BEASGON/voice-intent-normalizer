@@ -183,6 +183,27 @@ def _child_write_through_retained_state(
         results.put((exc.__class__.__name__, str(exc)))
 
 
+def _child_resolve_through_retained_state(
+    root: str, ready, start, attempting, done, results
+) -> None:
+    try:
+        with guard_state_root(
+            Path(root),
+            retained_dirs=("hotwords", "hotwords/payloads"),
+        ) as lease:
+            ready.set()
+            if not start.wait(10):
+                results.put(("test-timeout", None))
+                return
+            attempting.set()
+            data = updater_module.resolve_hotword_file(lease)
+            results.put(("ok", data))
+    except Exception as exc:
+        results.put((exc.__class__.__name__, str(exc)))
+    finally:
+        done.set()
+
+
 def test_valid_update_replaces_hotwords_and_records_check(tmp_path):
     data = hotword_data()
     paths = paths_for(tmp_path)
@@ -1356,6 +1377,20 @@ def test_windows_mutex_name_normalizes_drive_and_unc_aliases(tmp_path):
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained path mutex key")
+def test_windows_retained_lease_path_mutex_matches_initial_updater_key(tmp_path):
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    initial_name = updater_module._windows_path_mutex_name(paths)
+
+    with guard_state_root(paths.root) as lease:
+        retained_name = updater_module._windows_path_mutex_name_from_key(
+            lease.captured_lock_key
+        )
+
+    assert retained_name == initial_name
+
+
 class _FakeWaitKernel:
     def __init__(self, result, error=0):
         self.result = result
@@ -1487,6 +1522,35 @@ def test_posix_lock_name_is_independent_of_hotword_directory_replacement(tmp_pat
     assert after.endswith(".lock")
 
 
+def test_posix_retained_lease_lock_key_ignores_live_realpath_drift(
+    tmp_path, monkeypatch
+):
+    """Catch a retained P lease recomputing its coordination key from live Q."""
+    paths = paths_for(tmp_path)
+    paths.root.mkdir(parents=True)
+    replacement = tmp_path / "replacement-state"
+    replacement.mkdir()
+    initial_name = updater_module._posix_lock_name(paths)
+    real_realpath = updater_module.os.path.realpath
+
+    def redirect_configured_root(value):
+        if Path(value) == paths.root:
+            return str(replacement)
+        return real_realpath(value)
+
+    with guard_state_root(paths.root) as lease:
+        monkeypatch.setattr(
+            updater_module.os.path, "realpath", redirect_configured_root
+        )
+        live_name = updater_module._posix_lock_name(paths)
+        assert live_name == initial_name
+        retained_name = updater_module._posix_lock_name_from_key(
+            lease.captured_lock_key
+        )
+
+    assert retained_name == initial_name
+
+
 def test_posix_control_directory_is_outside_configured_state(tmp_path):
     paths = paths_for(tmp_path)
     home = tmp_path / "home"
@@ -1608,6 +1672,61 @@ def test_posix_lock_survives_hotword_directory_rename_and_replacement(tmp_path):
     release.set()
     holder.join(10)
     assert holder.exitcode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX retained lock-key behavior")
+def test_posix_retained_loader_contends_after_root_becomes_symlink(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    holder_ready = context.Event()
+    release_holder = context.Event()
+    loader_ready = context.Event()
+    start_loader = context.Event()
+    loader_attempting = context.Event()
+    loader_done = context.Event()
+    results = context.Queue()
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Retained P")
+    assert update_hotwords(
+        paths, MANIFEST_URL, transport_for(data), NOW
+    ).status is UpdateStatus.UPDATED
+    replacement = tmp_path / "replacement-state"
+    replacement.mkdir()
+    holder = context.Process(
+        target=_child_hold_lock,
+        args=(str(paths.root), holder_ready, release_holder),
+    )
+    holder.start()
+    assert holder_ready.wait(10)
+    loader = context.Process(
+        target=_child_resolve_through_retained_state,
+        args=(
+            str(paths.root),
+            loader_ready,
+            start_loader,
+            loader_attempting,
+            loader_done,
+            results,
+        ),
+    )
+    loader.start()
+    assert loader_ready.wait(10)
+    retained_root = tmp_path / "retained-state"
+    paths.root.rename(retained_root)
+    paths.root.symlink_to(replacement, target_is_directory=True)
+
+    try:
+        start_loader.set()
+        assert loader_attempting.wait(10)
+        assert not loader_done.wait(0.25)
+        assert holder.is_alive()
+    finally:
+        release_holder.set()
+        holder.join(10)
+        loader.join(10)
+
+    assert holder.exitcode == 0
+    assert loader.exitcode == 0
+    assert results.get(timeout=3) == ("ok", None)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process environment behavior")
