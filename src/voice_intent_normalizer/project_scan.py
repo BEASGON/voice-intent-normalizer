@@ -282,11 +282,10 @@ def scan_project(
     except (OSError, ValueError):
         return ScanResult((), False, 0, 0)
     try:
-        project_paths = state_paths.for_project(project_authority)
-    except (OSError, ValueError):
-        authority_context.__exit__(None, None, None)
-        return ScanResult((), False, 0, 0)
-    try:
+        try:
+            project_paths = state_paths.for_project(project_authority)
+        except (OSError, ValueError):
+            return ScanResult((), False, 0, 0)
         # A source can change while it is read. Only publish a cache after a
         # matching bounded metadata snapshot, otherwise retry and leave old
         # state stale. Every snapshot is duplicated from the same retained root

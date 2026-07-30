@@ -456,6 +456,68 @@ def test_scan_retains_nested_child_before_junction_chain_walk(
     assert "ChainSecretDirectory" not in canonicals
 
 
+@pytest.mark.parametrize("failure_type", [ValueError, OSError])
+def test_scan_closes_root_handles_when_project_path_derivation_fails(
+    tmp_path, monkeypatch, failure_type
+):
+    """Catch state-path derivation leaking an already duplicated scan root."""
+    project = tmp_path / "project"
+    project.mkdir()
+    state_paths = _state_paths(tmp_path)
+    real_acquire = project_scan_module._acquire_project_scan_root
+    real_close = project_scan_module._close_retained_project_handle
+    authorities = []
+    retained_handles = []
+    close_counts: dict[int, int] = {}
+
+    def capture_acquisition(root):
+        context, authority, retained = real_acquire(root)
+        authorities.append(authority)
+        retained_handles.append(retained)
+        return context, authority, retained
+
+    def count_and_close(handle):
+        close_counts[id(handle)] = close_counts.get(id(handle), 0) + 1
+        real_close(handle)
+
+    def fail_project_path_derivation(self, authority):
+        raise failure_type("injected project path derivation failure")
+
+    monkeypatch.setattr(
+        project_scan_module,
+        "_acquire_project_scan_root",
+        capture_acquisition,
+    )
+    monkeypatch.setattr(
+        project_scan_module,
+        "_close_retained_project_handle",
+        count_and_close,
+    )
+    monkeypatch.setattr(
+        StatePaths,
+        "for_project",
+        fail_project_path_derivation,
+    )
+
+    try:
+        for _attempt in range(3):
+            result = scan_project(project, state_paths)
+
+            assert result.entries == ()
+            assert result.files_scanned == 0
+
+        renamed = tmp_path / "renamed-project"
+        project.rename(renamed)
+
+        assert all(authority.descriptor == -1 for authority in authorities)
+        assert all(handle.descriptor == -1 for handle in retained_handles)
+        assert all(close_counts.get(id(handle)) == 1 for handle in retained_handles)
+        assert renamed.is_dir()
+    finally:
+        for handle in retained_handles:
+            real_close(handle)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows retained-handle cleanup")
 def test_scanner_closes_queued_directory_handles_on_file_limit(tmp_path):
     """Catch a truncated traversal leaking handles that block later renames."""
