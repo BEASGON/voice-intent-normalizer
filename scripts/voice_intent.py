@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import ntpath
+import os
 import posixpath
+import stat
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 
 
 def main() -> int:
-    repository = Path(__file__).resolve().parents[1]
+    repository = Path(__file__).resolve(strict=True).parents[1]
     source = _trusted_source(repository / "src")
     _prioritize_source(source)
-    _verify_import_targets(source)
+    expected_cli = _preflight_package(source)
     _clear_preloaded_package()
     from voice_intent_normalizer import cli
 
-    if not _native_is_below(cli.__file__, source):
+    if (
+        cli.__name__ != "voice_intent_normalizer.cli"
+        or not _same_native_file(cli.__file__, expected_cli)
+        or not _same_native_file(
+            None if cli.__spec__ is None else cli.__spec__.origin,
+            expected_cli,
+        )
+    ):
         raise RuntimeError("trusted repository CLI could not be imported")
 
     return cli.main()
@@ -32,19 +41,72 @@ def _prioritize_source(source: Path) -> None:
 
 
 def _trusted_source(source: Path) -> Path:
+    _require_direct_directory(source)
     resolved = source.resolve(strict=True)
     if not resolved.is_dir():
         raise RuntimeError("trusted repository source is unavailable")
     return resolved
 
 
-def _verify_import_targets(source: Path) -> None:
-    for target in (
-        source / "voice_intent_normalizer",
-        source / "voice_intent_normalizer" / "cli.py",
-    ):
-        if not _native_is_below(target, source):
-            raise RuntimeError("trusted repository CLI could not be imported")
+def _preflight_package(source: Path) -> Path:
+    package = source / "voice_intent_normalizer"
+    _require_direct_directory(package)
+    pending = [(package, 0)]
+    directories = 0
+    python_files = 0
+    expected_cli: Path | None = None
+    while pending:
+        directory, depth = pending.pop()
+        directories += 1
+        if directories > 32 or depth > 8:
+            raise RuntimeError("trusted repository package is too large")
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as exc:
+            raise RuntimeError("trusted repository package is unavailable") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                raise RuntimeError("trusted repository package is unavailable") from exc
+            if _is_reparse_point(info) or stat.S_ISLNK(info.st_mode):
+                raise RuntimeError("trusted repository package contains an alias")
+            if stat.S_ISDIR(info.st_mode):
+                if path.name != "__pycache__":
+                    pending.append((path, depth + 1))
+                continue
+            if path.suffix != ".py":
+                continue
+            _require_direct_regular_file(path, info)
+            if not _native_is_below(path, package):
+                raise RuntimeError("trusted repository package contains an alias")
+            python_files += 1
+            if python_files > 64:
+                raise RuntimeError("trusted repository package is too large")
+            if path == package / "cli.py":
+                expected_cli = path.resolve(strict=True)
+    if expected_cli is None:
+        raise RuntimeError("trusted repository CLI could not be imported")
+    return expected_cli
+
+
+def _require_direct_directory(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RuntimeError("trusted repository source is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode) or _is_reparse_point(info):
+        raise RuntimeError("trusted repository source must be a direct directory")
+
+
+def _require_direct_regular_file(path: Path, info: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode) or _is_reparse_point(info):
+        raise RuntimeError("trusted repository package contains an alias")
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0) & 0x400)
 
 
 def _canonical_path(value: str | Path) -> str:
@@ -92,6 +154,17 @@ def _native_is_below(value: str | None, root: Path) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     return True
+
+
+def _same_native_file(value: str | None, expected: Path) -> bool:
+    if value is None:
+        return False
+    try:
+        candidate = Path(value).resolve(strict=True)
+        trusted = expected.resolve(strict=True)
+        return os.path.samefile(candidate, trusted)
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _windows_path(value: str | Path) -> PureWindowsPath:

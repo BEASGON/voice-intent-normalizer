@@ -320,6 +320,99 @@ def test_bootstrap_rejects_physical_cli_origins_outside_trusted_src(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    "alias_kind", ["src-root", "init-file", "helper-file", "helper-directory"]
+)
+def test_bootstrap_preflight_rejects_transitive_python_aliases_before_import(
+    tmp_path, alias_kind
+):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    source = repository / "src"
+    marker = tmp_path / "external-import-ran"
+    external = tmp_path / "external"
+    external.mkdir()
+
+    if alias_kind == "src-root":
+        external_source = external / "src"
+        package = external_source / "voice_intent_normalizer"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "cli.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['VOICE_INTENT_EXTERNAL_MARKER']).write_text('imported')\n"
+            "def main():\n    return 0\n",
+            encoding="utf-8",
+        )
+        try:
+            source.symlink_to(external_source, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+    elif alias_kind == "helper-directory":
+        package = source / "voice_intent_normalizer"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "cli.py").write_text(
+            "from . import helper\n\ndef main():\n    return 0\n",
+            encoding="utf-8",
+        )
+        external_helper = external / "helper"
+        external_helper.mkdir()
+        (external_helper / "__init__.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['VOICE_INTENT_EXTERNAL_MARKER']).write_text('imported')\n",
+            encoding="utf-8",
+        )
+        try:
+            (package / "helper").symlink_to(external_helper, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+    else:
+        package = source / "voice_intent_normalizer"
+        package.mkdir(parents=True)
+        (package / "cli.py").write_text(
+            "from . import helper\n\ndef main():\n    return 0\n",
+            encoding="utf-8",
+        )
+        external_file = external / (
+            "__init__.py" if alias_kind == "init-file" else "helper.py"
+        )
+        external_file.write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['VOICE_INTENT_EXTERNAL_MARKER']).write_text('imported')\n",
+            encoding="utf-8",
+        )
+        if alias_kind == "init-file":
+            (package / "helper.py").write_text("", encoding="utf-8")
+            link = package / "__init__.py"
+        else:
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            link = package / "helper.py"
+        try:
+            link.symlink_to(external_file)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor", "--json"],
+        cwd=tmp_path,
+        env={
+            "PATH": str(Path(sys.executable).parent),
+            "VOICE_INTENT_EXTERNAL_MARKER": str(marker),
+            "PYTHONPATH": os.pathsep.join(()),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
 def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):
     class BrokenLearning:
         def list_recent(self, limit):
