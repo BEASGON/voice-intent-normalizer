@@ -227,6 +227,29 @@ def test_corrupt_hotword_pointer_is_diagnostic_even_with_raw_fallback(tmp_path):
     assert "hotword_state_invalid" in diagnostics
 
 
+def test_unverified_scanner_cache_is_not_loaded(tmp_path):
+    """Catch scanner bytes being parsed without transaction metadata/hash proof."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "project"
+    project = paths.for_project(project_root)
+    _write_entries(
+        project.scan_lexicon_file,
+        _raw_entry(
+            canonical="InjectedScannerTerm",
+            scope="project",
+            aliases=["injected"],
+            project_id=project.project_id,
+        ),
+    )
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins", project_root
+    )
+
+    assert "InjectedScannerTerm" not in {entry.canonical for entry in lexicons.entries}
+    assert "project_scan_invalid" in diagnostics
+
+
 @pytest.fixture
 def layer_fixture(tmp_path):
     paths = StatePaths.resolve(environ={}, home=tmp_path / "home")

@@ -220,6 +220,7 @@ def test_first_refresh_removes_only_legacy_scanner_records(tmp_path):
         status=EntryStatus.CANDIDATE,
         project_id=project_paths.project_id,
         source="widget.py",
+        use_count=1,
         notes="camel-case",
     )
     learned = LexiconEntry(
@@ -239,3 +240,33 @@ def test_first_refresh_removes_only_legacy_scanner_records(tmp_path):
     assert [entry.canonical for entry in load_jsonl(project_paths.lexicon_file)] == [
         "WidgetEngine"
     ]
+
+
+def test_empty_scanned_directory_makes_the_cache_stale(tmp_path):
+    """Catch fingerprints that ignore directory-stem producing entries."""
+    (tmp_path / "source.py").write_text("class SourceTerm:\n", encoding="utf-8")
+    state_paths = _state_paths(tmp_path)
+    scan_project(tmp_path, state_paths)
+
+    (tmp_path / "WidgetDirectory").mkdir()
+
+    assert project_cache_is_stale(tmp_path, state_paths) is True
+
+
+def test_legacy_cleanup_preserves_nondefault_manual_candidate(tmp_path):
+    """Catch broad scanner cleanup deleting manually tuned candidate records."""
+    (tmp_path / "widget.py").write_text("class Widget:\n", encoding="utf-8")
+    state_paths = _state_paths(tmp_path)
+    project_paths = state_paths.for_project(tmp_path)
+    project_paths.root.mkdir(parents=True)
+    manual = LexiconEntry(
+        canonical="Widget", scope=Scope.PROJECT, aliases=("Widget",),
+        domains=(), weight=0.99, status=EntryStatus.CANDIDATE,
+        project_id=project_paths.project_id, source="widget.py",
+        use_count=77, notes="camel-case",
+    )
+    write_jsonl_atomic(project_paths.lexicon_file, (manual,))
+
+    scan_project(tmp_path, state_paths)
+
+    assert load_jsonl(project_paths.lexicon_file) == (manual,)

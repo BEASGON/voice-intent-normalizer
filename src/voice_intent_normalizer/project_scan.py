@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .lexicon import _entry_data, load_jsonl_bytes
@@ -112,11 +113,14 @@ _QUOTED_CHINESE = re.compile(r"[“\"「『]([\u4e00-\u9fff]{2,20})[”\"」』]
 _NAMED_CHINESE = re.compile(
     r"(?:产品名是|产品名称是|名称是|名为|叫做)[：:\s]*([\u4e00-\u9fff]{2,20})(?=[，。；;、\s]|$)"
 )
-_SCAN_STATE_VERSION = 2
+_SCAN_STATE_VERSION = 3
 _MAX_SCAN_STATE_BYTES = 64 * 1024
 _MAX_SCAN_CACHE_BYTES = 10 * 1024 * 1024
 _MAX_DIRECTORY_ENTRIES = 4_096
+_MAX_SCAN_ENTRIES = 50_000
 _SCAN_ATTEMPTS = 2
+_PUBLICATION_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_PUBLICATION_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,26 +249,39 @@ def scan_project(
         after = _project_fingerprint(project_root, max_files=max_files)
         if before != after:
             continue
-        cache = _serialize_entries(result.entries)
+        cache, cached_entries, output_truncated = _serialize_entries(result.entries)
+        result = replace(
+            result,
+            entries=cached_entries,
+            truncated=result.truncated or output_truncated,
+        )
         relative_dir = Path("projects") / project_paths.project_id
-        with guard_state_root(
-            state_paths.root,
-            create=True,
-            retained_dirs=(relative_dir,),
-            create_retained=True,
-        ) as lease:
-            cache_relative = relative_dir / "project-scan.jsonl"
-            state_relative = relative_dir / "scan-state.json"
-            if not lease.exists(cache_relative):
-                _remove_pre_release_scan_entries(
-                    lease, relative_dir, project_paths.project_id
+        with _project_publication_lock(state_paths, project_paths.project_id):
+            with guard_state_root(
+                state_paths.root,
+                create=True,
+                retained_dirs=(relative_dir,),
+                create_retained=True,
+            ) as lease:
+                cache_relative = relative_dir / "project-scan.jsonl"
+                state_relative = relative_dir / "scan-state.json"
+                if not lease.exists(cache_relative):
+                    _remove_pre_release_scan_entries(
+                        lease, relative_dir, project_paths.project_id
+                    )
+                lease.write_bytes_atomic(cache_relative, cache)
+                generation = _next_generation(lease, state_relative)
+                lease.write_bytes_atomic(
+                    state_relative,
+                    _scan_state_bytes(
+                        after,
+                        cache,
+                        max_files,
+                        max_text_bytes,
+                        generation,
+                        result.truncated,
+                    ),
                 )
-            lease.write_bytes_atomic(cache_relative, cache)
-            generation = _next_generation(lease, state_relative)
-            lease.write_bytes_atomic(
-                state_relative,
-                _scan_state_bytes(after, cache, max_files, max_text_bytes, generation),
-            )
         return result
     raise RuntimeError("project changed during bounded scan")
 
@@ -303,6 +320,7 @@ def project_cache_is_stale(
             "max_files",
             "max_text_bytes",
             "schema_version",
+            "truncated",
         }:
             return True
         if (
@@ -311,6 +329,7 @@ def project_cache_is_stale(
             or raw["max_text_bytes"] != max_text_bytes
             or not isinstance(raw["fingerprint"], str)
             or not isinstance(raw["cache_sha256"], str)
+            or not isinstance(raw["truncated"], bool)
             or isinstance(raw["generation"], bool)
             or not isinstance(raw["generation"], int)
         ):
@@ -320,6 +339,66 @@ def project_cache_is_stale(
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return True
     return raw["fingerprint"] != _project_fingerprint(project_root, max_files=max_files)
+
+
+def load_project_scan_entries(
+    lease: StateRootLease,
+    project_root: Path,
+    project_id: str,
+) -> tuple[tuple[LexiconEntry, ...], str | None]:
+    """Resolve one hash-coherent scanner cache through the caller's lease."""
+    relative_dir = Path("projects") / project_id
+    cache_relative = relative_dir / "project-scan.jsonl"
+    state_relative = relative_dir / "scan-state.json"
+    try:
+        if not lease.available(relative_dir) or not lease.exists(cache_relative):
+            return (), None
+        cache = lease.read_bytes(cache_relative, _MAX_SCAN_CACHE_BYTES, "scan cache")
+        raw = json.loads(
+            lease.read_bytes(state_relative, _MAX_SCAN_STATE_BYTES, "scan state")
+        )
+        if not _valid_scan_state(raw):
+            return (), "project_scan_invalid"
+        if hashlib.sha256(cache).hexdigest() != raw["cache_sha256"]:
+            return (), "project_scan_invalid"
+        entries = load_jsonl_bytes(
+            cache, cache_relative, expected_scope=Scope.PROJECT
+        )
+        if any(entry.project_id != project_id for entry in entries):
+            return (), "project_scan_invalid"
+        stale = raw["fingerprint"] != _project_fingerprint(
+            project_root, max_files=raw["max_files"]
+        )
+        return entries, "project_scan_stale" if stale else None
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return (), "project_scan_invalid"
+
+
+def _valid_scan_state(raw: object) -> bool:
+    """Validate the complete cache transaction contract before using bytes."""
+    return (
+        isinstance(raw, dict)
+        and set(raw)
+        == {
+            "fingerprint",
+            "cache_sha256",
+            "generation",
+            "max_files",
+            "max_text_bytes",
+            "schema_version",
+            "truncated",
+        }
+        and raw["schema_version"] == _SCAN_STATE_VERSION
+        and isinstance(raw["fingerprint"], str)
+        and isinstance(raw["cache_sha256"], str)
+        and isinstance(raw["generation"], int)
+        and not isinstance(raw["generation"], bool)
+        and isinstance(raw["max_files"], int)
+        and raw["max_files"] >= 0
+        and isinstance(raw["max_text_bytes"], int)
+        and raw["max_text_bytes"] >= 0
+        and isinstance(raw["truncated"], bool)
+    )
 
 
 def _project_fingerprint(root: Path, *, max_files: int) -> str:
@@ -338,6 +417,7 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
         if overflow:
             truncated = True
             break
+        directories: list[Path] = []
         for path in children:
             entries_seen += 1
             if entries_seen > max_entries:
@@ -350,7 +430,17 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
                     path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
                     and not _is_private_name(path.name)
                 ):
-                    pending.append(path)
+                    # Directory names are scanner input too: they can produce
+                    # project candidates even when they contain no files.
+                    info = path.stat()
+                    records.append(
+                        (
+                            _relative_source(root, path) + "/",
+                            info.st_size,
+                            info.st_mtime_ns,
+                        )
+                    )
+                    directories.append(path)
                 continue
             if not path.is_file() or not _is_allowed_text_file(path):
                 continue
@@ -365,6 +455,7 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
             records.append(
                 (_relative_source(root, path), info.st_size, info.st_mtime_ns)
             )
+        pending.extend(reversed(directories))
     payload = json.dumps(
         {"records": records, "truncated": truncated},
         ensure_ascii=True,
@@ -455,21 +546,39 @@ def _tree_entry_budget(max_files: int) -> int:
     return max(_MAX_DIRECTORY_ENTRIES, max_files * 4 + 1)
 
 
-def _serialize_entries(entries: Iterable[LexiconEntry]) -> bytes:
-    serialized = "\n".join(
-        json.dumps(
-            _entry_data(entry),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+def _serialize_entries(
+    entries: Iterable[LexiconEntry],
+) -> tuple[bytes, tuple[LexiconEntry, ...], bool]:
+    """Encode a deterministic, bounded cache without allocating unbounded JSON."""
+    serialized = bytearray()
+    kept: list[LexiconEntry] = []
+    for entry in entries:
+        line = (
+            json.dumps(
+                _entry_data(entry),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
         )
-        for entry in entries
-    )
-    return (serialized + "\n" if serialized else "").encode("utf-8")
+        if (
+            len(kept) >= _MAX_SCAN_ENTRIES
+            or len(serialized) + len(line) > _MAX_SCAN_CACHE_BYTES
+        ):
+            return bytes(serialized), tuple(kept), True
+        serialized.extend(line)
+        kept.append(entry)
+    return bytes(serialized), tuple(kept), False
 
 
 def _scan_state_bytes(
-    fingerprint: str, cache: bytes, max_files: int, max_text_bytes: int, generation: int
+    fingerprint: str,
+    cache: bytes,
+    max_files: int,
+    max_text_bytes: int,
+    generation: int,
+    truncated: bool,
 ) -> bytes:
     return json.dumps(
         {
@@ -479,6 +588,7 @@ def _scan_state_bytes(
             "max_files": max_files,
             "max_text_bytes": max_text_bytes,
             "schema_version": _SCAN_STATE_VERSION,
+            "truncated": truncated,
         },
         ensure_ascii=True,
         sort_keys=True,
@@ -501,6 +611,14 @@ def _next_generation(lease: StateRootLease, relative: Path) -> int:
         return 1
 
 
+def _project_publication_lock(state_paths: StatePaths, project_id: str):
+    """Serialize same-process scanner publications by direct state-root identity."""
+    key = (str(state_paths.root), project_id)
+    with _PUBLICATION_LOCKS_GUARD:
+        lock = _PUBLICATION_LOCKS.setdefault(key, threading.Lock())
+    return lock
+
+
 def _remove_pre_release_scan_entries(
     lease: StateRootLease, relative_dir: Path, project_id: str
 ) -> None:
@@ -519,14 +637,25 @@ def _remove_pre_release_scan_entries(
         entry for entry in entries if not _is_pre_release_scan_entry(entry, project_id)
     )
     if len(kept) != len(entries):
-        lease.write_bytes_atomic(relative, _serialize_entries(kept))
+        serialized, _cached, truncated = _serialize_entries(kept)
+        if not truncated:
+            lease.write_bytes_atomic(relative, serialized)
 
 
 def _is_pre_release_scan_entry(entry: LexiconEntry, project_id: str) -> bool:
+    if entry.use_count is None or entry.use_count < 1:
+        return False
     return (
         entry.project_id == project_id
         and entry.scope is Scope.PROJECT
         and entry.status in {EntryStatus.CANDIDATE, EntryStatus.REPEATED}
+        and entry.status
+        is (
+            EntryStatus.REPEATED
+            if entry.use_count > 1
+            else EntryStatus.CANDIDATE
+        )
+        and entry.weight == _entry_weight(entry.use_count)
         and entry.source is not None
         and entry.notes
         in {

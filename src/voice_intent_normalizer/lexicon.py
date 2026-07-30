@@ -193,7 +193,8 @@ class LexiconSet:
             state_paths.root, retained_dirs=retained_dirs
         ) as lease:
             hotword_data = resolve_hotword_file(lease)
-            if _invalid_hotword_pointer(lease):
+            pointer_invalid = _invalid_hotword_pointer(lease)
+            if pointer_invalid:
                 diagnostics.append("hotword_state_invalid")
             if hotword_data is None:
                 if _invalid_hotword_snapshot(lease):
@@ -206,6 +207,8 @@ class LexiconSet:
                         hotword_data = lease.read_bytes(
                             raw_hotword, _MAX_STATE_LEXICON_BYTES, "hotword"
                         )
+                elif not pointer_invalid:
+                    diagnostics.append("hotword_transaction_invalid")
             if lease.root_exists:
                 layers.extend(
                     _safe_load_lease_layer(
@@ -235,18 +238,15 @@ class LexiconSet:
                     for entry in project_entries
                     if entry.project_id == project_paths.project_id
                 )
-                scan_relative = (
-                    Path("projects")
-                    / project_paths.project_id
-                    / "project-scan.jsonl"
+                # Import lazily: the scanner owns its transaction schema while
+                # this layer owns the long-lived state lease.
+                from .project_scan import load_project_scan_entries
+
+                scanner_entries, scan_diagnostic = load_project_scan_entries(
+                    lease, project_paths.project_root, project_paths.project_id
                 )
-                scanner_entries = _safe_load_lease_layer(
-                    lease,
-                    scan_relative,
-                    Scope.PROJECT,
-                    "project_scan_invalid",
-                    diagnostics,
-                )
+                if scan_diagnostic is not None:
+                    diagnostics.append(scan_diagnostic)
                 layers.extend(
                     entry
                     for entry in scanner_entries
