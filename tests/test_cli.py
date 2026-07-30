@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from io import StringIO
@@ -151,7 +153,9 @@ def test_bootstrap_prefers_its_own_src_over_an_earlier_pythonpath_package(tmp_pa
         "def main():\n    return 99\n", encoding="utf-8"
     )
     environment = {
-        "PYTHONPATH": str(tmp_path / "evil") + ";" + str(repository / "src"),
+        "PYTHONPATH": os.pathsep.join(
+            (str(tmp_path / "evil"), str(repository / "src"))
+        ),
         "PATH": str(Path(sys.executable).parent),
     }
 
@@ -186,7 +190,7 @@ def test_bootstrap_discards_a_preloaded_shadow_package_from_sitecustomize(tmp_pa
         encoding="utf-8",
     )
     environment = {
-        "PYTHONPATH": str(evil) + ";" + str(repository / "src"),
+        "PYTHONPATH": os.pathsep.join((str(evil), str(repository / "src"))),
         "PATH": str(Path(sys.executable).parent),
     }
 
@@ -238,6 +242,9 @@ def test_bootstrap_posix_containment_is_lexical_and_case_sensitive(
         (r"C:\Repo\src\voice_intent_normalizer\cli.py", r"C:\Repo\src", True),
         (r"C:/REPO/src/voice_intent_normalizer/cli.py", r"C:\Repo\src", True),
         (r"\\?\C:\repo\src\voice_intent_normalizer\cli.py", r"C:\Repo\src", True),
+        (r"\\?\UNC\server\share\src\cli.py", r"\\server\share\src", True),
+        (r"\\?\UNC\server\other\src\cli.py", r"\\server\share\src", False),
+        (r"\\?\UNC\server\share\src\..\secret.py", r"\\server\share\src", False),
         (r"C:\Repo\src-sibling\cli.py", r"C:\Repo\src", False),
         (r"D:\Repo\src\cli.py", r"C:\Repo\src", False),
         (r"\\server\share\src\cli.py", r"C:\Repo\src", False),
@@ -249,6 +256,68 @@ def test_bootstrap_windows_containment_normalizes_equivalent_paths(
     assert (
         bootstrap_module._is_below(candidate, root, flavor="windows") is expected
     )
+
+
+def _bootstrap_test_repository(tmp_path):
+    repository = tmp_path / "repository"
+    script_source = Path(__file__).resolve().parents[1] / "scripts" / "voice_intent.py"
+    script_target = repository / "scripts" / "voice_intent.py"
+    script_target.parent.mkdir(parents=True)
+    shutil.copyfile(script_source, script_target)
+    return repository, script_target
+
+
+@pytest.mark.parametrize("linked_target", ["package", "cli-file"])
+def test_bootstrap_rejects_physical_cli_origins_outside_trusted_src(
+    tmp_path, linked_target
+):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    source = repository / "src"
+    external = tmp_path / "external"
+    package = external / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "external-main-ran"
+    (package / "cli.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def main():\n"
+        "    Path(os.environ['VOICE_INTENT_EXTERNAL_MARKER']).write_text('ran')\n"
+        "    return 99\n",
+        encoding="utf-8",
+    )
+    source.mkdir(parents=True)
+    if linked_target == "package":
+        try:
+            (source / "voice_intent_normalizer").symlink_to(
+                package, target_is_directory=True
+            )
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+    else:
+        trusted_package = source / "voice_intent_normalizer"
+        trusted_package.mkdir()
+        (trusted_package / "__init__.py").write_text("", encoding="utf-8")
+        try:
+            (trusted_package / "cli.py").symlink_to(package / "cli.py")
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor", "--json"],
+        cwd=tmp_path,
+        env={
+            "PATH": str(Path(sys.executable).parent),
+            "VOICE_INTENT_EXTERNAL_MARKER": str(marker),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
 
 
 def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):

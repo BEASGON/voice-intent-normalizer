@@ -11,12 +11,13 @@ from typing import Literal
 
 def main() -> int:
     repository = Path(__file__).resolve().parents[1]
-    source = repository / "src"
+    source = _trusted_source(repository / "src")
     _prioritize_source(source)
+    _verify_import_targets(source)
     _clear_preloaded_package()
     from voice_intent_normalizer import cli
 
-    if not _is_below(cli.__file__, source):
+    if not _native_is_below(cli.__file__, source):
         raise RuntimeError("trusted repository CLI could not be imported")
 
     return cli.main()
@@ -28,6 +29,22 @@ def _prioritize_source(source: Path) -> None:
         entry for entry in sys.path if _canonical_path(entry) != trusted
     ]
     sys.path.insert(0, str(source.resolve()))
+
+
+def _trusted_source(source: Path) -> Path:
+    resolved = source.resolve(strict=True)
+    if not resolved.is_dir():
+        raise RuntimeError("trusted repository source is unavailable")
+    return resolved
+
+
+def _verify_import_targets(source: Path) -> None:
+    for target in (
+        source / "voice_intent_normalizer",
+        source / "voice_intent_normalizer" / "cli.py",
+    ):
+        if not _native_is_below(target, source):
+            raise RuntimeError("trusted repository CLI could not be imported")
 
 
 def _canonical_path(value: str | Path) -> str:
@@ -65,9 +82,29 @@ def _is_below(
     return candidate.is_absolute() and trusted.is_absolute()
 
 
+def _native_is_below(value: str | None, root: Path) -> bool:
+    if value is None:
+        return False
+    try:
+        candidate = Path(value).resolve(strict=True)
+        trusted = root.resolve(strict=True)
+        candidate.relative_to(trusted)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 def _windows_path(value: str | Path) -> PureWindowsPath:
     raw = str(value).replace("/", "\\")
-    if raw.casefold().startswith("\\\\?\\"):
+    folded = raw.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        raw = "\\\\" + raw[8:]
+    elif (
+        folded.startswith("\\\\?\\")
+        and len(raw) >= 6
+        and raw[4].isalpha()
+        and raw[5] == ":"
+    ):
         raw = raw[4:]
     normalized = ntpath.normpath(raw).casefold()
     return PureWindowsPath(normalized)
