@@ -83,10 +83,7 @@ def _preflight_package(source: Path) -> Path:
                 continue
             if not stat.S_ISREG(info.st_mode):
                 raise RuntimeError("trusted repository package contains an alias")
-            if path.suffix in {".pyc", ".pyo"} or any(
-                path.name.endswith(suffix)
-                for suffix in importlib.machinery.EXTENSION_SUFFIXES
-            ):
+            if _is_loader_artifact(path.name):
                 raise RuntimeError("trusted repository package contains an alias")
             if path.suffix != ".py":
                 continue
@@ -131,6 +128,18 @@ def _require_direct_regular_file(path: Path, info: os.stat_result) -> None:
 
 def _is_reparse_point(info: os.stat_result) -> bool:
     return bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+
+def _is_loader_artifact(
+    name: str,
+    *,
+    flavor: Literal["posix", "windows"] | None = None,
+) -> bool:
+    selected = flavor or ("windows" if sys.platform == "win32" else "posix")
+    normalizer = ntpath.normcase if selected == "windows" else posixpath.normcase
+    candidate = normalizer(name)
+    suffixes = (".pyc", ".pyo", *importlib.machinery.EXTENSION_SUFFIXES)
+    return any(candidate.endswith(normalizer(suffix)) for suffix in suffixes)
 
 
 def _canonical_path(value: str | Path) -> str:

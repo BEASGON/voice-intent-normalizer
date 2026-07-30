@@ -594,6 +594,94 @@ def test_bootstrap_rejects_helper_extension_before_cli_import(tmp_path):
     assert "DLL load failed" not in result.stderr
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        ".PYD",
+        "".join(
+            character.upper() if index % 2 else character.lower()
+            for index, character in enumerate(
+                max(importlib.machinery.EXTENSION_SUFFIXES, key=len)
+            )
+        ),
+    ],
+)
+def test_bootstrap_rejects_windows_case_variant_cli_extensions(tmp_path, suffix):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def main():\n"
+        "    Path(os.environ['VOICE_INTENT_SOURCE_MARKER']).write_text('trusted')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    (package / f"cli{suffix}").write_bytes(b"not a native module")
+    marker = tmp_path / "source-ran"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={
+            "PATH": str(Path(sys.executable).parent),
+            "VOICE_INTENT_SOURCE_MARKER": str(marker),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert "DLL load failed" not in result.stderr
+
+
+@pytest.mark.parametrize("artifact", ["helper.PYC", "helper.PYO"])
+def test_bootstrap_rejects_windows_case_variant_helper_bytecode(tmp_path, artifact):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    (package / artifact).write_bytes(b"sourceless bytecode")
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={"PATH": str(Path(sys.executable).parent)},
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("suffix", importlib.machinery.EXTENSION_SUFFIXES)
+def test_loader_artifact_matching_preserves_platform_case_rules(
+    bootstrap_module, suffix
+):
+    case_variant = suffix.swapcase()
+
+    assert bootstrap_module._is_loader_artifact(
+        f"module{case_variant}", flavor="windows"
+    )
+    assert not bootstrap_module._is_loader_artifact(
+        f"module{case_variant}", flavor="posix"
+    )
+    assert bootstrap_module._is_loader_artifact("helper.PYC", flavor="windows")
+    assert not bootstrap_module._is_loader_artifact("helper.PYC", flavor="posix")
+    assert bootstrap_module._is_loader_artifact("helper.PYO", flavor="windows")
+    assert not bootstrap_module._is_loader_artifact("helper.PYO", flavor="posix")
+
+
 @pytest.mark.parametrize("artifact", ["cli.pyc", "helper.pyo"])
 def test_bootstrap_rejects_top_level_sourceless_bytecode(tmp_path, artifact):
     repository, script = _bootstrap_test_repository(tmp_path)
