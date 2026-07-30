@@ -1,10 +1,11 @@
 """Safe, recoverable retrieval of the public hotword lexicon.
 
 The transport receives only already allowlisted public URLs.  The updater never
-sends local lexicons, project data, or user input over the network. POSIX
-coordination lives in an owner-only control root outside updateable state.
-Replacing that verified root requires the same user's authority and is outside
-the lock's threat model; ordinary state-directory replacement remains safe.
+sends local lexicons, project data, or user input over the network. V1 accepts
+only a direct canonical local state root; path aliases fail before network or
+state access. POSIX coordination lives in an owner-only control root outside
+updateable state, while Windows retains a replacement-stable canonical-path
+mutex.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
 from .models import Scope
-from .paths import StatePaths
+from .paths import StatePaths, StateRootValidationError, validate_state_root
 
 
 class Response(Protocol):
@@ -133,6 +134,7 @@ def update_hotwords(
     """
     candidate_version: str | None = None
     try:
+        validate_state_root(paths.root)
         checked_at = _utc_now(now)
         if not _allowed_url(manifest_url):
             return UpdateResult(
@@ -175,7 +177,12 @@ def update_hotwords(
             _commit_locked(paths, manifest, data, checked_at)
             return UpdateResult(UpdateStatus.UPDATED, version=manifest.version)
     except Exception as exc:
-        if candidate_version is not None and not isinstance(exc, UpdateLockTimeout):
+        invalid_root = isinstance(exc, StateRootValidationError)
+        if (
+            candidate_version is not None
+            and not invalid_root
+            and not isinstance(exc, UpdateLockTimeout)
+        ):
             try:
                 with _update_lock(paths):
                     current = _recover_locked(paths, checked_at)
@@ -185,7 +192,7 @@ def update_hotwords(
                         )
             except Exception:
                 pass
-        if not isinstance(exc, UpdateLockTimeout):
+        if not invalid_root and not isinstance(exc, UpdateLockTimeout):
             _record_failed_attempt(paths, now)
         return UpdateResult(UpdateStatus.REJECTED, message=_safe_message(exc))
 
@@ -638,6 +645,7 @@ def _cleanup_payloads(paths: StatePaths, current: _CurrentState) -> None:
 def resolve_hotword_file(paths: StatePaths) -> Path | None:
     """Return a recovered authoritative cache for LexiconSet, or fail safely."""
     try:
+        validate_state_root(paths.root)
         operation_now = datetime.now(timezone.utc)
         with _update_lock(paths):
             current = _recover_locked(paths, operation_now)
@@ -755,13 +763,16 @@ def _ensure_storage(paths: StatePaths) -> None:
 @contextmanager
 def _update_lock(paths: StatePaths, *, timeout: float | None = None) -> Iterator[None]:
     """Use a stable OS lease, never a replaceable filesystem lock entry."""
+    validate_state_root(paths.root)
     if os.name == "nt":
         with _windows_mutex(paths, timeout):
             yield
         return
 
     with _posix_control_lock(paths, timeout):
+        validate_state_root(paths.root)
         _ensure_storage(paths)
+        validate_state_root(paths.root)
         yield
 
 
@@ -924,22 +935,101 @@ def _windows_mutex(paths: StatePaths, timeout: float | None) -> Iterator[None]:
     deadline = time.monotonic() + lease_timeout
     path_name = _windows_path_mutex_name(paths)
     with _acquire_windows_mutex_names(kernel32, (path_name,), timeout=lease_timeout):
+        validate_state_root(paths.root)
         for attempt_number in range(_WINDOWS_IDENTITY_RETRIES):
             remaining = max(0.0, deadline - time.monotonic())
             _ensure_storage(paths)
-            identity = _windows_directory_identity(paths.root)
-            identity_name = _windows_identity_mutex_name(identity)
-            with _acquire_windows_mutex_names(
-                kernel32, (identity_name,), timeout=remaining
+            validate_state_root(paths.root)
+            with (
+                _windows_directory_guard(paths.root),
+                _windows_directory_guard(_hotword_dir(paths)),
+                _windows_directory_guard(_payloads_dir(paths)),
             ):
-                if _windows_directory_identity(paths.root) == identity:
-                    yield
-                    return
+                identity = _windows_directory_identity(paths.root)
+                identity_name = _windows_identity_mutex_name(identity)
+                with _acquire_windows_mutex_names(
+                    kernel32, (identity_name,), timeout=remaining
+                ):
+                    validate_state_root(paths.root)
+                    if _windows_directory_identity(paths.root) == identity:
+                        yield
+                        return
             if (
                 attempt_number + 1 >= _WINDOWS_IDENTITY_RETRIES
                 or time.monotonic() >= deadline
             ):
                 raise OSError("Windows state path changed during lock acquisition")
+
+
+@contextmanager
+def _windows_directory_guard(path: Path) -> Iterator[None]:
+    """Prevent replacement of one validated state directory during an operation."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x10080,  # DELETE | FILE_READ_ATTRIBUTES
+        0x3,  # FILE_SHARE_READ | FILE_SHARE_WRITE; intentionally deny DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    active_exception = False
+    try:
+        attributes = _FileAttributeTagInfo()
+        ctypes.set_last_error(0)
+        if not kernel32.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not attributes.file_attributes & 0x10 or (
+            attributes.file_attributes & 0x400
+        ):
+            raise StateRootValidationError(
+                "state root rejected: direct canonical local path required"
+            )
+        validate_state_root(path)
+        yield
+    except BaseException:
+        active_exception = True
+        raise
+    finally:
+        ctypes.set_last_error(0)
+        if not kernel32.CloseHandle(handle) and not active_exception:
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 @contextmanager
@@ -1301,4 +1391,6 @@ def _reject_constant(value: str) -> None:
 
 def _safe_message(exc: Exception) -> str:
     """Avoid returning arbitrary remote/body content in a diagnostic receipt."""
+    if isinstance(exc, StateRootValidationError):
+        return str(exc)
     return f"update rejected: {exc.__class__.__name__}"

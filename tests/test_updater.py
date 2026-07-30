@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -176,6 +177,149 @@ def test_valid_update_replaces_hotwords_and_records_check(tmp_path):
         "schema_version": 1,
         "version": "2026.07.29",
     }
+
+
+def test_symlink_state_root_is_rejected_before_network_or_mutation(tmp_path):
+    direct_root = tmp_path / "direct-state"
+    direct_root.mkdir()
+    alias_root = tmp_path / "state-alias"
+    try:
+        alias_root.symlink_to(direct_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(
+        StatePaths(root=alias_root), MANIFEST_URL, transport, NOW, force=True
+    )
+
+    assert result.status is UpdateStatus.REJECTED
+    assert result.message == (
+        "state root rejected: direct canonical local path required"
+    )
+    assert transport.calls == []
+    assert list(direct_root.iterdir()) == []
+
+
+def test_symlinked_state_root_ancestor_is_rejected_before_network(tmp_path):
+    direct_parent = tmp_path / "direct-parent"
+    direct_parent.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    try:
+        alias_parent.symlink_to(direct_parent, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(
+        StatePaths(root=alias_parent / "state"),
+        MANIFEST_URL,
+        transport,
+        NOW,
+        force=True,
+    )
+
+    assert result.status is UpdateStatus.REJECTED
+    assert result.message == (
+        "state root rejected: direct canonical local path required"
+    )
+    assert transport.calls == []
+    assert list(direct_parent.iterdir()) == []
+
+
+def test_noncanonical_state_root_spelling_is_rejected_without_creating_it(tmp_path):
+    direct_root = tmp_path / "direct-state"
+    noncanonical_root = tmp_path / "unused" / ".." / direct_root.name
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(
+        StatePaths(root=noncanonical_root),
+        MANIFEST_URL,
+        transport,
+        NOW,
+        force=True,
+    )
+
+    assert result.status is UpdateStatus.REJECTED
+    assert result.message == (
+        "state root rejected: direct canonical local path required"
+    )
+    assert transport.calls == []
+    assert not direct_root.exists()
+
+
+def test_state_root_replacement_with_alias_after_storage_is_revalidated(
+    tmp_path, monkeypatch
+):
+    paths = paths_for(tmp_path)
+    moved_root = tmp_path / "original-state"
+    alias_target = tmp_path / "alias-target"
+    alias_target.mkdir()
+    real_ensure_storage = updater_module._ensure_storage
+    replaced = False
+
+    def replace_after_storage(locked_paths):
+        nonlocal replaced
+        real_ensure_storage(locked_paths)
+        if not replaced:
+            replaced = True
+            locked_paths.root.rename(moved_root)
+            try:
+                locked_paths.root.symlink_to(alias_target, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    monkeypatch.setattr(updater_module, "_ensure_storage", replace_after_storage)
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(paths, MANIFEST_URL, transport, NOW, force=True)
+
+    assert result.status is UpdateStatus.REJECTED
+    assert result.message == (
+        "state root rejected: direct canonical local path required"
+    )
+    assert transport.calls == []
+    assert list(alias_target.iterdir()) == []
+
+
+def test_lexicon_load_rejects_state_root_alias_before_reading_personal_layer(tmp_path):
+    direct_root = tmp_path / "direct-state"
+    personal_path = direct_root / "personal.jsonl"
+    personal_path.parent.mkdir()
+    personal_path.write_text(
+        '{"canonical":"Alias data","scope":"personal","aliases":["alias"],'
+        '"domains":[],"weight":1.0,"status":"confirmed"}\n',
+        encoding="utf-8",
+    )
+    alias_root = tmp_path / "state-alias"
+    try:
+        alias_root.symlink_to(direct_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="direct canonical local path required"):
+        LexiconSet.load(StatePaths(root=alias_root), tmp_path / "builtins")
+
+
+def test_hotword_resolver_rejects_alias_without_changing_direct_authority(tmp_path):
+    direct_paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Direct authority")
+    assert update_hotwords(
+        direct_paths, MANIFEST_URL, transport_for(data), NOW
+    ).status is UpdateStatus.UPDATED
+    alias_root = tmp_path / "state-alias"
+    try:
+        alias_root.symlink_to(direct_paths.root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    current_path = direct_paths.hotwords_file.parent / "current.json"
+    current_before = current_path.read_bytes()
+
+    resolved = updater_module.resolve_hotword_file(StatePaths(root=alias_root))
+
+    assert resolved is None
+    assert current_path.read_bytes() == current_before
+    assert direct_paths.hotwords_file.read_bytes() == data
 
 
 def test_transport_reads_only_a_bounded_amount_and_closes_each_response(tmp_path):
@@ -826,6 +970,41 @@ def test_windows_extended_path_alias_contends_on_the_same_global_mutex(tmp_path)
     assert holder.exitcode == 0
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_windows_junction_state_root_is_rejected_before_network(tmp_path):
+    direct_root = tmp_path / "direct-state"
+    direct_root.mkdir()
+    junction_root = tmp_path / "state-junction"
+    created = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(junction_root),
+            str(direct_root),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {created.stderr.strip()}")
+    transport = transport_for(hotword_data())
+
+    result = update_hotwords(
+        StatePaths(root=junction_root), MANIFEST_URL, transport, NOW, force=True
+    )
+
+    assert result.status is UpdateStatus.REJECTED
+    assert result.message == (
+        "state root rejected: direct canonical local path required"
+    )
+    assert transport.calls == []
+    assert list(direct_root.iterdir()) == []
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows kernel mutex behavior")
 def test_windows_state_root_replacement_still_contends_on_path_mutex(tmp_path):
     context = multiprocessing.get_context("spawn")
@@ -838,8 +1017,8 @@ def test_windows_state_root_replacement_still_contends_on_path_mutex(tmp_path):
     holder.start()
     assert ready.wait(10)
     moved = tmp_path / "held-state-root"
-    paths.root.rename(moved)
-    paths.root.mkdir()
+    with pytest.raises(OSError):
+        paths.root.rename(moved)
     transport = transport_for(hotword_data())
 
     try:
@@ -854,6 +1033,25 @@ def test_windows_state_root_replacement_still_contends_on_path_mutex(tmp_path):
         release.set()
         holder.join(10)
     assert holder.exitcode == 0
+    paths.root.rename(moved)
+    paths.root.mkdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory sharing behavior")
+def test_windows_update_lock_guards_state_root_against_rename(tmp_path):
+    paths = paths_for(tmp_path)
+
+    with updater_module._update_lock(paths):
+        with pytest.raises(OSError):
+            paths.root.rename(tmp_path / "renamed-while-guarded")
+        with pytest.raises(OSError):
+            paths.hotwords_file.parent.rename(tmp_path / "renamed-hotwords")
+        with pytest.raises(OSError):
+            (paths.hotwords_file.parent / "payloads").rename(
+                tmp_path / "renamed-payloads"
+            )
+
+    paths.root.rename(tmp_path / "renamed-after-release")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows identity replacement handling")
@@ -862,27 +1060,25 @@ def test_windows_retries_when_state_identity_changes_before_mutex_creation(
 ):
     paths = paths_for(tmp_path)
     paths.root.mkdir(parents=True)
-    moved = tmp_path / "identity-before-mutex"
     real_identity = updater_module._windows_directory_identity
     lookups = 0
 
-    def replace_after_first_lookup(path):
+    def change_after_first_lookup(path):
         nonlocal lookups
         identity = real_identity(path)
         lookups += 1
         if lookups == 1:
-            paths.root.rename(moved)
-            paths.root.mkdir()
+            return f"{identity}-stale"
         return identity
 
     monkeypatch.setattr(
-        updater_module, "_windows_directory_identity", replace_after_first_lookup
+        updater_module, "_windows_directory_identity", change_after_first_lookup
     )
 
     with updater_module._update_lock(paths):
         assert paths.root.is_dir()
 
-    assert lookups >= 2
+    assert lookups >= 4
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows alias lock ordering")
@@ -1174,8 +1370,7 @@ def test_posix_same_user_contends_across_different_xdg_environments(
     assert holder.exitcode == 0
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink and flock behavior")
-def test_posix_symlink_state_alias_contends_on_the_same_control_lock(tmp_path):
+def test_symlink_state_alias_rejects_after_direct_root_replacement(tmp_path):
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
     release = context.Event()
@@ -1188,13 +1383,23 @@ def test_posix_symlink_state_alias_contends_on_the_same_control_lock(tmp_path):
     )
     holder.start()
     assert ready.wait(10)
+    moved_root = tmp_path / "held-direct-state"
+    if os.name == "nt":
+        with pytest.raises(OSError):
+            paths.root.rename(moved_root)
+    else:
+        paths.root.rename(moved_root)
+        paths.root.mkdir()
     transport = transport_for(hotword_data())
 
-    blocked = update_hotwords(
+    rejected = update_hotwords(
         StatePaths(root=alias_root), MANIFEST_URL, transport, NOW, force=True
     )
 
-    assert blocked.status is UpdateStatus.REJECTED
+    assert rejected.status is UpdateStatus.REJECTED
+    assert rejected.message == (
+        "state root rejected: direct canonical local path required"
+    )
     assert transport.calls == []
     assert holder.is_alive()
     release.set()

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import EntryStatus, LexiconEntry, Scope
-from .paths import StatePaths
+from .paths import StatePaths, validate_state_root
 from .updater import resolve_hotword_file
 
 _REQUIRED_FIELDS = frozenset(
@@ -89,6 +89,7 @@ class LexiconSet:
         domains: Sequence[str] = (),
     ) -> LexiconSet:
         """Load layers in personal, project, industry, hot, then base precedence."""
+        validate_state_root(state_paths.root)
         builtin_paths = Path(builtins_root)
         layers: list[LexiconEntry] = []
 
