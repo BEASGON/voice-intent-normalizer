@@ -827,6 +827,65 @@ def _validate_posix_root_spelling(raw: str) -> str:
     return normalized
 
 
+def normalize_project_root(project_root: str | Path) -> Path:
+    """Return one absolute project spelling without dereferencing any component.
+
+    Project source authority is acquired separately through no-follow handles.
+    This helper exists only to produce the direct lexical spelling used by that
+    acquisition and by the deterministic project-state identifier.
+    """
+    raw = os.path.expanduser(os.fspath(project_root))
+    if not raw or "\0" in raw:
+        raise ValueError("project root must be a direct local path")
+    if os.name == "nt":
+        return Path(_normalize_windows_project_root(raw))
+    return Path(_normalize_posix_project_root(raw))
+
+
+def _normalize_windows_project_root(raw: str) -> str:
+    import ntpath
+
+    path = raw.replace("/", "\\")
+    folded = path.casefold()
+    if (
+        folded.startswith("\\\\?\\")
+        or folded.startswith("\\\\.\\")
+        or path.startswith("\\\\")
+    ):
+        raise ValueError("project root must be a direct local path")
+    drive, tail = ntpath.splitdrive(path)
+    if drive and not tail.startswith("\\"):
+        raise ValueError("project root must not be drive-relative")
+    if any(part == ".." for part in tail.split("\\")):
+        raise ValueError("project root must not contain parent traversal")
+    if not ntpath.isabs(path):
+        path = ntpath.join(os.getcwd(), path)
+    normalized = ntpath.normpath(path)
+    drive, tail = ntpath.splitdrive(normalized)
+    if (
+        not drive
+        or not tail.startswith("\\")
+        or _windows_drive_type(f"{drive}\\") in {0, 1, 4}
+        or any(
+            component.endswith((" ", "."))
+            for component in tail.split("\\")
+            if component
+        )
+    ):
+        raise ValueError("project root must be a direct local path")
+    return normalized
+
+
+def _normalize_posix_project_root(raw: str) -> str:
+    if raw.startswith("//") or any(part == ".." for part in raw.split("/")):
+        raise ValueError("project root must be a direct local path")
+    anchored = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+    normalized = os.path.normpath(anchored)
+    if not os.path.isabs(normalized) or normalized.startswith("//"):
+        raise ValueError("project root must be a direct local path")
+    return normalized
+
+
 def _reject_alias_components(path: Path) -> Path:
     current = Path(path.anchor)
     existing = current
@@ -1025,7 +1084,7 @@ class StatePaths:
 
     def for_project(self, project_root: str | Path) -> ProjectPaths:
         """Resolve deterministic project paths without creating them."""
-        normalized_root = Path(project_root).expanduser().resolve()
+        normalized_root = normalize_project_root(project_root)
         project_id = hashlib.sha256(
             str(normalized_root).encode("utf-8")
         ).hexdigest()[:16]

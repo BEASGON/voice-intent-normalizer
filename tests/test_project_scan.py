@@ -196,6 +196,171 @@ def test_scanner_rejects_a_symlink_supplied_as_the_project_root(tmp_path):
     assert result.files_scanned == 0
 
 
+def test_scanner_rejects_parent_traversal_in_project_root_spelling(
+    tmp_path, monkeypatch
+):
+    """Catch lexical parent traversal being normalized into another project."""
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ExternalLeakTerm.py").write_text(
+        "class ExternalPrivateThing:\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = scan_project(
+        Path("project") / ".." / "outside",
+        _state_paths(tmp_path),
+    )
+
+    assert result.entries == ()
+    assert result.files_scanned == 0
+
+
+def test_scanner_safely_anchors_an_ordinary_relative_project_root(
+    tmp_path, monkeypatch
+):
+    """Catch lexical hardening accidentally breaking normal relative roots."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "RelativeProjectTerm.py").write_text(
+        "class RelativeProjectWidget:\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = scan_project(Path("project"), _state_paths(tmp_path))
+
+    canonicals = {entry.canonical for entry in result.entries}
+    assert {"RelativeProjectTerm", "RelativeProjectWidget"} <= canonicals
+    assert result.files_scanned == 1
+
+
+def test_scanner_does_not_call_resolve_before_root_authority(
+    tmp_path, monkeypatch
+):
+    """Catch the former resolve hook swapping a direct root to a junction."""
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ExternalLeakTerm.py").write_text(
+        "class ExternalPrivateThing:\n", encoding="utf-8"
+    )
+    state_paths = _state_paths(tmp_path)
+    real_resolve = Path.resolve
+    outcome = {"attempted": False}
+
+    def swap_at_old_resolve_hook(path, *args, **kwargs):
+        if path == project:
+            outcome["attempted"] = True
+            path.rmdir()
+            if os.name == "nt":
+                _create_windows_junction(path, outside)
+            else:
+                path.symlink_to(outside, target_is_directory=True)
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", swap_at_old_resolve_hook)
+
+    result = scan_project(project, state_paths)
+
+    assert outcome["attempted"] is False
+    assert result.entries == ()
+    assert result.files_scanned == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows root-junction regression")
+def test_scanner_rejects_project_root_junction_and_external_cache_changes(
+    tmp_path, monkeypatch
+):
+    """Catch a supplied root junction becoming scan and fingerprint authority."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "ExternalLeakTerm.py"
+    secret.write_text("class ExternalPrivateThing:\n", encoding="utf-8")
+    junction = tmp_path / "linked-project"
+    _create_windows_junction(junction, outside)
+    state_paths = _state_paths(tmp_path)
+    monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
+
+    before = project_scan_module._project_fingerprint(junction, max_files=5_000)
+    result = scan_project(junction, state_paths)
+    secret.write_text(
+        "class MutatedExternalPrivateThing:\n" * 3, encoding="utf-8"
+    )
+    after = project_scan_module._project_fingerprint(junction, max_files=5_000)
+
+    assert result.entries == ()
+    assert result.files_scanned == 0
+    assert before == after
+    assert project_cache_is_stale(junction, state_paths) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ancestor-junction regression")
+def test_scanner_rejects_project_root_beneath_junction_ancestor(
+    tmp_path, monkeypatch
+):
+    """Catch an ancestor junction being followed before the final root open."""
+    outside = tmp_path / "outside"
+    project = outside / "project"
+    project.mkdir(parents=True)
+    (project / "ExternalLeakTerm.py").write_text(
+        "class ExternalPrivateThing:\n", encoding="utf-8"
+    )
+    linked_parent = tmp_path / "linked-parent"
+    _create_windows_junction(linked_parent, outside)
+    monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
+
+    result = scan_project(
+        linked_parent / "project",
+        _state_paths(tmp_path),
+    )
+
+    assert result.entries == ()
+    assert result.files_scanned == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX root-symlink regression")
+def test_posix_scanner_rejects_project_root_symlink_for_cache_checks(tmp_path):
+    """Catch a POSIX root symlink influencing scan or stale-cache state."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ExternalLeakTerm.py").write_text(
+        "class ExternalPrivateThing:\n", encoding="utf-8"
+    )
+    linked_root = tmp_path / "linked-project"
+    linked_root.symlink_to(outside, target_is_directory=True)
+    state_paths = _state_paths(tmp_path)
+
+    result = scan_project(linked_root, state_paths)
+
+    assert result.entries == ()
+    assert result.files_scanned == 0
+    assert project_cache_is_stale(linked_root, state_paths) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ancestor-symlink regression")
+def test_posix_scanner_rejects_project_root_beneath_symlink_ancestor(tmp_path):
+    """Catch POSIX O_NOFOLLOW being applied only to the final root component."""
+    outside = tmp_path / "outside"
+    project = outside / "project"
+    project.mkdir(parents=True)
+    (project / "ExternalLeakTerm.py").write_text(
+        "class ExternalPrivateThing:\n", encoding="utf-8"
+    )
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+
+    result = scan_project(
+        linked_parent / "project",
+        _state_paths(tmp_path),
+    )
+
+    assert result.entries == ()
+    assert result.files_scanned == 0
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory junction regression")
 def test_scanner_ignores_junction_name_content_and_external_fingerprint(tmp_path):
     """Catch Windows junctions contributing names or traversing external state."""
