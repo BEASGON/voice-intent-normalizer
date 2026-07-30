@@ -261,7 +261,7 @@ class StateRootLease:
 
 def _relative_path_parts(value: str | Path) -> tuple[str, ...]:
     candidate = Path(value)
-    if candidate.is_absolute() or ".." in candidate.parts:
+    if candidate.anchor or ".." in candidate.parts:
         raise ValueError("state path must be relative")
     return tuple(part for part in candidate.parts if part not in ("", "."))
 
@@ -492,7 +492,7 @@ def guard_state_root(
 def _relative_directory_parts(value: str | Path) -> tuple[str, ...]:
     candidate = Path(value)
     if (
-        candidate.is_absolute()
+        candidate.anchor
         or not candidate.parts
         or any(part in ("", ".", "..") for part in candidate.parts)
     ):

@@ -38,6 +38,16 @@ With creation enabled, each component is created relative to its retained
 parent, opened without following aliases, and retained before the operation
 continues.
 
+`LexiconSet.load` acquires exactly one lease before resolving any state layer.
+Personal, project, and hotword bytes are all read through that lease. If a
+transaction needs recovery, the loader keeps the lease while taking the same
+external update lock. On POSIX the order is retained directory descriptors,
+then the control lock. On Windows it is retained share-compatible directory
+handles, path mutex, then identity mutex; updater order is path mutex,
+share-compatible directory handles, then identity mutex. Directory handles do
+not exclude one another, so an updater that already holds the path mutex can
+finish and release it before the loader proceeds.
+
 An invalid root is rejected before hotword network access, journal recovery,
 or state mutation. `update_hotwords` returns `REJECTED` with:
 

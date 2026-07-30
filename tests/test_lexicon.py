@@ -183,6 +183,31 @@ def _write_entries(path: Path, *entries: dict[str, object]) -> None:
     )
 
 
+def _write_transactional_hotword(
+    paths: StatePaths, entry: dict[str, object]
+) -> None:
+    data = (json.dumps(entry) + "\n").encode()
+    digest = hashlib.sha256(data).hexdigest()
+    payload_name = f"payload-{digest}.jsonl"
+    hotwords = paths.hotwords_file.parent
+    payloads = hotwords / "payloads"
+    payloads.mkdir(parents=True)
+    (payloads / payload_name).write_bytes(data)
+    paths.hotwords_file.write_bytes(data)
+    (hotwords / "current.json").write_text(
+        json.dumps(
+            {
+                "last_check": "2026-07-30T00:00:00+00:00",
+                "payload": payload_name,
+                "schema_version": 1,
+                "sha256": digest,
+                "version": "2026.07.30",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
 def layer_fixture(tmp_path):
     paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
@@ -254,6 +279,77 @@ def test_layered_entries_follow_precedence_and_exclude_other_projects(layer_fixt
         Scope.BASE,
     ]
     assert all(entry.canonical != "Other Project" for entry in lexicons.entries)
+
+
+def test_all_state_layers_use_one_continuous_root_identity(tmp_path, monkeypatch):
+    """Catch Q hotwords being combined with P personal data across two leases."""
+    paths = StatePaths(root=tmp_path / "state")
+    q_paths = StatePaths(root=tmp_path / "q-state")
+    p_saved = tmp_path / "p-saved"
+    q_saved = tmp_path / "q-saved"
+    _write_entries(
+        paths.personal_file,
+        _raw_entry(
+            canonical="P Personal",
+            scope="personal",
+            aliases=["p-personal"],
+            status="confirmed",
+        ),
+    )
+    _write_transactional_hotword(
+        paths,
+        _raw_entry(canonical="P Hot", scope="hot", aliases=["p-hot"]),
+    )
+    _write_entries(
+        q_paths.personal_file,
+        _raw_entry(
+            canonical="Q Personal",
+            scope="personal",
+            aliases=["q-personal"],
+            status="confirmed",
+        ),
+    )
+    _write_transactional_hotword(
+        q_paths,
+        _raw_entry(canonical="Q Hot", scope="hot", aliases=["q-hot"]),
+    )
+    real_resolve = lexicon_module.resolve_hotword_file
+    attempted = False
+
+    def swap_to_q_only_during_hotword_resolution(authority):
+        nonlocal attempted
+        attempted = True
+        swapped = False
+        try:
+            paths.root.rename(p_saved)
+            try:
+                q_paths.root.rename(paths.root)
+            except BaseException:
+                p_saved.rename(paths.root)
+                raise
+            swapped = True
+        except OSError:
+            pass
+        try:
+            return real_resolve(authority)
+        finally:
+            if swapped:
+                paths.root.rename(q_saved)
+                p_saved.rename(paths.root)
+
+    monkeypatch.setattr(
+        lexicon_module,
+        "resolve_hotword_file",
+        swap_to_q_only_during_hotword_resolution,
+    )
+
+    lexicons = LexiconSet.load(paths, tmp_path / "builtins")
+
+    assert attempted
+    assert [entry.canonical for entry in lexicons.entries] == [
+        "P Personal",
+        "P Hot",
+    ]
 
 
 def test_hotword_load_uses_the_bytes_validated_by_authority_resolution(

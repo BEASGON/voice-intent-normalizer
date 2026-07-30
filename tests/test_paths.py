@@ -224,6 +224,25 @@ def test_guarded_path_rejects_an_unretained_intermediate_directory(tmp_path):
             lease.path("unretained/file.json")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows root-relative path syntax")
+def test_windows_lease_helpers_reject_root_relative_paths(tmp_path):
+    """Catch ``\\name`` escaping a retained drive-root through Path joining."""
+    root = tmp_path / "state"
+    root.mkdir()
+
+    with guard_state_root(root) as lease:
+        with pytest.raises(ValueError, match="state path must be relative"):
+            lease.exists(r"\outside")
+        with pytest.raises(ValueError, match="state path must be relative"):
+            lease.write_bytes_atomic(r"\outside", b"blocked")
+
+    with pytest.raises(
+        ValueError, match="retained state directory must be a non-empty relative"
+    ):
+        with guard_state_root(root, retained_dirs=(r"\outside",)):
+            pass
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative I/O")
 def test_posix_lease_io_does_not_require_proc_or_dev_fd(tmp_path, monkeypatch):
     """Catch descriptor retention depending on optional descriptor filesystems."""

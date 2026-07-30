@@ -705,7 +705,7 @@ def resolve_hotword_file(
     """
     try:
         if isinstance(authority, StateRootLease):
-            return _resolve_hotword_snapshot(authority)
+            return _resolve_hotword_with_recovery(authority)
         paths = authority
         validate_state_root(paths.root)
         operation_now = datetime.now(timezone.utc)
@@ -726,6 +726,24 @@ def resolve_hotword_file(
     except Exception:
         return None
     return None
+
+
+def _resolve_hotword_with_recovery(paths: StateRootLease) -> bytes | None:
+    """Recover and resolve transaction state without releasing *paths*."""
+    if not paths.root_exists or not paths.available(_hotword_file()):
+        return None
+    if not paths.available(_payloads_dir()):
+        # A legacy raw cache can be read from the retained hotword directory,
+        # but transaction recovery cannot safely create an unretained payload
+        # directory after lease acquisition.
+        return _resolve_hotword_snapshot(paths)
+    operation_now = datetime.now(timezone.utc)
+    with _retained_lease_update_lock(paths):
+        current = _recover_locked(paths, operation_now)
+        if current is not None:
+            _verify_current_cache(paths, current)
+            return _verify_payload(paths, current)
+        return _resolve_hotword_snapshot(paths)
 
 
 def _resolve_hotword_snapshot(paths: StateRootLease) -> bytes | None:
@@ -856,6 +874,48 @@ def _update_lock(
             create_retained=True,
         ) as lease:
             yield lease
+
+
+@contextmanager
+def _retained_lease_update_lock(
+    lease: StateRootLease, *, timeout: float | None = None
+) -> Iterator[None]:
+    """Coordinate recovery while preserving the caller's retained identity.
+
+    POSIX takes the external control lock after retaining directory fds.
+    Windows takes path then identity mutexes after retaining share-compatible
+    directory handles. Updaters take path, then directory handles, then
+    identity; because directory handles do not exclude one another, an updater
+    already holding the path mutex can always finish before this loader enters.
+    """
+    paths = StatePaths(root=lease.configured_root)
+    if os.name != "nt":
+        with _posix_control_lock(paths, timeout):
+            yield
+        return
+
+    kernel32 = _windows_mutex_api()
+    lease_timeout = _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + lease_timeout
+    with _acquire_windows_mutex_names(
+        kernel32,
+        (_windows_path_mutex_name(paths),),
+        timeout=lease_timeout,
+    ):
+        validate_state_root(paths.root)
+        identity = _windows_directory_identity(paths.root)
+        remaining = max(0.0, deadline - time.monotonic())
+        with _acquire_windows_mutex_names(
+            kernel32,
+            (_windows_identity_mutex_name(identity),),
+            timeout=remaining,
+        ):
+            validate_state_root(paths.root)
+            if _windows_directory_identity(paths.root) != identity:
+                raise OSError(
+                    "Windows state path changed during lock acquisition"
+                )
+            yield
 
 
 @contextmanager
@@ -993,28 +1053,7 @@ def _windows_mutex(
     paths: StatePaths, timeout: float | None
 ) -> Iterator[StateRootLease]:
     """Hold stable path plus alias-convergent identity mutexes in fixed order."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = (
-        ctypes.c_void_p,
-        wintypes.BOOL,
-        wintypes.LPCWSTR,
-    )
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.OpenMutexW.argtypes = (
-        wintypes.DWORD,
-        wintypes.BOOL,
-        wintypes.LPCWSTR,
-    )
-    kernel32.OpenMutexW.restype = wintypes.HANDLE
-    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
-    kernel32.ReleaseMutex.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32 = _windows_mutex_api()
     lease_timeout = _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
     deadline = time.monotonic() + lease_timeout
     path_name = _windows_path_mutex_name(paths)
@@ -1042,6 +1081,33 @@ def _windows_mutex(
                 or time.monotonic() >= deadline
             ):
                 raise OSError("Windows state path changed during lock acquisition")
+
+
+def _windows_mutex_api():
+    """Configure and return the Win32 mutex API used by both lock entry paths."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.OpenMutexW.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
 
 
 @contextmanager

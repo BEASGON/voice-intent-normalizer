@@ -16,9 +16,7 @@ from .models import EntryStatus, LexiconEntry, Scope
 from .paths import (
     StatePaths,
     StateRootLease,
-    StateRootValidationError,
     guard_state_root,
-    state_root_identity,
     validate_state_root,
 )
 from .updater import resolve_hotword_file
@@ -115,7 +113,6 @@ class LexiconSet:
     ) -> LexiconSet:
         """Load layers in personal, project, industry, hot, then base precedence."""
         validate_state_root(state_paths.root)
-        initial_root_identity = state_root_identity(state_paths.root)
         builtin_paths = Path(builtins_root)
         project_paths = (
             None
@@ -131,21 +128,11 @@ class LexiconSet:
                 Path("projects") / project_paths.project_id
             )
         layers: list[LexiconEntry] = []
-        hotword_data = resolve_hotword_file(state_paths)
-        if initial_root_identity is None:
-            initial_root_identity = state_root_identity(state_paths.root)
 
         with guard_state_root(
             state_paths.root, retained_dirs=retained_dirs
         ) as lease:
-            if (
-                initial_root_identity is not None
-                and state_root_identity(state_paths.root)
-                != initial_root_identity
-            ):
-                raise StateRootValidationError(
-                    "state root rejected: direct canonical local path required"
-                )
+            hotword_data = resolve_hotword_file(lease)
             if lease.root_exists:
                 layers.extend(
                     _load_lease_if_present(

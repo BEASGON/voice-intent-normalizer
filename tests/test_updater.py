@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import voice_intent_normalizer.lexicon as lexicon_module
 import voice_intent_normalizer.updater as updater_module
 from voice_intent_normalizer.lexicon import LexiconSet
 from voice_intent_normalizer.paths import StatePaths, guard_state_root
@@ -1196,6 +1197,83 @@ def test_windows_read_guard_can_overlap_an_updater_guard(tmp_path):
 
     assert [result.status for result in results] == [UpdateStatus.UPDATED]
     assert paths.hotwords_file.read_bytes() == newer
+
+
+def test_lexicon_load_waits_for_update_without_deadlock(tmp_path, monkeypatch):
+    """Keep load's retained lease while it coordinates recovery with an updater."""
+    paths = paths_for(tmp_path)
+    initial = hotword_data(canonical="Initial")
+    newer = hotword_data(canonical="Newer")
+    assert update_hotwords(
+        paths, MANIFEST_URL, transport_for(initial), NOW
+    ).status is UpdateStatus.UPDATED
+    entered_recovery = threading.Event()
+    entered_resolver = threading.Event()
+    release_recovery = threading.Event()
+    load_done = threading.Event()
+    update_results = []
+    load_results = []
+    real_recover = updater_module._recover_locked
+    real_resolve = lexicon_module.resolve_hotword_file
+    blocked_once = False
+
+    def block_first_updater_recovery(lease, now):
+        nonlocal blocked_once
+        if (
+            threading.current_thread().name == "hotword-updater"
+            and not blocked_once
+        ):
+            blocked_once = True
+            entered_recovery.set()
+            assert release_recovery.wait(5)
+        return real_recover(lease, now)
+
+    def signal_resolver(authority):
+        entered_resolver.set()
+        return real_resolve(authority)
+
+    def run_update() -> None:
+        update_results.append(
+            update_hotwords(
+                paths,
+                MANIFEST_URL,
+                transport_for(newer, version="2026.07.30"),
+                NOW,
+                force=True,
+            )
+        )
+
+    def run_load() -> None:
+        load_results.append(LexiconSet.load(paths, tmp_path / "builtins"))
+        load_done.set()
+
+    monkeypatch.setattr(
+        updater_module, "_recover_locked", block_first_updater_recovery
+    )
+    monkeypatch.setattr(lexicon_module, "resolve_hotword_file", signal_resolver)
+    updater = threading.Thread(target=run_update, name="hotword-updater")
+    updater.start()
+    assert entered_recovery.wait(5)
+    loader = threading.Thread(target=run_load, name="lexicon-loader")
+    escaped_update_lock = False
+    try:
+        loader.start()
+        assert entered_resolver.wait(5)
+        escaped_update_lock = load_done.wait(0.25)
+    finally:
+        release_recovery.set()
+        updater.join(5)
+        loader.join(5)
+
+    assert not escaped_update_lock
+    assert not updater.is_alive()
+    assert not loader.is_alive()
+    assert [result.status for result in update_results] == [UpdateStatus.UPDATED]
+    assert len(load_results) == 1
+    assert [entry.canonical for entry in load_results[0].entries] in (
+        ["Initial"],
+        ["Newer"],
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows identity replacement handling")
