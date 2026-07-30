@@ -606,6 +606,10 @@ def test_bootstrap_rejects_helper_extension_before_cli_import(tmp_path):
         ),
     ],
 )
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows FileFinder treats artifact suffixes case-insensitively",
+)
 def test_bootstrap_rejects_windows_case_variant_cli_extensions(tmp_path, suffix):
     repository, script = _bootstrap_test_repository(tmp_path)
     package = repository / "src" / "voice_intent_normalizer"
@@ -642,6 +646,10 @@ def test_bootstrap_rejects_windows_case_variant_cli_extensions(tmp_path, suffix)
 
 
 @pytest.mark.parametrize("artifact", ["helper.PYC", "helper.PYO"])
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows FileFinder treats artifact suffixes case-insensitively",
+)
 def test_bootstrap_rejects_windows_case_variant_helper_bytecode(tmp_path, artifact):
     repository, script = _bootstrap_test_repository(tmp_path)
     package = repository / "src" / "voice_intent_normalizer"
@@ -662,6 +670,45 @@ def test_bootstrap_rejects_windows_case_variant_helper_bytecode(tmp_path, artifa
     )
 
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("artifact", ["cli.PYD", "helper.PYC", "helper.PYO"])
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX keeps differently cased artifact names distinct"
+)
+def test_bootstrap_accepts_posix_case_distinct_artifact_names(tmp_path, artifact):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def main():\n"
+        "    Path(os.environ['VOICE_INTENT_SOURCE_MARKER']).write_text('trusted')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    (package / artifact).write_bytes(b"harmless case-distinct artifact")
+    marker = tmp_path / "source-ran"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={
+            "PATH": str(Path(sys.executable).parent),
+            "PYTHONPATH": os.pathsep.join(()),
+            "VOICE_INTENT_SOURCE_MARKER": str(marker),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert marker.read_text(encoding="utf-8") == "trusted"
 
 
 @pytest.mark.parametrize("suffix", importlib.machinery.EXTENSION_SUFFIXES)
