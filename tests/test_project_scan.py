@@ -44,7 +44,7 @@ def test_scanner_stores_relative_locations_not_source_paragraphs(tmp_path):
     result = scan_project(tmp_path, state_paths)
 
     entry = next(item for item in result.entries if item.canonical == "云雀引擎")
-    cache_path = state_paths.for_project(tmp_path).lexicon_file
+    cache_path = state_paths.for_project(tmp_path).scan_lexicon_file
     assert entry.source == "docs.md"
     assert "一大段说明" not in entry.source
     assert "一大段说明" not in cache_path.read_text(encoding="utf-8")
@@ -59,9 +59,8 @@ def test_scanner_discards_long_markdown_headings(tmp_path):
     result = scan_project(tmp_path, state_paths)
 
     assert long_heading not in {entry.canonical for entry in result.entries}
-    assert long_heading not in state_paths.for_project(tmp_path).lexicon_file.read_text(
-        encoding="utf-8"
-    )
+    cache = state_paths.for_project(tmp_path).scan_lexicon_file
+    assert long_heading not in cache.read_text(encoding="utf-8")
 
 
 def test_scanner_ignores_binary_content_with_a_text_extension(tmp_path):
@@ -119,7 +118,7 @@ def test_scanner_persists_extraction_kind_and_exact_frequency(tmp_path):
 
     entry = next(
         item
-        for item in load_jsonl(state_paths.for_project(tmp_path).lexicon_file)
+        for item in load_jsonl(state_paths.for_project(tmp_path).scan_lexicon_file)
         if item.canonical == "WidgetEngine"
     )
     assert entry.notes == "camel-case"
@@ -169,7 +168,7 @@ def test_scanner_writes_only_current_project_entries_to_its_jsonl_cache(tmp_path
 
     result = scan_project(project, state_paths)
     project_paths = state_paths.for_project(project)
-    persisted = load_jsonl(project_paths.lexicon_file)
+    persisted = load_jsonl(project_paths.scan_lexicon_file)
 
     assert result.entries == persisted
     assert {entry.project_id for entry in persisted} == {project_paths.project_id}

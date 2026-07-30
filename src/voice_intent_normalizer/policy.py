@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .matching import MatchContext, normalize_alias
-from .models import Candidate, CorrectionDecision, DecisionAction
+from .models import Candidate, CorrectionDecision, DecisionAction, EntryStatus, Scope
 
 APPLY_THRESHOLD = 0.85
 ASK_THRESHOLD = 0.65
@@ -112,6 +112,20 @@ def _has_context_support(candidate: Candidate, context: MatchContext) -> bool:
     )
 
 
+def _has_high_impact_support(candidate: Candidate, context: MatchContext) -> bool:
+    """Require local project identity or an explicit V1 confirmation for risk."""
+    if (
+        candidate.entry.status is EntryStatus.CONFIRMED
+        and candidate.entry.source == "explicit-learning-v1"
+    ):
+        return True
+    return (
+        candidate.entry.scope is Scope.PROJECT
+        and normalize_alias(candidate.canonical)
+        in {normalize_alias(term) for term in context.project_terms}
+    )
+
+
 def _eligible_to_apply(
     candidate: Candidate,
     margin: float,
@@ -123,7 +137,7 @@ def _eligible_to_apply(
         or margin + _FLOAT_TOLERANCE < MARGIN_THRESHOLD
     ):
         return False
-    if risk.high_impact and not _has_context_support(candidate, context):
+    if risk.high_impact and not _has_high_impact_support(candidate, context):
         return False
     return _has_context_support(candidate, context) or not context.domains
 

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +113,7 @@ _QUOTED_CHINESE = re.compile(r"[“\"「『]([\u4e00-\u9fff]{2,20})[”\"」』]
 _NAMED_CHINESE = re.compile(
     r"(?:产品名是|产品名称是|名称是|名为|叫做)[：:\s]*([\u4e00-\u9fff]{2,20})(?=[，。；;、\s]|$)"
 )
+_SCAN_STATE_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,10 +289,134 @@ def scan_project(
 
     entries = _entries_from_observations(observations, project_paths.project_id)
     project_paths.root.mkdir(parents=True, exist_ok=True)
-    write_jsonl_atomic(project_paths.lexicon_file, entries)
+    write_jsonl_atomic(project_paths.scan_lexicon_file, entries)
+    _write_scan_state(
+        project_paths.scan_state_file,
+        _project_fingerprint(project_root, max_files=max_files),
+        max_files=max_files,
+        max_text_bytes=max_text_bytes,
+    )
     return ScanResult(
         entries=entries,
         truncated=truncated,
         files_scanned=files_scanned,
         text_bytes_scanned=text_bytes_scanned,
     )
+
+
+def project_cache_is_stale(
+    root: str | Path,
+    state_paths: StatePaths,
+    max_files: int = 5_000,
+    max_text_bytes: int = 2_000_000,
+) -> bool:
+    """Return whether the bounded scanner cache needs a safe refresh."""
+    if max_files < 0 or max_text_bytes < 0:
+        raise ValueError("scan limits must be non-negative")
+    supplied_root = Path(root).expanduser()
+    if supplied_root.is_symlink():
+        return False
+    project_root = supplied_root.resolve()
+    project_paths = state_paths.for_project(project_root)
+    if not project_paths.scan_lexicon_file.is_file():
+        return True
+    try:
+        raw = json.loads(project_paths.scan_state_file.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or set(raw) != {
+            "fingerprint",
+            "max_files",
+            "max_text_bytes",
+            "schema_version",
+        }:
+            return True
+        if (
+            raw["schema_version"] != _SCAN_STATE_VERSION
+            or raw["max_files"] != max_files
+            or raw["max_text_bytes"] != max_text_bytes
+            or not isinstance(raw["fingerprint"], str)
+        ):
+            return True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    return raw["fingerprint"] != _project_fingerprint(project_root, max_files=max_files)
+
+
+def _project_fingerprint(root: Path, *, max_files: int) -> str:
+    """Hash bounded metadata only; source content never enters state."""
+    records: list[tuple[str, int, int]] = []
+    pending = [root]
+    files_seen = 0
+    truncated = False
+    while pending and not truncated:
+        directory = pending.pop()
+        try:
+            children = sorted(
+                directory.iterdir(), key=lambda path: path.name.casefold()
+            )
+        except OSError:
+            continue
+        for path in children:
+            if path.is_symlink():
+                continue
+            if path.is_dir():
+                if (
+                    path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
+                    and not _is_private_name(path.name)
+                ):
+                    pending.append(path)
+                continue
+            if not path.is_file() or not _is_allowed_text_file(path):
+                continue
+            if files_seen >= max_files:
+                truncated = True
+                break
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            files_seen += 1
+            records.append(
+                (_relative_source(root, path), info.st_size, info.st_mtime_ns)
+            )
+    payload = json.dumps(
+        {"records": records, "truncated": truncated},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _write_scan_state(
+    path: Path,
+    fingerprint: str,
+    *,
+    max_files: int,
+    max_text_bytes: int,
+) -> None:
+    payload = json.dumps(
+        {
+            "fingerprint": fingerprint,
+            "max_files": max_files,
+            "max_text_bytes": max_text_bytes,
+            "schema_version": _SCAN_STATE_VERSION,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise

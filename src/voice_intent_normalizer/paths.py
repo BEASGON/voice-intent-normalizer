@@ -968,8 +968,13 @@ class ProjectPaths:
 
     @property
     def lexicon_file(self) -> Path:
-        """Return the project lexicon location without creating it."""
+        """Return the learning/curated project lexicon without creating it."""
         return self.root / "project.jsonl"
+
+    @property
+    def scan_lexicon_file(self) -> Path:
+        """Return the scanner-owned project cache without creating it."""
+        return self.root / "project-scan.jsonl"
 
     @property
     def scan_state_file(self) -> Path:

@@ -133,6 +133,9 @@ def test_state_paths_expose_shared_and_project_files_without_creating_them(tmp_p
     assert project.lexicon_file == (
         paths.root / "projects" / project.project_id / "project.jsonl"
     )
+    assert project.scan_lexicon_file == (
+        paths.root / "projects" / project.project_id / "project-scan.jsonl"
+    )
     assert project.scan_state_file == (
         paths.root / "projects" / project.project_id / "scan-state.json"
     )

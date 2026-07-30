@@ -99,7 +99,7 @@ def test_service_scans_a_project_only_when_its_cache_is_missing(service, project
 
     service.normalize(NormalizeRequest(text="检查项目", project_root=project_root))
 
-    assert service.paths.for_project(project_root).lexicon_file.is_file()
+    assert service.paths.for_project(project_root).scan_lexicon_file.is_file()
 
 
 def test_service_passes_conversation_receipt_state_to_policy(service):
@@ -176,4 +176,195 @@ def test_service_falls_back_to_builtins_for_malformed_state(service):
     )
 
     assert decision.corrected_text == "使用 Codex 检查项目"
-    assert "state_unavailable" in decision.diagnostics
+    assert "personal_invalid" in decision.diagnostics
+
+
+def test_stale_scanner_cache_refreshes_without_erasing_project_learning(
+    service, project_root
+):
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    source = project_root / "first.py"
+    source.write_text("class FirstWidget:\n    pass\n", encoding="utf-8")
+    service.normalize(NormalizeRequest(text="检查", project_root=project_root))
+    service.learning.confirm(
+        "work body",
+        "WorkBuddy",
+        Scope.PROJECT,
+        project_id=service.paths.for_project(project_root).project_id,
+    )
+    source.write_text(
+        "class FirstWidget:\n    pass\nclass SecondWidget:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    decision = service.normalize(
+        NormalizeRequest(text="work body 和 SecondWidget", project_root=project_root)
+    )
+
+    project_paths = service.paths.for_project(project_root)
+    assert decision.corrected_text == "WorkBuddy 和 SecondWidget"
+    assert project_paths.lexicon_file.is_file()
+    assert project_paths.scan_lexicon_file.is_file()
+    assert "SecondWidget" in project_paths.scan_lexicon_file.read_text(
+        encoding="utf-8"
+    )
+    assert "WorkBuddy" in project_paths.lexicon_file.read_text(encoding="utf-8")
+
+
+def test_corrupt_personal_layer_keeps_valid_project_and_hotword_layers(
+    service, project_root
+):
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    project_id = service.paths.for_project(project_root).project_id
+    service.paths.root.mkdir(parents=True)
+    service.paths.personal_file.write_text("not-json\n", encoding="utf-8")
+    _write_entry(
+        service.paths.for_project(project_root).lexicon_file,
+        canonical="ProjectTool",
+        scope="project",
+        aliases=["project tool"],
+        domains=["software-development"],
+        weight=1.0,
+        status="confirmed",
+        project_id=project_id,
+    )
+    _write_entry(
+        service.paths.hotwords_file,
+        canonical="HotTool",
+        scope="hot",
+        aliases=["hot tool"],
+        domains=["software-development"],
+        weight=1.0,
+        status="curated",
+    )
+
+    decision = service.normalize(
+        NormalizeRequest(
+            text="project tool 和 hot tool",
+            project_root=project_root,
+            domains=("software-development",),
+        )
+    )
+
+    assert decision.corrected_text == "ProjectTool 和 HotTool"
+    assert "personal_invalid" in decision.diagnostics
+
+
+def test_corrupt_hotword_layer_keeps_valid_project_layer(service, project_root):
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    project_id = service.paths.for_project(project_root).project_id
+    _write_entry(
+        service.paths.for_project(project_root).lexicon_file,
+        canonical="ProjectTool",
+        scope="project",
+        aliases=["project tool"],
+        domains=[],
+        weight=1.0,
+        status="confirmed",
+        project_id=project_id,
+    )
+    service.paths.hotwords_file.parent.mkdir(parents=True)
+    service.paths.hotwords_file.write_text("not-json\n", encoding="utf-8")
+
+    decision = service.normalize(
+        NormalizeRequest(text="project tool", project_root=project_root)
+    )
+
+    assert decision.corrected_text == "ProjectTool"
+    assert "hotword_invalid" in decision.diagnostics
+
+
+def test_read_only_list_control_remains_available(service):
+    service.learning.confirm("work body", "WorkBuddy", Scope.PERSONAL)
+    original_mode = service.paths.root.stat().st_mode
+    os.chmod(service.paths.root, 0o555)
+    try:
+        result = service.apply_control("查看最近学到的词。")
+    finally:
+        os.chmod(service.paths.root, original_mode)
+
+    assert result is not None
+    assert result.handled is True
+    assert "1" in result.message
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "我说的是 WorkBuddy，不是 work body",
+        "不要把 work body 改成 WorkBuddy",
+        "撤销刚才的纠正。",
+        "删除你学到的这个词。",
+    ),
+)
+def test_read_only_write_controls_never_mutate_learning_state(service, text):
+    service.paths.root.mkdir(parents=True)
+    original_mode = service.paths.root.stat().st_mode
+    os.chmod(service.paths.root, 0o555)
+    try:
+        result = service.apply_control(text)
+    finally:
+        os.chmod(service.paths.root, original_mode)
+
+    assert result is not None
+    assert result.handled is True
+    assert "只读" in result.message
+    assert not service.learning.events_file.exists()
+
+
+def test_confirmed_mapping_applies_to_an_ordinary_phrase_without_context(service):
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    service.learning.confirm("work body", "WorkBuddy", Scope.PERSONAL)
+
+    decision = service.normalize(NormalizeRequest(text="打开 work body"))
+
+    assert decision.action is DecisionAction.APPLY
+    assert decision.corrected_text == "打开 WorkBuddy"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "删除 code X",
+        "set code X retry to 42",
+        "python code X.py",
+    ),
+)
+def test_public_domain_evidence_never_auto_applies_to_high_impact_text(service, text):
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    decision = service.normalize(
+        NormalizeRequest(text=text, domains=("software-development",))
+    )
+
+    assert decision.action is not DecisionAction.APPLY
+    assert decision.corrected_text == text
+
+
+def test_request_rejects_unbounded_text_and_context_terms():
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    with pytest.raises(ValueError, match="text exceeds"):
+        NormalizeRequest(text="x" * 20_001)
+    with pytest.raises(ValueError, match="text exceeds"):
+        NormalizeRequest(text="😀" * 17_000)
+    with pytest.raises(ValueError, match="conversation_terms"):
+        NormalizeRequest(
+            text="ok", conversation_terms=tuple("x" for _ in range(129))
+        )
+
+
+def test_package_root_exports_service_contracts():
+    from voice_intent_normalizer import (
+        ControlResult,
+        NormalizeRequest,
+        NormalizerService,
+    )
+
+    assert NormalizerService.__name__ == "NormalizerService"
+    assert NormalizeRequest.__name__ == "NormalizeRequest"
+    assert ControlResult.__name__ == "ControlResult"

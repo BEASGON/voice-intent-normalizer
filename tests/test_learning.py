@@ -559,12 +559,16 @@ def test_project_confirmation_preserves_scanner_entries(tmp_path):
         project_id=project_id,
     )
 
-    entries = {
+    scanner_entries = {
+        entry.canonical: entry
+        for entry in load_jsonl(paths.for_project(workspace).scan_lexicon_file)
+    }
+    learned_entries = {
         entry.canonical: entry
         for entry in load_jsonl(paths.for_project(workspace).lexicon_file)
     }
-    assert entries["ExistingWidget"].source == "README.md"
-    assert entries["WidgetEngine"].aliases == ("widget engine",)
+    assert scanner_entries["ExistingWidget"].source == "README.md"
+    assert learned_entries["WidgetEngine"].aliases == ("widget engine",)
 
 
 def test_external_same_key_edit_during_active_generation_is_a_conflict(tmp_path):

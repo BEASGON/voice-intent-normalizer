@@ -15,11 +15,18 @@ from .matching import MatchContext, generate_candidates
 from .models import CorrectionDecision, DecisionAction, Scope
 from .paths import StatePaths, validate_state_root
 from .policy import decide
-from .project_scan import scan_project
+from .project_scan import project_cache_is_stale, scan_project
 
 _STATE_UNAVAILABLE = "state_unavailable"
 _READ_ONLY_STATE = "read_only_state"
 _EXPLICIT_CONTROL = "explicit_control"
+_MAX_TEXT_CHARS = 20_000
+_MAX_TEXT_BYTES = 64 * 1024
+_MAX_DOMAINS = 32
+_MAX_CONVERSATION_TERMS = 128
+_MAX_TERM_CHARS = 256
+_MAX_TERM_BYTES = 1_024
+_MAX_NOTIFIED_PAIRS = 1_024
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,15 +42,28 @@ class NormalizeRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
             raise TypeError("text must be a string")
+        if (
+            len(self.text) > _MAX_TEXT_CHARS
+            or len(self.text.encode("utf-8")) > _MAX_TEXT_BYTES
+        ):
+            raise ValueError("text exceeds normalization bounds")
         if self.project_root is not None:
             object.__setattr__(self, "project_root", Path(self.project_root))
-        object.__setattr__(self, "domains", _text_tuple(self.domains, "domains"))
+        object.__setattr__(
+            self, "domains", _text_tuple(self.domains, "domains", _MAX_DOMAINS)
+        )
         object.__setattr__(
             self,
             "conversation_terms",
-            _text_tuple(self.conversation_terms, "conversation_terms"),
+            _text_tuple(
+                self.conversation_terms,
+                "conversation_terms",
+                _MAX_CONVERSATION_TERMS,
+            ),
         )
         pairs = frozenset(self.notified_pairs)
+        if len(pairs) > _MAX_NOTIFIED_PAIRS:
+            raise ValueError("notified_pairs exceeds normalization bounds")
         if any(
             not isinstance(pair, tuple)
             or len(pair) != 2
@@ -51,6 +71,13 @@ class NormalizeRequest:
             for pair in pairs
         ):
             raise ValueError("notified_pairs must contain string pairs")
+        if any(
+            len(value) > _MAX_TERM_CHARS
+            or len(value.encode("utf-8")) > _MAX_TERM_BYTES
+            for pair in pairs
+            for value in pair
+        ):
+            raise ValueError("notified_pairs contains an oversized term")
         object.__setattr__(self, "notified_pairs", pairs)
 
 
@@ -138,10 +165,14 @@ class NormalizerService:
         command = parse_control(text)
         if command is None:
             return None
-        if not self._state_is_writable():
-            return ControlResult(True, "状态目录为只读，未保存明确更正。")
-
         try:
+            if command.kind == "list_recent":
+                return ControlResult(
+                    True,
+                    f"最近有 {len(self.learning.list_recent())} 条明确更正。",
+                )
+            if not self._state_is_writable():
+                return ControlResult(True, "状态目录为只读，未保存明确更正。")
             if command.kind == "confirm":
                 scope = Scope.PROJECT if project_root is not None else Scope.PERSONAL
                 project_id = (
@@ -168,11 +199,6 @@ class NormalizerService:
                     "已撤销最近的更正。" if event else "没有可撤销的更正。",
                     event,
                 )
-            if command.kind == "list_recent":
-                return ControlResult(
-                    True,
-                    f"最近有 {len(self.learning.list_recent())} 条明确更正。",
-                )
             if command.kind == "delete":
                 return ControlResult(True, "请说明要删除的词。")
         except (OSError, PermissionError, RuntimeError, ValueError):
@@ -190,12 +216,11 @@ class NormalizerService:
     def _refresh_missing_project_cache(
         self, project_root: Path | None, diagnostics: list[str]
     ) -> None:
-        """Populate only an absent cache so scanning cannot erase V1 learning."""
+        """Refresh only scanner-owned cache, leaving V1 learning authoritative."""
         if project_root is None:
             return
         try:
-            cache = self.paths.for_project(project_root).lexicon_file
-            if not cache.is_file():
+            if project_cache_is_stale(project_root, self.paths):
                 self.project_scanner(project_root, self.paths)
         except (OSError, PermissionError, RuntimeError, ValueError):
             diagnostics.append("project_scan_failed")
@@ -204,12 +229,14 @@ class NormalizerService:
         self, request: NormalizeRequest, diagnostics: list[str]
     ) -> LexiconSet:
         try:
-            return LexiconSet.load(
+            lexicons, layer_diagnostics = LexiconSet.load_with_diagnostics(
                 self.paths,
                 self.builtins_root,
                 project_root=request.project_root,
                 domains=request.domains,
             )
+            diagnostics.extend(layer_diagnostics)
+            return lexicons
         except (OSError, PermissionError, RuntimeError, ValueError):
             diagnostics.append(_STATE_UNAVAILABLE)
             return self._builtins_only(request.domains)
@@ -267,10 +294,20 @@ def _required(value: str | None) -> str:
     return value
 
 
-def _text_tuple(values: Iterable[str], name: str) -> tuple[str, ...]:
+def _text_tuple(
+    values: Iterable[str], name: str, maximum: int
+) -> tuple[str, ...]:
     values = tuple(values)
     if any(not isinstance(value, str) for value in values):
         raise ValueError(f"{name} must contain only strings")
+    if len(values) > maximum:
+        raise ValueError(f"{name} exceeds normalization bounds")
+    if any(
+        len(value) > _MAX_TERM_CHARS
+        or len(value.encode("utf-8")) > _MAX_TERM_BYTES
+        for value in values
+    ):
+        raise ValueError(f"{name} contains an oversized term")
     return values
 
 

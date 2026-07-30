@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .lexicon import LexiconSet
-from .models import Candidate, LexiconEntry, Scope
+from .models import Candidate, EntryStatus, LexiconEntry, Scope
 
 _SEPARATOR_PATTERN = re.compile(r"[\s\-_/]+")
 _SCOPE_PRECEDENCE = {
@@ -173,6 +173,9 @@ def _candidate(
     weight_score = entry.weight * 0.20
     score += weight_score
     evidence.append(f"weight:{weight_score:.2f}")
+    if match_kind != "negative" and entry.status is EntryStatus.CONFIRMED:
+        score += 0.25
+        evidence.append("status:confirmed")
     return Candidate(
         canonical=entry.canonical,
         original=text[span[0] : span[1]],

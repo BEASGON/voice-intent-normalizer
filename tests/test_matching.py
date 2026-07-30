@@ -214,6 +214,7 @@ def test_scoring_records_context_and_negative_alias_evidence():
         "project:exact-term",
         "conversation:mention",
         "weight:0.20",
+        "status:confirmed",
     )
     negative = next(
         candidate for candidate in candidates if candidate.original == "open door"

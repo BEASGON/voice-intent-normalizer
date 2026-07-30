@@ -76,6 +76,39 @@ def _load_lease_if_present(
     )
 
 
+def _safe_load_lease_layer(
+    lease: StateRootLease,
+    relative: str | Path,
+    scope: Scope,
+    diagnostic: str,
+    diagnostics: list[str],
+) -> tuple[LexiconEntry, ...]:
+    """Keep a malformed mutable layer from erasing valid sibling layers."""
+    try:
+        return _load_lease_if_present(lease, relative, scope)
+    except (OSError, ValueError):
+        diagnostics.append(diagnostic)
+        return ()
+
+
+def _invalid_hotword_snapshot(lease: StateRootLease) -> bool:
+    """Report a corrupt optional raw cache without affecting other layers."""
+    relative = Path("hotwords") / "zh-ai.jsonl"
+    try:
+        if not lease.available(relative) or not lease.exists(relative):
+            return False
+        if not stat.S_ISREG(lease.stat(relative).st_mode):
+            return True
+        load_jsonl_bytes(
+            lease.read_bytes(relative, _MAX_STATE_LEXICON_BYTES, "hotword"),
+            relative,
+            expected_scope=Scope.HOT,
+        )
+    except (OSError, ValueError):
+        return True
+    return False
+
+
 def _first_existing(paths: Sequence[Path]) -> Path | None:
     """Return the first conventional built-in file that exists."""
     return next((path for path in paths if path.is_file()), None)
@@ -112,6 +145,20 @@ class LexiconSet:
         domains: Sequence[str] = (),
     ) -> LexiconSet:
         """Load layers in personal, project, industry, hot, then base precedence."""
+        lexicons, _diagnostics = cls.load_with_diagnostics(
+            state_paths, builtins_root, project_root, domains
+        )
+        return lexicons
+
+    @classmethod
+    def load_with_diagnostics(
+        cls,
+        state_paths: StatePaths,
+        builtins_root: str | Path,
+        project_root: str | Path | None = None,
+        domains: Sequence[str] = (),
+    ) -> tuple[LexiconSet, tuple[str, ...]]:
+        """Load independent mutable layers without discarding valid siblings."""
         validate_state_root(state_paths.root)
         builtin_paths = Path(builtins_root)
         project_paths = (
@@ -128,15 +175,22 @@ class LexiconSet:
                 Path("projects") / project_paths.project_id
             )
         layers: list[LexiconEntry] = []
+        diagnostics: list[str] = []
 
         with guard_state_root(
             state_paths.root, retained_dirs=retained_dirs
         ) as lease:
             hotword_data = resolve_hotword_file(lease)
+            if hotword_data is None and _invalid_hotword_snapshot(lease):
+                diagnostics.append("hotword_invalid")
             if lease.root_exists:
                 layers.extend(
-                    _load_lease_if_present(
-                        lease, "personal.jsonl", Scope.PERSONAL
+                    _safe_load_lease_layer(
+                        lease,
+                        "personal.jsonl",
+                        Scope.PERSONAL,
+                        "personal_invalid",
+                        diagnostics,
                     )
                 )
 
@@ -146,18 +200,33 @@ class LexiconSet:
                     / project_paths.project_id
                     / "project.jsonl"
                 )
-                project_entries = (
-                    _load_lease_if_present(
-                        lease,
-                        project_relative,
-                        Scope.PROJECT,
-                    )
-                    if lease.available(project_relative)
-                    else ()
+                project_entries = _safe_load_lease_layer(
+                    lease,
+                    project_relative,
+                    Scope.PROJECT,
+                    "project_invalid",
+                    diagnostics,
                 )
                 layers.extend(
                     entry
                     for entry in project_entries
+                    if entry.project_id == project_paths.project_id
+                )
+                scan_relative = (
+                    Path("projects")
+                    / project_paths.project_id
+                    / "project-scan.jsonl"
+                )
+                scanner_entries = _safe_load_lease_layer(
+                    lease,
+                    scan_relative,
+                    Scope.PROJECT,
+                    "project_scan_invalid",
+                    diagnostics,
+                )
+                layers.extend(
+                    entry
+                    for entry in scanner_entries
                     if entry.project_id == project_paths.project_id
                 )
 
@@ -204,7 +273,7 @@ class LexiconSet:
             if base_path is not None:
                 layers.extend(_load_if_present(base_path, Scope.BASE))
 
-        return cls(entries=tuple(layers))
+        return cls(entries=tuple(layers)), tuple(diagnostics)
 
     def by_alias(self, alias: str) -> tuple[LexiconEntry, ...]:
         """Return matching entries in layer precedence order."""
