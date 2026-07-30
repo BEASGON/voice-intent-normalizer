@@ -219,7 +219,9 @@ class NormalizerService:
         if project_root is None:
             return
         try:
-            if project_cache_is_stale(project_root, self.paths):
+            if project_cache_is_stale(
+                project_root, self.paths, diagnostics=diagnostics
+            ):
                 self.project_scanner(project_root, self.paths)
         except (OSError, PermissionError, RuntimeError, ValueError):
             diagnostics.append("project_scan_failed")

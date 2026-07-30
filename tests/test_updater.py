@@ -701,6 +701,28 @@ def test_authoritative_cache_reconstructs_missing_payload_and_discards_bad_pendi
     assert not (paths.hotwords_file.parent / "pending.json").exists()
 
 
+def test_direct_resolver_uses_exact_raw_when_payload_path_cannot_be_repaired(
+    tmp_path,
+):
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Direct recovery")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    current = json.loads((paths.hotwords_file.parent / "current.json").read_text())
+    payload = paths.hotwords_file.parent / "payloads" / current["payload"]
+    payload.unlink()
+    payload.mkdir()
+    diagnostics: list[str] = []
+
+    resolved = updater_module.resolve_hotword_file(
+        paths, diagnostics=diagnostics
+    )
+
+    assert resolved == data
+    assert diagnostics == ["hotword_transaction_invalid"]
+
+
 def test_pointerless_corrupt_cache_falls_back_to_builtin_lexicon(tmp_path):
     paths = paths_for(tmp_path)
     paths.hotwords_file.parent.mkdir(parents=True)
@@ -1249,9 +1271,9 @@ def test_lexicon_load_waits_for_update_without_deadlock(tmp_path, monkeypatch):
             assert release_recovery.wait(5)
         return real_recover(lease, now)
 
-    def signal_resolver(authority):
+    def signal_resolver(authority, **kwargs):
         entered_resolver.set()
-        return real_resolve(authority)
+        return real_resolve(authority, **kwargs)
 
     def run_update() -> None:
         update_results.append(

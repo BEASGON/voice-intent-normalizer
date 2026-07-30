@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-import threading
+import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -113,14 +114,17 @@ _QUOTED_CHINESE = re.compile(r"[“\"「『]([\u4e00-\u9fff]{2,20})[”\"」』]
 _NAMED_CHINESE = re.compile(
     r"(?:产品名是|产品名称是|名称是|名为|叫做)[：:\s]*([\u4e00-\u9fff]{2,20})(?=[，。；;、\s]|$)"
 )
-_SCAN_STATE_VERSION = 3
+_SCAN_STATE_VERSION = 4
 _MAX_SCAN_STATE_BYTES = 64 * 1024
 _MAX_SCAN_CACHE_BYTES = 10 * 1024 * 1024
+_MAX_SCAN_FILES = 5_000
+_MAX_SCAN_TEXT_BYTES = 2_000_000
 _MAX_DIRECTORY_ENTRIES = 4_096
 _MAX_SCAN_ENTRIES = 50_000
 _SCAN_ATTEMPTS = 2
-_PUBLICATION_LOCKS: dict[tuple[str, str], threading.Lock] = {}
-_PUBLICATION_LOCKS_GUARD = threading.Lock()
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_PROJECT_ID = re.compile(r"[0-9a-f]{16}\Z", re.ASCII)
+_WINDOWS_REPARSE_POINT = 0x400
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,8 +235,7 @@ def scan_project(
     symlinks, and treats unreadable files as absent.  Reaching either supplied
     limit produces the partial cache and marks the result as truncated.
     """
-    if max_files < 0 or max_text_bytes < 0:
-        raise ValueError("scan limits must be non-negative")
+    _validate_scan_limits(max_files, max_text_bytes)
 
     supplied_root = Path(root).expanduser()
     if supplied_root.is_symlink():
@@ -256,32 +259,31 @@ def scan_project(
             truncated=result.truncated or output_truncated,
         )
         relative_dir = Path("projects") / project_paths.project_id
-        with _project_publication_lock(state_paths, project_paths.project_id):
-            with guard_state_root(
-                state_paths.root,
-                create=True,
-                retained_dirs=(relative_dir,),
-                create_retained=True,
-            ) as lease:
-                cache_relative = relative_dir / "project-scan.jsonl"
-                state_relative = relative_dir / "scan-state.json"
-                if not lease.exists(cache_relative):
-                    _remove_pre_release_scan_entries(
-                        lease, relative_dir, project_paths.project_id
-                    )
-                lease.write_bytes_atomic(cache_relative, cache)
-                generation = _next_generation(lease, state_relative)
-                lease.write_bytes_atomic(
-                    state_relative,
-                    _scan_state_bytes(
-                        after,
-                        cache,
-                        max_files,
-                        max_text_bytes,
-                        generation,
-                        result.truncated,
-                    ),
+        with _project_publication_lock(
+            state_paths, project_paths.project_id
+        ) as lease:
+            cache_relative = relative_dir / "project-scan.jsonl"
+            state_relative = relative_dir / "scan-state.json"
+            if not lease.exists(cache_relative):
+                _remove_pre_release_scan_entries(
+                    lease, relative_dir, project_paths.project_id
                 )
+            lease.write_bytes_atomic(cache_relative, cache)
+            # Re-read only after the cross-process lease is held. Every
+            # successful publication therefore consumes a unique generation.
+            generation = _next_generation(lease, state_relative)
+            lease.write_bytes_atomic(
+                state_relative,
+                _scan_state_bytes(
+                    after,
+                    cache,
+                    max_files,
+                    max_text_bytes,
+                    generation,
+                    result.truncated,
+                    project_paths.project_id,
+                ),
+            )
         return result
     raise RuntimeError("project changed during bounded scan")
 
@@ -291,10 +293,11 @@ def project_cache_is_stale(
     state_paths: StatePaths,
     max_files: int = 5_000,
     max_text_bytes: int = 2_000_000,
+    *,
+    diagnostics: list[str] | None = None,
 ) -> bool:
     """Return whether the bounded scanner cache needs a safe refresh."""
-    if max_files < 0 or max_text_bytes < 0:
-        raise ValueError("scan limits must be non-negative")
+    _validate_scan_limits(max_files, max_text_bytes)
     supplied_root = Path(root).expanduser()
     if supplied_root.is_symlink():
         return False
@@ -305,7 +308,14 @@ def project_cache_is_stale(
         with guard_state_root(state_paths.root, retained_dirs=(relative_dir,)) as lease:
             cache_relative = relative_dir / "project-scan.jsonl"
             state_relative = relative_dir / "scan-state.json"
-            if not lease.root_exists or not lease.exists(cache_relative):
+            if not lease.root_exists:
+                return True
+            cache_exists = lease.exists(cache_relative)
+            state_exists = lease.exists(state_relative)
+            if not cache_exists and not state_exists:
+                return True
+            if cache_exists != state_exists:
+                _append_scan_diagnostic(diagnostics)
                 return True
             cache = lease.read_bytes(
                 cache_relative, _MAX_SCAN_CACHE_BYTES, "scan cache"
@@ -313,30 +323,20 @@ def project_cache_is_stale(
             raw = json.loads(
                 lease.read_bytes(state_relative, _MAX_SCAN_STATE_BYTES, "scan state")
             )
-        if not isinstance(raw, dict) or set(raw) != {
-            "fingerprint",
-            "cache_sha256",
-            "generation",
-            "max_files",
-            "max_text_bytes",
-            "schema_version",
-            "truncated",
-        }:
+        if not _valid_scan_state(raw, project_paths.project_id):
+            _append_scan_diagnostic(diagnostics)
             return True
         if (
-            raw["schema_version"] != _SCAN_STATE_VERSION
-            or raw["max_files"] != max_files
+            raw["max_files"] != max_files
             or raw["max_text_bytes"] != max_text_bytes
-            or not isinstance(raw["fingerprint"], str)
-            or not isinstance(raw["cache_sha256"], str)
-            or not isinstance(raw["truncated"], bool)
-            or isinstance(raw["generation"], bool)
-            or not isinstance(raw["generation"], int)
         ):
+            _append_scan_diagnostic(diagnostics)
             return True
         if hashlib.sha256(cache).hexdigest() != raw["cache_sha256"]:
+            _append_scan_diagnostic(diagnostics)
             return True
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        _append_scan_diagnostic(diagnostics)
         return True
     return raw["fingerprint"] != _project_fingerprint(project_root, max_files=max_files)
 
@@ -351,13 +351,19 @@ def load_project_scan_entries(
     cache_relative = relative_dir / "project-scan.jsonl"
     state_relative = relative_dir / "scan-state.json"
     try:
-        if not lease.available(relative_dir) or not lease.exists(cache_relative):
+        if not lease.available(relative_dir):
             return (), None
+        cache_exists = lease.exists(cache_relative)
+        state_exists = lease.exists(state_relative)
+        if not cache_exists and not state_exists:
+            return (), None
+        if cache_exists != state_exists:
+            return (), "project_scan_invalid"
         cache = lease.read_bytes(cache_relative, _MAX_SCAN_CACHE_BYTES, "scan cache")
         raw = json.loads(
             lease.read_bytes(state_relative, _MAX_SCAN_STATE_BYTES, "scan state")
         )
-        if not _valid_scan_state(raw):
+        if not _valid_scan_state(raw, project_id):
             return (), "project_scan_invalid"
         if hashlib.sha256(cache).hexdigest() != raw["cache_sha256"]:
             return (), "project_scan_invalid"
@@ -374,7 +380,7 @@ def load_project_scan_entries(
         return (), "project_scan_invalid"
 
 
-def _valid_scan_state(raw: object) -> bool:
+def _valid_scan_state(raw: object, project_id: str | None = None) -> bool:
     """Validate the complete cache transaction contract before using bytes."""
     return (
         isinstance(raw, dict)
@@ -387,18 +393,41 @@ def _valid_scan_state(raw: object) -> bool:
             "max_text_bytes",
             "schema_version",
             "truncated",
+            "project_id",
         }
         and raw["schema_version"] == _SCAN_STATE_VERSION
+        and type(raw["schema_version"]) is int
         and isinstance(raw["fingerprint"], str)
+        and _SHA256.fullmatch(raw["fingerprint"]) is not None
         and isinstance(raw["cache_sha256"], str)
-        and isinstance(raw["generation"], int)
-        and not isinstance(raw["generation"], bool)
-        and isinstance(raw["max_files"], int)
-        and raw["max_files"] >= 0
-        and isinstance(raw["max_text_bytes"], int)
-        and raw["max_text_bytes"] >= 0
-        and isinstance(raw["truncated"], bool)
+        and _SHA256.fullmatch(raw["cache_sha256"]) is not None
+        and type(raw["generation"]) is int
+        and raw["generation"] >= 0
+        and type(raw["max_files"]) is int
+        and 0 < raw["max_files"] <= _MAX_SCAN_FILES
+        and type(raw["max_text_bytes"]) is int
+        and 0 < raw["max_text_bytes"] <= _MAX_SCAN_TEXT_BYTES
+        and type(raw["truncated"]) is bool
+        and isinstance(raw["project_id"], str)
+        and _PROJECT_ID.fullmatch(raw["project_id"]) is not None
+        and (project_id is None or raw["project_id"] == project_id)
     )
+
+
+def _validate_scan_limits(max_files: int, max_text_bytes: int) -> None:
+    """Reject caller or metadata limits outside immutable scanner hard caps."""
+    if (
+        type(max_files) is not int
+        or not 0 < max_files <= _MAX_SCAN_FILES
+        or type(max_text_bytes) is not int
+        or not 0 < max_text_bytes <= _MAX_SCAN_TEXT_BYTES
+    ):
+        raise ValueError("scan limits must be positive integers within hard caps")
+
+
+def _append_scan_diagnostic(diagnostics: list[str] | None) -> None:
+    if diagnostics is not None and "project_scan_invalid" not in diagnostics:
+        diagnostics.append("project_scan_invalid")
 
 
 def _project_fingerprint(root: Path, *, max_files: int) -> str:
@@ -505,9 +534,10 @@ def _scan_once(
                 break
             remaining = max_text_bytes - text_bytes_scanned
             try:
-                with path.open("rb") as text_file:
-                    content_bytes = text_file.read(remaining + 1)
-            except OSError:
+                content_bytes = _read_project_file(
+                    root, path, remaining + 1
+                )
+            except (OSError, ValueError):
                 continue
             if len(content_bytes) > remaining:
                 truncated = True
@@ -530,6 +560,176 @@ def _scan_once(
         files_scanned,
         text_bytes_scanned,
     )
+
+
+def _read_project_file(root: Path, path: Path, limit: int) -> bytes:
+    """Read a bounded direct regular file without escaping the project root."""
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("project read limit must be a positive integer")
+    relative = path.relative_to(root)
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("project source must be strictly beneath its root")
+    root_info = os.stat(root, follow_symlinks=False)
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise ValueError("project root must remain a direct directory")
+    root_identity = (root_info.st_dev, root_info.st_ino)
+    if os.name == "nt":
+        descriptor = _open_windows_project_file(root, path, root_identity)
+        try:
+            return _read_descriptor_limited(descriptor, limit)
+        finally:
+            os.close(descriptor)
+    return _read_posix_project_file(root, relative, root_identity, limit)
+
+
+def _read_posix_project_file(
+    root: Path,
+    relative: Path,
+    root_identity: tuple[int, int],
+    limit: int,
+) -> bytes:
+    """Walk every source component relative to one no-follow root descriptor."""
+    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required):
+        raise OSError("secure project reads require POSIX no-follow flags")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, directory_flags)
+        descriptors.append(current)
+        info = os.fstat(current)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or (info.st_dev, info.st_ino) != root_identity
+        ):
+            raise ValueError("project root identity changed during source open")
+        for component in relative.parts[:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(current)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise ValueError("project source parent must be a directory")
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        source = os.open(relative.parts[-1], file_flags, dir_fd=current)
+        descriptors.append(source)
+        if not stat.S_ISREG(os.fstat(source).st_mode):
+            raise ValueError("project source must be a regular file")
+        return _read_descriptor_limited(source, limit)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _open_windows_project_file(
+    root: Path,
+    path: Path,
+    root_identity: tuple[int, int],
+) -> int:
+    """Open a no-follow Windows file and verify its final handle containment."""
+    import ctypes
+    import msvcrt
+    import ntpath
+    from ctypes import wintypes
+
+    from .paths import _extended_windows_path
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x80000000,  # GENERIC_READ
+        0x7,  # share read/write/delete; the exact handle remains authoritative
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = _FileAttributeTagInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.file_attributes & (0x10 | _WINDOWS_REPARSE_POINT):
+            raise ValueError("project source must be a direct regular file")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if length == 0 or length >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error() or 206)
+        final_path = _plain_windows_path(buffer.value)
+        root_path = ntpath.normcase(ntpath.normpath(os.fspath(root)))
+        final_key = ntpath.normcase(ntpath.normpath(final_path))
+        if ntpath.commonpath((root_path, final_key)) != root_path:
+            raise ValueError("project source escaped its root")
+        root_after = os.stat(root, follow_symlinks=False)
+        if (root_after.st_dev, root_after.st_ino) != root_identity:
+            raise ValueError("project root identity changed during source open")
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        handle = None
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError("project source must be a regular file")
+        return descriptor
+    finally:
+        if handle is not None:
+            kernel32.CloseHandle(handle)
+
+
+def _plain_windows_path(value: str) -> str:
+    folded = value.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        return "\\\\" + value[8:]
+    if folded.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
+def _read_descriptor_limited(descriptor: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        remaining = limit - total
+        chunk = os.read(descriptor, min(64 * 1024, remaining))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _bounded_children(directory: Path) -> tuple[list[Path], bool]:
@@ -579,6 +779,7 @@ def _scan_state_bytes(
     max_text_bytes: int,
     generation: int,
     truncated: bool,
+    project_id: str,
 ) -> bytes:
     return json.dumps(
         {
@@ -587,6 +788,7 @@ def _scan_state_bytes(
             "generation": generation,
             "max_files": max_files,
             "max_text_bytes": max_text_bytes,
+            "project_id": project_id,
             "schema_version": _SCAN_STATE_VERSION,
             "truncated": truncated,
         },
@@ -604,7 +806,7 @@ def _next_generation(lease: StateRootLease, relative: Path) -> int:
         generation = raw.get("generation", 0) if isinstance(raw, dict) else 0
         return (
             generation + 1
-            if isinstance(generation, int) and not isinstance(generation, bool)
+            if type(generation) is int and generation >= 0
             else 1
         )
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -612,11 +814,15 @@ def _next_generation(lease: StateRootLease, relative: Path) -> int:
 
 
 def _project_publication_lock(state_paths: StatePaths, project_id: str):
-    """Serialize same-process scanner publications by direct state-root identity."""
-    key = (str(state_paths.root), project_id)
-    with _PUBLICATION_LOCKS_GUARD:
-        lock = _PUBLICATION_LOCKS.setdefault(key, threading.Lock())
-    return lock
+    """Serialize one project through Task 7's alias-stable OS coordination."""
+    from .updater import state_serialization_lock
+
+    relative_dir = Path("projects") / project_id
+    return state_serialization_lock(
+        state_paths,
+        f"project-scan:{project_id}",
+        retained_dirs=(relative_dir,),
+    )
 
 
 def _remove_pre_release_scan_entries(

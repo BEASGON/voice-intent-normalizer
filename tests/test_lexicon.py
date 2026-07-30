@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import voice_intent_normalizer.lexicon as lexicon_module
+import voice_intent_normalizer.project_scan as project_scan_module
 from voice_intent_normalizer.lexicon import (
     LexiconSet,
     load_jsonl,
@@ -18,6 +19,7 @@ from voice_intent_normalizer.lexicon import (
 )
 from voice_intent_normalizer.models import Candidate, EntryStatus, Scope
 from voice_intent_normalizer.paths import StatePaths, StateRootLease
+from voice_intent_normalizer.project_scan import scan_project
 
 
 def _raw_entry(**overrides: object) -> dict[str, object]:
@@ -208,6 +210,39 @@ def _write_transactional_hotword(
     )
 
 
+def _write_hotword_pointer(
+    paths: StatePaths,
+    authoritative: dict[str, object],
+    *,
+    payload: bytes | None,
+    raw: bytes | None,
+) -> bytes:
+    """Write one structurally valid pointer with independently controlled bytes."""
+    data = (json.dumps(authoritative) + "\n").encode()
+    digest = hashlib.sha256(data).hexdigest()
+    payload_name = f"payload-{digest}.jsonl"
+    hotwords = paths.hotwords_file.parent
+    payloads = hotwords / "payloads"
+    payloads.mkdir(parents=True)
+    if payload is not None:
+        (payloads / payload_name).write_bytes(payload)
+    if raw is not None:
+        paths.hotwords_file.write_bytes(raw)
+    (hotwords / "current.json").write_text(
+        json.dumps(
+            {
+                "last_check": "2026-07-30T00:00:00+00:00",
+                "payload": payload_name,
+                "schema_version": 1,
+                "sha256": digest,
+                "version": "2026.07.30",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return data
+
+
 def test_corrupt_hotword_pointer_is_diagnostic_even_with_raw_fallback(tmp_path):
     """Catch pointer corruption being hidden by a still-readable legacy cache."""
     paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
@@ -225,6 +260,108 @@ def test_corrupt_hotword_pointer_is_diagnostic_even_with_raw_fallback(tmp_path):
 
     assert [entry.canonical for entry in lexicons.entries] == ["RawFallback"]
     assert "hotword_state_invalid" in diagnostics
+
+
+@pytest.mark.parametrize("payload", (None, b"corrupt immutable payload\n"))
+def test_valid_pointer_recovers_only_exact_hash_raw_with_transaction_diagnostic(
+    tmp_path, payload
+):
+    """Catch pointer-authoritative recovery hiding an interrupted transaction."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    authoritative = _raw_entry(
+        canonical="PointerAuthority", scope="hot", aliases=["authority"]
+    )
+    data = (json.dumps(authoritative) + "\n").encode()
+    _write_hotword_pointer(paths, authoritative, payload=payload, raw=data)
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins"
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == ["PointerAuthority"]
+    assert diagnostics.count("hotword_transaction_invalid") == 1
+    assert "hotword_invalid" not in diagnostics
+
+
+def test_valid_pointer_can_use_exact_raw_when_corrupt_payload_path_is_unrepairable(
+    tmp_path,
+):
+    """Catch a valid raw fallback being mislabeled because repair itself failed."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    authoritative = _raw_entry(
+        canonical="DirectoryPayloadAuthority", scope="hot", aliases=["authority"]
+    )
+    data = (json.dumps(authoritative) + "\n").encode()
+    _write_hotword_pointer(paths, authoritative, payload=None, raw=data)
+    digest = hashlib.sha256(data).hexdigest()
+    (
+        paths.hotwords_file.parent
+        / "payloads"
+        / f"payload-{digest}.jsonl"
+    ).mkdir()
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins"
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == [
+        "DirectoryPayloadAuthority"
+    ]
+    assert diagnostics.count("hotword_transaction_invalid") == 1
+    assert "hotword_invalid" not in diagnostics
+
+
+@pytest.mark.parametrize("payload", (None, b"corrupt immutable payload\n"))
+def test_valid_pointer_never_loads_mismatched_raw_fallback(tmp_path, payload):
+    """Catch readable raw bytes overriding the valid pointer's checksum authority."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    authoritative = _raw_entry(
+        canonical="PointerAuthority", scope="hot", aliases=["authority"]
+    )
+    mismatched = (
+        json.dumps(
+            _raw_entry(canonical="MismatchedRaw", scope="hot", aliases=["raw"])
+        )
+        + "\n"
+    ).encode()
+    _write_hotword_pointer(paths, authoritative, payload=payload, raw=mismatched)
+    _write_entries(
+        tmp_path / "builtins" / "hotwords-snapshot.jsonl",
+        _raw_entry(canonical="BuiltinFallback", scope="hot", aliases=["builtin"]),
+    )
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins"
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == ["BuiltinFallback"]
+    assert diagnostics.count("hotword_transaction_invalid") == 1
+    assert diagnostics.count("hotword_invalid") == 1
+
+
+def test_missing_pointer_payload_without_raw_still_reports_transaction_invalid(
+    tmp_path,
+):
+    """Catch built-in fallback erasing evidence of an interrupted pointer commit."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    _write_hotword_pointer(
+        paths,
+        _raw_entry(canonical="PointerAuthority", scope="hot", aliases=["authority"]),
+        payload=None,
+        raw=None,
+    )
+    _write_entries(
+        tmp_path / "builtins" / "hotwords-snapshot.jsonl",
+        _raw_entry(canonical="BuiltinFallback", scope="hot", aliases=["builtin"]),
+    )
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins"
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == ["BuiltinFallback"]
+    assert diagnostics.count("hotword_transaction_invalid") == 1
+    assert "hotword_invalid" not in diagnostics
 
 
 def test_unverified_scanner_cache_is_not_loaded(tmp_path):
@@ -248,6 +385,110 @@ def test_unverified_scanner_cache_is_not_loaded(tmp_path):
 
     assert "InjectedScannerTerm" not in {entry.canonical for entry in lexicons.entries}
     assert "project_scan_invalid" in diagnostics
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("generation", -1),
+        ("generation", True),
+        ("max_files", 0),
+        ("max_files", True),
+        ("max_files", 5_001),
+        ("max_text_bytes", 0),
+        ("max_text_bytes", True),
+        ("max_text_bytes", 2_000_001),
+        ("fingerprint", "not-a-sha256"),
+        ("cache_sha256", "not-a-sha256"),
+        ("truncated", 0),
+    ),
+)
+def test_invalid_scanner_metadata_never_drives_source_traversal(
+    tmp_path, monkeypatch, field, value
+):
+    """Catch malformed transaction metadata becoming traversal configuration."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "widget.py").write_text(
+        "class MetadataWidget:\n", encoding="utf-8"
+    )
+    scan_project(project_root, paths)
+    project = paths.for_project(project_root)
+    state = json.loads(project.scan_state_file.read_text(encoding="utf-8"))
+    state[field] = value
+    project.scan_state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    def reject_metadata_traversal(*_args, **_kwargs):
+        raise AssertionError("invalid scanner metadata drove source traversal")
+
+    monkeypatch.setattr(
+        project_scan_module, "_project_fingerprint", reject_metadata_traversal
+    )
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins", project_root
+    )
+
+    assert "MetadataWidget" not in {
+        entry.canonical for entry in lexicons.entries
+    }
+    assert diagnostics.count("project_scan_invalid") == 1
+
+
+def test_scanner_metadata_project_binding_must_match_the_caller(
+    tmp_path, monkeypatch
+):
+    """Catch replaying a valid scanner transaction under another project ID."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "widget.py").write_text(
+        "class ProjectBoundWidget:\n", encoding="utf-8"
+    )
+    scan_project(project_root, paths)
+    project = paths.for_project(project_root)
+    state = json.loads(project.scan_state_file.read_text(encoding="utf-8"))
+    state["project_id"] = "0" * 16
+    project.scan_state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    def reject_replayed_traversal(*_args, **_kwargs):
+        raise AssertionError("wrong-project metadata drove source traversal")
+
+    monkeypatch.setattr(
+        project_scan_module, "_project_fingerprint", reject_replayed_traversal
+    )
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins", project_root
+    )
+
+    assert "ProjectBoundWidget" not in {
+        entry.canonical for entry in lexicons.entries
+    }
+    assert diagnostics.count("project_scan_invalid") == 1
+
+
+@pytest.mark.parametrize("orphan", ("cache", "state"))
+def test_orphan_scanner_transaction_is_always_diagnostic(tmp_path, orphan):
+    """Catch half-published scanner state being mistaken for a missing cache."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "widget.py").write_text("class OrphanWidget:\n", encoding="utf-8")
+    scan_project(project_root, paths)
+    project = paths.for_project(project_root)
+    if orphan == "cache":
+        project.scan_state_file.unlink()
+    else:
+        project.scan_lexicon_file.unlink()
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins", project_root
+    )
+
+    assert "OrphanWidget" not in {entry.canonical for entry in lexicons.entries}
+    assert diagnostics.count("project_scan_invalid") == 1
 
 
 @pytest.fixture
@@ -358,7 +599,7 @@ def test_all_state_layers_use_one_continuous_root_identity(tmp_path, monkeypatch
     real_resolve = lexicon_module.resolve_hotword_file
     attempted = False
 
-    def swap_to_q_only_during_hotword_resolution(authority):
+    def swap_to_q_only_during_hotword_resolution(authority, **kwargs):
         nonlocal attempted
         attempted = True
         swapped = False
@@ -373,7 +614,7 @@ def test_all_state_layers_use_one_continuous_root_identity(tmp_path, monkeypatch
         except OSError:
             pass
         try:
-            return real_resolve(authority)
+            return real_resolve(authority, **kwargs)
         finally:
             if swapped:
                 paths.root.rename(q_saved)
@@ -455,8 +696,8 @@ def test_hotword_load_uses_the_bytes_validated_by_authority_resolution(
     assert result.status is UpdateStatus.UPDATED
     real_resolve = lexicon_module.resolve_hotword_file
 
-    def replace_after_resolution(authority):
-        resolved = real_resolve(authority)
+    def replace_after_resolution(authority, **kwargs):
+        resolved = real_resolve(authority, **kwargs)
         (paths.hotwords_file.parent / "current.json").unlink()
         _write_entries(paths.hotwords_file, replacement)
         return resolved

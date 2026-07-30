@@ -210,6 +210,36 @@ def test_stale_scanner_cache_refreshes_without_erasing_project_learning(
     assert "WorkBuddy" in project_paths.lexicon_file.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("interruption", ("cache", "state", "metadata"))
+def test_service_reports_invalid_scanner_transaction_before_safe_refresh(
+    service, project_root, interruption
+):
+    """Catch scanner refresh erasing evidence of an interrupted transaction."""
+    from voice_intent_normalizer.service import NormalizeRequest
+
+    (project_root / "widget.py").write_text(
+        "class InterruptedWidget:\n", encoding="utf-8"
+    )
+    service.normalize(NormalizeRequest(text="检查", project_root=project_root))
+    project = service.paths.for_project(project_root)
+    if interruption == "cache":
+        project.scan_state_file.unlink()
+    elif interruption == "state":
+        project.scan_lexicon_file.unlink()
+    else:
+        state = json.loads(project.scan_state_file.read_text(encoding="utf-8"))
+        state["generation"] = -1
+        project.scan_state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    decision = service.normalize(
+        NormalizeRequest(text="再次检查", project_root=project_root)
+    )
+
+    assert decision.diagnostics.count("project_scan_invalid") == 1
+    assert project.scan_lexicon_file.is_file()
+    assert project.scan_state_file.is_file()
+
+
 def test_corrupt_personal_layer_keeps_valid_project_and_hotword_layers(
     service, project_root
 ):

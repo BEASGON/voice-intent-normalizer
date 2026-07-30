@@ -543,24 +543,33 @@ def _verify_payload(
     paths: StateRootLease, state: _CurrentState, *, repair: bool = True
 ) -> bytes:
     payload = _payload_file(state)
-    if not paths.available(payload) or not paths.exists(payload):
-        if not repair:
+    try:
+        if not paths.available(payload) or not paths.exists(payload):
             raise ValueError("authoritative payload is missing")
-        # The pointer is authoritative. If a crash happened after switching it
-        # but before payload cleanup completed, a matching validated cache can
-        # reconstruct the immutable payload without accepting stale bytes.
+        data = _read_regular_file(paths, payload, _MAX_DATA_BYTES, "payload")
+        if hashlib.sha256(data).hexdigest() != state.sha256:
+            raise ValueError("payload checksum mismatch")
+        _validate_hotword_jsonl(data)
+        return data
+    except (OSError, ValueError):
+        if not repair:
+            raise
+        # The pointer remains authoritative. A missing or damaged immutable
+        # payload can be reconstructed only from the exact checksum-matching
+        # materialized cache; unrelated readable raw bytes never gain authority.
         cached = _read_regular_file(
             paths, _hotword_file(), _MAX_DATA_BYTES, "hotword file"
         )
         if hashlib.sha256(cached).hexdigest() != state.sha256:
-            raise ValueError("authoritative payload is missing")
+            raise ValueError("raw hotword checksum does not match current pointer")
         _validate_hotword_jsonl(cached)
-        _write_bytes_atomic(paths, payload, cached)
-    data = _read_regular_file(paths, payload, _MAX_DATA_BYTES, "payload")
-    if hashlib.sha256(data).hexdigest() != state.sha256:
-        raise ValueError("payload checksum mismatch")
-    _validate_hotword_jsonl(data)
-    return data
+        if paths.available(payload):
+            _write_bytes_atomic(paths, payload, cached)
+            if _read_regular_file(
+                paths, payload, _MAX_DATA_BYTES, "payload"
+            ) != cached:
+                raise ValueError("recovered payload verification failed")
+        return cached
 
 
 def _materialize_current(paths: StateRootLease, state: _CurrentState) -> None:
@@ -696,6 +705,8 @@ def _cleanup_payloads(paths: StateRootLease, current: _CurrentState) -> None:
 
 def resolve_hotword_file(
     authority: StateRootLease | StatePaths,
+    *,
+    diagnostics: list[str] | None = None,
 ) -> bytes | None:
     """Return validated hotword bytes read under one retained directory lease.
 
@@ -706,45 +717,74 @@ def resolve_hotword_file(
     """
     try:
         if isinstance(authority, StateRootLease):
-            return _resolve_hotword_with_recovery(authority)
+            return _resolve_hotword_with_recovery(authority, diagnostics)
         paths = authority
         validate_state_root(paths.root)
         operation_now = datetime.now(timezone.utc)
         with _update_lock(paths) as locked_paths:
-            current = _recover_locked(locked_paths, operation_now)
-            if current is not None:
-                _verify_current_cache(locked_paths, current)
-                return _verify_payload(locked_paths, current)
-            if _is_regular_state_file(locked_paths, _hotword_file()):
-                data = _read_regular_file(
-                    locked_paths,
-                    _hotword_file(),
-                    _MAX_DATA_BYTES,
-                    "hotword file",
-                )
-                _validate_hotword_jsonl(data)
-                return data
+            return _resolve_hotword_locked(
+                locked_paths, diagnostics, operation_now
+            )
     except Exception:
         return None
     return None
 
 
-def _resolve_hotword_with_recovery(paths: StateRootLease) -> bytes | None:
+def _resolve_hotword_with_recovery(
+    paths: StateRootLease, diagnostics: list[str] | None = None
+) -> bytes | None:
     """Recover and resolve transaction state without releasing *paths*."""
-    if not paths.root_exists or not paths.available(_hotword_file()):
+    if not paths.root_exists:
         return None
-    if not paths.available(_payloads_dir()):
-        # A legacy raw cache can be read from the retained hotword directory,
-        # but transaction recovery cannot safely create an unretained payload
-        # directory after lease acquisition.
-        return _resolve_hotword_snapshot(paths)
     operation_now = datetime.now(timezone.utc)
     with _retained_lease_update_lock(paths):
+        return _resolve_hotword_locked(paths, diagnostics, operation_now)
+
+
+def _resolve_hotword_locked(
+    paths: StateRootLease,
+    diagnostics: list[str] | None,
+    operation_now: datetime,
+) -> bytes | None:
+    """Resolve authority while the caller holds the applicable updater lock."""
+    pointer_state, current, payload_invalid = _diagnose_pointer_payload(
+        paths, diagnostics
+    )
+    if current is not None and payload_invalid:
+        raw_fallback = _resolve_raw_hotword_snapshot(
+            paths,
+            diagnostics=diagnostics,
+            expected_sha256=current.sha256,
+        )
+        if raw_fallback is None:
+            return None
+        try:
+            recovered = _verify_payload(paths, current)
+        except (OSError, ValueError):
+            # Valid checksum-matching raw bytes remain safe to use even when a
+            # malformed payload path cannot be repaired in place.
+            return raw_fallback
+        if not paths.available(_payload_file(current)):
+            return recovered
+    try:
         current = _recover_locked(paths, operation_now)
-        if current is not None:
-            _verify_current_cache(paths, current)
-            return _verify_payload(paths, current)
-        return _resolve_hotword_snapshot(paths)
+    except (OSError, OverflowError, ValueError):
+        if pointer_state == "valid":
+            return None
+        if _transaction_payloads_present(paths):
+            if pointer_state == "missing":
+                _append_hotword_diagnostic(
+                    diagnostics, "hotword_transaction_invalid"
+                )
+            return None
+        return _resolve_raw_hotword_snapshot(paths, diagnostics=diagnostics)
+    if current is not None:
+        _verify_current_cache(paths, current)
+        return _verify_payload(paths, current)
+    if _transaction_payloads_present(paths):
+        _append_hotword_diagnostic(diagnostics, "hotword_transaction_invalid")
+        return None
+    return _resolve_raw_hotword_snapshot(paths, diagnostics=diagnostics)
 
 
 def _resolve_hotword_snapshot(paths: StateRootLease) -> bytes | None:
@@ -763,6 +803,60 @@ def _resolve_hotword_snapshot(paths: StateRootLease) -> bytes | None:
     )
     _validate_hotword_jsonl(data)
     return data
+
+
+def _diagnose_pointer_payload(
+    paths: StateRootLease, diagnostics: list[str] | None
+) -> tuple[str, _CurrentState | None, bool]:
+    """Inspect pointer authority before recovery can erase interruption evidence."""
+    if not paths.exists(_current_file()):
+        return "missing", None, False
+    try:
+        current = _read_current(paths)
+    except (OSError, OverflowError, ValueError):
+        _append_hotword_diagnostic(diagnostics, "hotword_state_invalid")
+        return "invalid", None, False
+    if current is None:
+        return "missing", None, False
+    try:
+        _verify_payload(paths, current, repair=False)
+    except (OSError, ValueError):
+        _append_hotword_diagnostic(diagnostics, "hotword_transaction_invalid")
+        return "valid", current, True
+    return "valid", current, False
+
+
+def _resolve_raw_hotword_snapshot(
+    paths: StateRootLease,
+    *,
+    diagnostics: list[str] | None,
+    expected_sha256: str | None = None,
+) -> bytes | None:
+    """Read optional raw bytes only after schema and optional authority checks."""
+    target = _hotword_file()
+    if not paths.exists(target):
+        return None
+    try:
+        if not _is_regular_state_file(paths, target):
+            raise ValueError("raw hotword cache must be a regular file")
+        data = _read_regular_file(paths, target, _MAX_DATA_BYTES, "hotword file")
+        _validate_hotword_jsonl(data)
+        if (
+            expected_sha256 is not None
+            and hashlib.sha256(data).hexdigest() != expected_sha256
+        ):
+            raise ValueError("raw hotword checksum does not match current pointer")
+        return data
+    except (OSError, ValueError):
+        _append_hotword_diagnostic(diagnostics, "hotword_invalid")
+        return None
+
+
+def _append_hotword_diagnostic(
+    diagnostics: list[str] | None, diagnostic: str
+) -> None:
+    if diagnostics is not None and diagnostic not in diagnostics:
+        diagnostics.append(diagnostic)
 
 
 def _record_failed_attempt(paths: StatePaths, now: datetime) -> None:
@@ -878,6 +972,92 @@ def _update_lock(
             if lease.captured_lock_key != lock_key:
                 raise OSError("state lock key changed during lease acquisition")
             yield lease
+
+
+@contextmanager
+def state_serialization_lock(
+    paths: StatePaths,
+    scope: str,
+    *,
+    retained_dirs: tuple[str | Path, ...],
+    timeout: float | None = None,
+) -> Iterator[StateRootLease]:
+    """Serialize one scoped state publication with Task 7's stable OS lease."""
+    if (
+        not isinstance(scope, str)
+        or not scope
+        or len(scope) > 256
+        or _CONTROL_PATTERN.search(scope)
+    ):
+        raise ValueError("state serialization scope is invalid")
+    validate_state_root(paths.root)
+    lock_key = state_root_lock_key(paths.root)
+    coordination_key = hashlib.sha256(
+        (lock_key + "\0" + scope).encode("utf-8")
+    ).hexdigest()
+    if os.name == "nt":
+        with _windows_scoped_state_mutex(
+            paths,
+            lock_key,
+            coordination_key,
+            retained_dirs,
+            timeout,
+        ) as lease:
+            yield lease
+        return
+    with _posix_control_lock(coordination_key, timeout):
+        with guard_state_root(
+            paths.root,
+            create=True,
+            retained_dirs=retained_dirs,
+            create_retained=True,
+        ) as lease:
+            if lease.captured_lock_key != lock_key:
+                raise OSError("state lock key changed during lease acquisition")
+            yield lease
+
+
+@contextmanager
+def _windows_scoped_state_mutex(
+    paths: StatePaths,
+    lock_key: str,
+    coordination_key: str,
+    retained_dirs: tuple[str | Path, ...],
+    timeout: float | None,
+) -> Iterator[StateRootLease]:
+    """Hold scoped path and identity mutexes around one retained state lease."""
+    kernel32 = _windows_mutex_api()
+    lease_timeout = _LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + lease_timeout
+    path_name = _windows_path_mutex_name_from_key(coordination_key)
+    with _acquire_windows_mutex_names(kernel32, (path_name,), timeout=lease_timeout):
+        validate_state_root(paths.root)
+        for attempt_number in range(_WINDOWS_IDENTITY_RETRIES):
+            remaining = max(0.0, deadline - time.monotonic())
+            with guard_state_root(
+                paths.root,
+                create=True,
+                retained_dirs=retained_dirs,
+                create_retained=True,
+            ) as lease:
+                if lease.captured_lock_key != lock_key:
+                    raise OSError("state lock key changed during lease acquisition")
+                identity = _windows_directory_identity(paths.root)
+                identity_name = _windows_identity_mutex_name(
+                    f"{coordination_key}:{identity}"
+                )
+                with _acquire_windows_mutex_names(
+                    kernel32, (identity_name,), timeout=remaining
+                ):
+                    validate_state_root(paths.root)
+                    if _windows_directory_identity(paths.root) == identity:
+                        yield lease
+                        return
+            if (
+                attempt_number + 1 >= _WINDOWS_IDENTITY_RETRIES
+                or time.monotonic() >= deadline
+            ):
+                raise OSError("Windows state path changed during lock acquisition")
 
 
 @contextmanager
