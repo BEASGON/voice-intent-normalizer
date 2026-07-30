@@ -7,6 +7,8 @@ import os
 import posixpath
 import stat
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 
@@ -16,20 +18,21 @@ def main() -> int:
     source = _trusted_source(repository / "src")
     _prioritize_source(source)
     expected_cli = _preflight_package(source)
-    _clear_preloaded_package()
-    from voice_intent_normalizer import cli
+    with _bytecode_isolation():
+        _clear_preloaded_package()
+        from voice_intent_normalizer import cli
 
-    if (
-        cli.__name__ != "voice_intent_normalizer.cli"
-        or not _same_native_file(cli.__file__, expected_cli)
-        or not _same_native_file(
-            None if cli.__spec__ is None else cli.__spec__.origin,
-            expected_cli,
-        )
-    ):
-        raise RuntimeError("trusted repository CLI could not be imported")
+        if (
+            cli.__name__ != "voice_intent_normalizer.cli"
+            or not _same_native_file(cli.__file__, expected_cli)
+            or not _same_native_file(
+                None if cli.__spec__ is None else cli.__spec__.origin,
+                expected_cli,
+            )
+        ):
+            raise RuntimeError("trusted repository CLI could not be imported")
 
-    return cli.main()
+        return cli.main()
 
 
 def _prioritize_source(source: Path) -> None:
@@ -51,10 +54,11 @@ def _trusted_source(source: Path) -> Path:
 def _preflight_package(source: Path) -> Path:
     package = source / "voice_intent_normalizer"
     _require_direct_directory(package)
+    _require_package_marker(package, "__init__.py")
+    expected_cli = _require_package_marker(package, "cli.py")
     pending = [(package, 0)]
     directories = 0
     python_files = 0
-    expected_cli: Path | None = None
     while pending:
         directory, depth = pending.pop()
         directories += 1
@@ -84,11 +88,23 @@ def _preflight_package(source: Path) -> Path:
             python_files += 1
             if python_files > 64:
                 raise RuntimeError("trusted repository package is too large")
-            if path == package / "cli.py":
-                expected_cli = path.resolve(strict=True)
-    if expected_cli is None:
-        raise RuntimeError("trusted repository CLI could not be imported")
     return expected_cli
+
+
+def _require_package_marker(package: Path, name: str) -> Path:
+    marker = package / name
+    try:
+        info = marker.lstat()
+    except OSError as exc:
+        raise RuntimeError("trusted repository package is unavailable") from exc
+    _require_direct_regular_file(marker, info)
+    try:
+        resolved = marker.resolve(strict=True)
+        trusted_package = package.resolve(strict=True)
+        resolved.relative_to(trusted_package)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("trusted repository package contains an alias") from exc
+    return resolved
 
 
 def _require_direct_directory(path: Path) -> None:
@@ -120,6 +136,39 @@ def _clear_preloaded_package() -> None:
             "voice_intent_normalizer."
         ):
             del sys.modules[name]
+
+
+@contextmanager
+def _bytecode_isolation():
+    original_prefix = sys.pycache_prefix
+    original_dont_write_bytecode = sys.dont_write_bytecode
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="voice-intent-bootstrap-")
+    except Exception:
+        raise RuntimeError("trusted repository import isolation unavailable") from None
+
+    body_failed = False
+    try:
+        cache = Path(temporary.name)
+        if not cache.is_dir():
+            raise RuntimeError("trusted repository import isolation unavailable")
+        sys.pycache_prefix = str(cache)
+        sys.dont_write_bytecode = True
+        try:
+            yield cache
+        except BaseException:
+            body_failed = True
+            raise
+    finally:
+        sys.pycache_prefix = original_prefix
+        sys.dont_write_bytecode = original_dont_write_bytecode
+        try:
+            temporary.cleanup()
+        except Exception:
+            if not body_failed:
+                raise RuntimeError(
+                    "trusted repository import isolation unavailable"
+                ) from None
 
 
 def _is_below(

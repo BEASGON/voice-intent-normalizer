@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import py_compile
 import shutil
 import subprocess
 import sys
@@ -411,6 +412,187 @@ def test_bootstrap_preflight_rejects_transitive_python_aliases_before_import(
 
     assert result.returncode != 0
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("bytecode_kind", ["unchecked", "symlink"])
+def test_bootstrap_does_not_execute_existing_cli_bytecode(
+    tmp_path, bytecode_kind
+):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def main():\n"
+        "    Path(os.environ['VOICE_INTENT_SOURCE_MARKER']).write_text('trusted')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    malicious_source = tmp_path / "malicious_cli.py"
+    malicious_source.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['VOICE_INTENT_EXTERNAL_MARKER']).write_text('malicious')\n"
+        "def main():\n    return 99\n",
+        encoding="utf-8",
+    )
+    cache = Path(importlib.util.cache_from_source(str(package / "cli.py")))
+    cache.parent.mkdir()
+    external_marker = tmp_path / "external-bytecode-ran"
+    source_marker = tmp_path / "source-ran"
+    if bytecode_kind == "unchecked":
+        py_compile.compile(
+            str(malicious_source),
+            cfile=str(cache),
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+    else:
+        external_pyc = tmp_path / "malicious_cli.pyc"
+        py_compile.compile(
+            str(malicious_source),
+            cfile=str(external_pyc),
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+        try:
+            cache.symlink_to(external_pyc)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+    environment = {
+        "PATH": str(Path(sys.executable).parent),
+        "VOICE_INTENT_EXTERNAL_MARKER": str(external_marker),
+        "VOICE_INTENT_SOURCE_MARKER": str(source_marker),
+    }
+    first = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    second = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert first.returncode == 0
+    assert second.returncode == 0
+    assert source_marker.read_text(encoding="utf-8") == "trusted"
+    assert not external_marker.exists()
+
+
+def test_bootstrap_rejects_missing_init_before_namespace_package_merges(tmp_path):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "cli.py").write_text(
+        "from . import helper\n\ndef main():\n    return 0\n", encoding="utf-8"
+    )
+    evil_root = tmp_path / "evil"
+    evil_package = evil_root / "voice_intent_normalizer"
+    evil_package.mkdir(parents=True)
+    marker = tmp_path / "namespace-helper-ran"
+    (evil_package / "helper.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['VOICE_INTENT_EXTERNAL_MARKER']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={
+            "PATH": str(Path(sys.executable).parent),
+            "PYTHONPATH": os.pathsep.join((str(evil_root),)),
+            "VOICE_INTENT_EXTERNAL_MARKER": str(marker),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_bytecode_isolation_restores_interpreter_flags_and_removes_cache(
+    bootstrap_module
+):
+    original_prefix = sys.pycache_prefix
+    original_flag = sys.dont_write_bytecode
+    with bootstrap_module._bytecode_isolation() as cache:
+        cache_path = Path(cache)
+        assert cache_path.is_dir()
+        assert sys.pycache_prefix == str(cache_path)
+        assert sys.dont_write_bytecode is True
+
+    assert sys.pycache_prefix == original_prefix
+    assert sys.dont_write_bytecode is original_flag
+    assert not cache_path.exists()
+
+
+def test_bytecode_isolation_hides_temporary_directory_failures(
+    bootstrap_module, monkeypatch
+):
+    class BrokenTemporaryDirectory:
+        def __init__(self, **kwargs):
+            raise OSError("secret temporary location")
+
+    monkeypatch.setattr(
+        bootstrap_module.tempfile,
+        "TemporaryDirectory",
+        BrokenTemporaryDirectory,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        with bootstrap_module._bytecode_isolation():
+            raise AssertionError("isolation must not yield")
+
+    assert str(exc_info.value) == "trusted repository import isolation unavailable"
+    assert "secret temporary location" not in str(exc_info.value)
+
+
+def test_bytecode_isolation_hides_cleanup_failures(
+    bootstrap_module, monkeypatch, tmp_path
+):
+    class BrokenTemporaryDirectory:
+        def __init__(self, **kwargs):
+            self.name = str(tmp_path / "private-cache")
+            Path(self.name).mkdir()
+
+        def cleanup(self):
+            raise OSError("secret temporary location")
+
+    original_prefix = sys.pycache_prefix
+    original_flag = sys.dont_write_bytecode
+    monkeypatch.setattr(
+        bootstrap_module.tempfile,
+        "TemporaryDirectory",
+        BrokenTemporaryDirectory,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        with bootstrap_module._bytecode_isolation():
+            pass
+
+    assert str(exc_info.value) == "trusted repository import isolation unavailable"
+    assert "secret temporary location" not in str(exc_info.value)
+    assert sys.pycache_prefix == original_prefix
+    assert sys.dont_write_bytecode is original_flag
 
 
 def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):
