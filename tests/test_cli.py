@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -459,6 +460,7 @@ def test_bootstrap_does_not_execute_existing_cli_bytecode(
             cache.symlink_to(external_pyc)
         except OSError as exc:
             pytest.skip(f"symlink unavailable: {exc}")
+    original_cache = cache.read_bytes()
 
     environment = {
         "PATH": str(Path(sys.executable).parent),
@@ -490,6 +492,7 @@ def test_bootstrap_does_not_execute_existing_cli_bytecode(
     assert second.returncode == 0
     assert source_marker.read_text(encoding="utf-8") == "trusted"
     assert not external_marker.exists()
+    assert cache.read_bytes() == original_cache
 
 
 def test_bootstrap_rejects_missing_init_before_namespace_package_merges(tmp_path):
@@ -529,6 +532,91 @@ def test_bootstrap_rejects_missing_init_before_namespace_package_merges(tmp_path
     assert not marker.exists()
 
 
+def test_bootstrap_rejects_cli_extension_before_native_loader_runs(tmp_path):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def main():\n"
+        "    Path(os.environ['VOICE_INTENT_SOURCE_MARKER']).write_text('trusted')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    extension = package / f"cli{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    extension.write_bytes(b"not a native module")
+    marker = tmp_path / "source-ran"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={
+            "PATH": str(Path(sys.executable).parent),
+            "VOICE_INTENT_SOURCE_MARKER": str(marker),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert "DLL load failed" not in result.stderr
+
+
+def test_bootstrap_rejects_helper_extension_before_cli_import(tmp_path):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "from . import helper\n\ndef main():\n    return 0\n", encoding="utf-8"
+    )
+    extension = package / f"helper{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    extension.write_bytes(b"not a native module")
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={"PATH": str(Path(sys.executable).parent)},
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+    assert "DLL load failed" not in result.stderr
+
+
+@pytest.mark.parametrize("artifact", ["cli.pyc", "helper.pyo"])
+def test_bootstrap_rejects_top_level_sourceless_bytecode(tmp_path, artifact):
+    repository, script = _bootstrap_test_repository(tmp_path)
+    package = repository / "src" / "voice_intent_normalizer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    (package / artifact).write_bytes(b"sourceless bytecode")
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor"],
+        cwd=tmp_path,
+        env={"PATH": str(Path(sys.executable).parent)},
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+
+
 def test_bytecode_isolation_restores_interpreter_flags_and_removes_cache(
     bootstrap_module
 ):
@@ -536,7 +624,7 @@ def test_bytecode_isolation_restores_interpreter_flags_and_removes_cache(
     original_flag = sys.dont_write_bytecode
     with bootstrap_module._bytecode_isolation() as cache:
         cache_path = Path(cache)
-        assert cache_path.is_dir()
+        assert not cache_path.exists()
         assert sys.pycache_prefix == str(cache_path)
         assert sys.dont_write_bytecode is True
 
@@ -545,17 +633,16 @@ def test_bytecode_isolation_restores_interpreter_flags_and_removes_cache(
     assert not cache_path.exists()
 
 
-def test_bytecode_isolation_hides_temporary_directory_failures(
+def test_bytecode_isolation_hides_temporary_directory_creation_failures(
     bootstrap_module, monkeypatch
 ):
-    class BrokenTemporaryDirectory:
-        def __init__(self, **kwargs):
-            raise OSError("secret temporary location")
+    def broken_mkdtemp(**kwargs):
+        raise OSError("secret temporary location")
 
     monkeypatch.setattr(
         bootstrap_module.tempfile,
-        "TemporaryDirectory",
-        BrokenTemporaryDirectory,
+        "mkdtemp",
+        broken_mkdtemp,
     )
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -566,24 +653,25 @@ def test_bytecode_isolation_hides_temporary_directory_failures(
     assert "secret temporary location" not in str(exc_info.value)
 
 
-def test_bytecode_isolation_hides_cleanup_failures(
+def test_bytecode_isolation_hides_cache_removal_failures(
     bootstrap_module, monkeypatch, tmp_path
 ):
-    class BrokenTemporaryDirectory:
-        def __init__(self, **kwargs):
-            self.name = str(tmp_path / "private-cache")
-            Path(self.name).mkdir()
+    cache = tmp_path / "private-cache"
+    cache.mkdir()
+    native_rmdir = os.rmdir
 
-        def cleanup(self):
-            raise OSError("secret temporary location")
+    def remove_then_fail(path):
+        native_rmdir(path)
+        raise OSError("secret temporary location")
 
     original_prefix = sys.pycache_prefix
     original_flag = sys.dont_write_bytecode
     monkeypatch.setattr(
         bootstrap_module.tempfile,
-        "TemporaryDirectory",
-        BrokenTemporaryDirectory,
+        "mkdtemp",
+        lambda **kwargs: str(cache),
     )
+    monkeypatch.setattr(bootstrap_module.os, "rmdir", remove_then_fail)
 
     with pytest.raises(RuntimeError) as exc_info:
         with bootstrap_module._bytecode_isolation():
@@ -593,6 +681,21 @@ def test_bytecode_isolation_hides_cleanup_failures(
     assert "secret temporary location" not in str(exc_info.value)
     assert sys.pycache_prefix == original_prefix
     assert sys.dont_write_bytecode is original_flag
+    assert not cache.exists()
+
+
+def test_bytecode_isolation_restores_flags_after_body_failure(bootstrap_module):
+    original_prefix = sys.pycache_prefix
+    original_flag = sys.dont_write_bytecode
+    with pytest.raises(ValueError, match="body failure"):
+        with bootstrap_module._bytecode_isolation() as cache:
+            cache_path = Path(cache)
+            assert not cache_path.exists()
+            raise ValueError("body failure")
+
+    assert sys.pycache_prefix == original_prefix
+    assert sys.dont_write_bytecode is original_flag
+    assert not cache_path.exists()
 
 
 def test_runtime_value_error_degrades_instead_of_becoming_validation_error(tmp_path):

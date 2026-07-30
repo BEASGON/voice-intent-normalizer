@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import ntpath
 import os
 import posixpath
@@ -80,6 +81,13 @@ def _preflight_package(source: Path) -> Path:
                 if path.name != "__pycache__":
                     pending.append((path, depth + 1))
                 continue
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError("trusted repository package contains an alias")
+            if path.suffix in {".pyc", ".pyo"} or any(
+                path.name.endswith(suffix)
+                for suffix in importlib.machinery.EXTENSION_SUFFIXES
+            ):
+                raise RuntimeError("trusted repository package contains an alias")
             if path.suffix != ".py":
                 continue
             _require_direct_regular_file(path, info)
@@ -143,32 +151,20 @@ def _bytecode_isolation():
     original_prefix = sys.pycache_prefix
     original_dont_write_bytecode = sys.dont_write_bytecode
     try:
-        temporary = tempfile.TemporaryDirectory(prefix="voice-intent-bootstrap-")
+        cache = Path(tempfile.mkdtemp(prefix="voice-intent-bootstrap-"))
+        os.rmdir(cache)
+        if cache.exists():
+            raise OSError("private cache path still exists")
     except Exception:
         raise RuntimeError("trusted repository import isolation unavailable") from None
 
-    body_failed = False
     try:
-        cache = Path(temporary.name)
-        if not cache.is_dir():
-            raise RuntimeError("trusted repository import isolation unavailable")
         sys.pycache_prefix = str(cache)
         sys.dont_write_bytecode = True
-        try:
-            yield cache
-        except BaseException:
-            body_failed = True
-            raise
+        yield cache
     finally:
         sys.pycache_prefix = original_prefix
         sys.dont_write_bytecode = original_dont_write_bytecode
-        try:
-            temporary.cleanup()
-        except Exception:
-            if not body_failed:
-                raise RuntimeError(
-                    "trusted repository import isolation unavailable"
-                ) from None
 
 
 def _is_below(
