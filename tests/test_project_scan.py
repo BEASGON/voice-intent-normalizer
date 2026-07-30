@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -147,6 +148,42 @@ def test_scanner_rejects_a_symlink_supplied_as_the_project_root(tmp_path):
 
     assert result.entries == ()
     assert result.files_scanned == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction regression")
+def test_scanner_ignores_junction_name_content_and_external_fingerprint(tmp_path):
+    """Catch Windows junctions contributing names or traversing external state."""
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "ExternalSecretTerm.py"
+    secret.write_text("class ExternalPrivateThing:\n", encoding="utf-8")
+    junction = project / "PrivateJunctionName"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"cannot create Windows junction: {created.stderr}")
+    state_paths = _state_paths(tmp_path)
+
+    result = scan_project(project, state_paths)
+    canonicals = {entry.canonical for entry in result.entries}
+
+    assert "PrivateJunctionName" not in canonicals
+    assert "ExternalSecretTerm" not in canonicals
+    assert "ExternalPrivateThing" not in canonicals
+    assert result.files_scanned == 0
+    assert project_cache_is_stale(project, state_paths) is False
+
+    secret.write_text(
+        "class MutatedExternalPrivateThing:\n" * 3, encoding="utf-8"
+    )
+
+    assert project_cache_is_stale(project, state_paths) is False
 
 
 def test_scanner_never_opens_file_replaced_by_symlink_after_checks(

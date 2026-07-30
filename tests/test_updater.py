@@ -723,6 +723,56 @@ def test_direct_resolver_uses_exact_raw_when_payload_path_cannot_be_repaired(
     assert diagnostics == ["hotword_transaction_invalid"]
 
 
+@pytest.mark.parametrize("resolver_form", ("paths", "lease"))
+@pytest.mark.parametrize(
+    ("raw_state", "expected_diagnostics"),
+    (
+        ("missing", []),
+        ("valid", []),
+        ("mismatched", ["hotword_invalid"]),
+        ("directory", ["hotword_invalid"]),
+    ),
+)
+def test_valid_payload_authority_survives_every_secondary_raw_state(
+    tmp_path, resolver_form, raw_state, expected_diagnostics
+):
+    """Catch secondary raw cache health disabling a verified immutable payload."""
+    paths = paths_for(tmp_path)
+    data = hotword_data(canonical="Immutable authority")
+    assert update_hotwords(paths, MANIFEST_URL, transport_for(data), NOW).status is (
+        UpdateStatus.UPDATED
+    )
+    if raw_state != "valid":
+        paths.hotwords_file.unlink()
+    if raw_state == "mismatched":
+        paths.hotwords_file.write_bytes(
+            hotword_data(canonical="Mismatched secondary cache")
+        )
+    elif raw_state == "directory":
+        paths.hotwords_file.mkdir()
+    diagnostics: list[str] = []
+
+    if resolver_form == "paths":
+        resolved = updater_module.resolve_hotword_file(
+            paths, diagnostics=diagnostics
+        )
+    else:
+        with guard_state_root(
+            paths.root,
+            retained_dirs=("hotwords", "hotwords/payloads"),
+        ) as lease:
+            resolved = updater_module.resolve_hotword_file(
+                lease, diagnostics=diagnostics
+            )
+
+    assert resolved == data
+    assert diagnostics == expected_diagnostics
+    if raw_state == "directory":
+        assert paths.hotwords_file.is_dir()
+    else:
+        assert paths.hotwords_file.read_bytes() == data
+
+
 def test_pointerless_corrupt_cache_falls_back_to_builtin_lexicon(tmp_path):
     paths = paths_for(tmp_path)
     paths.hotwords_file.parent.mkdir(parents=True)

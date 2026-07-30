@@ -575,24 +575,26 @@ def _verify_payload(
 def _materialize_current(paths: StateRootLease, state: _CurrentState) -> None:
     data = _verify_payload(paths, state)
     target = _hotword_file()
-    if (
-        paths.exists(target)
-        and _read_regular_file(
-            paths, target, _MAX_DATA_BYTES, "hotword file"
-        )
-        == data
-    ):
+    try:
+        if (
+            paths.exists(target)
+            and _read_regular_file(
+                paths, target, _MAX_DATA_BYTES, "hotword file"
+            )
+            == data
+        ):
+            return
+        _write_bytes_atomic(paths, target, data)
+    except (OSError, ValueError):
+        # The raw file is a repairable secondary cache. A non-regular or
+        # otherwise unreplaceable path never revokes verified pointer payload.
         return
-    _write_bytes_atomic(paths, target, data)
 
 
 def _verify_current_cache(paths: StateRootLease, state: _CurrentState) -> None:
     if _read_current(paths) != state:
         raise ValueError("current pointer verification failed")
-    if _read_regular_file(
-        paths, _hotword_file(), _MAX_DATA_BYTES, "hotword file"
-    ) != _verify_payload(paths, state):
-        raise ValueError("hotword cache verification failed")
+    _verify_payload(paths, state)
 
 
 def _write_current(paths: StateRootLease, state: _CurrentState) -> None:
@@ -808,22 +810,54 @@ def _resolve_hotword_snapshot(paths: StateRootLease) -> bytes | None:
 def _diagnose_pointer_payload(
     paths: StateRootLease, diagnostics: list[str] | None
 ) -> tuple[str, _CurrentState | None, bool]:
-    """Inspect pointer authority before recovery can erase interruption evidence."""
-    if not paths.exists(_current_file()):
-        return "missing", None, False
+    """Inspect pointer, payload, and raw state before recovery erases evidence."""
+    pointer_state = "missing"
+    current: _CurrentState | None = None
+    payload_invalid = False
+    if paths.exists(_current_file()):
+        try:
+            current = _read_current(paths)
+        except (OSError, OverflowError, ValueError):
+            _append_hotword_diagnostic(diagnostics, "hotword_state_invalid")
+            pointer_state = "invalid"
+        else:
+            if current is not None:
+                pointer_state = "valid"
+                try:
+                    _verify_payload(paths, current, repair=False)
+                except (OSError, ValueError):
+                    _append_hotword_diagnostic(
+                        diagnostics, "hotword_transaction_invalid"
+                    )
+                    payload_invalid = True
+    _diagnose_raw_hotword(
+        paths,
+        diagnostics,
+        expected_sha256=current.sha256 if current is not None else None,
+    )
+    return pointer_state, current, payload_invalid
+
+
+def _diagnose_raw_hotword(
+    paths: StateRootLease,
+    diagnostics: list[str] | None,
+    *,
+    expected_sha256: str | None,
+) -> None:
+    """Record invalid secondary raw state without changing its authority."""
+    target = _hotword_file()
+    if not paths.exists(target):
+        return
     try:
-        current = _read_current(paths)
-    except (OSError, OverflowError, ValueError):
-        _append_hotword_diagnostic(diagnostics, "hotword_state_invalid")
-        return "invalid", None, False
-    if current is None:
-        return "missing", None, False
-    try:
-        _verify_payload(paths, current, repair=False)
+        data = _read_regular_file(paths, target, _MAX_DATA_BYTES, "hotword file")
+        _validate_hotword_jsonl(data)
+        if (
+            expected_sha256 is not None
+            and hashlib.sha256(data).hexdigest() != expected_sha256
+        ):
+            raise ValueError("raw hotword checksum does not match current pointer")
     except (OSError, ValueError):
-        _append_hotword_diagnostic(diagnostics, "hotword_transaction_invalid")
-        return "valid", current, True
-    return "valid", current, False
+        _append_hotword_diagnostic(diagnostics, "hotword_invalid")
 
 
 def _resolve_raw_hotword_snapshot(

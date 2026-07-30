@@ -311,6 +311,60 @@ def test_valid_pointer_can_use_exact_raw_when_corrupt_payload_path_is_unrepairab
     assert "hotword_invalid" not in diagnostics
 
 
+@pytest.mark.parametrize(
+    ("raw_state", "expected_diagnostics"),
+    (
+        ("missing", ()),
+        ("valid", ()),
+        ("mismatched", ("hotword_invalid",)),
+        ("directory", ("hotword_invalid",)),
+    ),
+)
+def test_lexicon_keeps_valid_payload_authority_for_every_secondary_raw_state(
+    tmp_path, raw_state, expected_diagnostics
+):
+    """Catch LexiconSet treating a raw materialization cache as authoritative."""
+    paths = StatePaths.resolve(environ={}, home=tmp_path / "home")
+    authoritative = _raw_entry(
+        canonical="ImmutableLexiconAuthority",
+        scope="hot",
+        aliases=["authority"],
+    )
+    data = (json.dumps(authoritative) + "\n").encode()
+    raw: bytes | None
+    if raw_state == "valid":
+        raw = data
+    elif raw_state == "mismatched":
+        raw = (
+            json.dumps(
+                _raw_entry(
+                    canonical="MismatchedSecondary",
+                    scope="hot",
+                    aliases=["secondary"],
+                )
+            )
+            + "\n"
+        ).encode()
+    else:
+        raw = None
+    _write_hotword_pointer(paths, authoritative, payload=data, raw=raw)
+    if raw_state == "directory":
+        paths.hotwords_file.mkdir()
+
+    lexicons, diagnostics = LexiconSet.load_with_diagnostics(
+        paths, tmp_path / "builtins"
+    )
+
+    assert [entry.canonical for entry in lexicons.entries] == [
+        "ImmutableLexiconAuthority"
+    ]
+    assert diagnostics == expected_diagnostics
+    if raw_state == "directory":
+        assert paths.hotwords_file.is_dir()
+    else:
+        assert paths.hotwords_file.read_bytes() == data
+
+
 @pytest.mark.parametrize("payload", (None, b"corrupt immutable payload\n"))
 def test_valid_pointer_never_loads_mismatched_raw_fallback(tmp_path, payload):
     """Catch readable raw bytes overriding the valid pointer's checksum authority."""

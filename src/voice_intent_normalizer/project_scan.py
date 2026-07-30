@@ -440,28 +440,25 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
     while pending and not truncated:
         directory = pending.pop()
         try:
-            children, overflow = _bounded_children(directory)
+            children, overflow = _bounded_directory_entries(directory)
         except OSError:
             continue
         if overflow:
             truncated = True
             break
         directories: list[Path] = []
-        for path in children:
+        for path, info in children:
             entries_seen += 1
             if entries_seen > max_entries:
                 truncated = True
                 break
-            if path.is_symlink():
-                continue
-            if path.is_dir():
+            if stat.S_ISDIR(info.st_mode):
                 if (
                     path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
                     and not _is_private_name(path.name)
                 ):
                     # Directory names are scanner input too: they can produce
                     # project candidates even when they contain no files.
-                    info = path.stat()
                     records.append(
                         (
                             _relative_source(root, path) + "/",
@@ -471,15 +468,11 @@ def _project_fingerprint(root: Path, *, max_files: int) -> str:
                     )
                     directories.append(path)
                 continue
-            if not path.is_file() or not _is_allowed_text_file(path):
+            if not stat.S_ISREG(info.st_mode) or not _is_allowed_text_file(path):
                 continue
             if files_seen >= max_files:
                 truncated = True
                 break
-            try:
-                info = path.stat()
-            except OSError:
-                continue
             files_seen += 1
             records.append(
                 (_relative_source(root, path), info.st_size, info.st_mtime_ns)
@@ -504,21 +497,19 @@ def _scan_once(
     while pending and not truncated:
         directory = pending.pop()
         try:
-            children, overflow = _bounded_children(directory)
+            children, overflow = _bounded_directory_entries(directory)
         except OSError:
             continue
         if overflow:
             truncated = True
             break
         directories: list[Path] = []
-        for path in children:
+        for path, info in children:
             entries_seen += 1
             if entries_seen > max_entries:
                 truncated = True
                 break
-            if path.is_symlink():
-                continue
-            if path.is_dir():
+            if stat.S_ISDIR(info.st_mode):
                 if (
                     path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
                     and not _is_private_name(path.name)
@@ -527,7 +518,7 @@ def _scan_once(
                     _add_stem(observations, path.name, source, "directory-stem")
                     directories.append(path)
                 continue
-            if not path.is_file() or not _is_allowed_text_file(path):
+            if not stat.S_ISREG(info.st_mode) or not _is_allowed_text_file(path):
                 continue
             if files_scanned >= max_files or max_text_bytes - text_bytes_scanned <= 0:
                 truncated = True
@@ -732,14 +723,35 @@ def _read_descriptor_limited(descriptor: int, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def _bounded_children(directory: Path) -> tuple[list[Path], bool]:
+def _bounded_directory_entries(
+    directory: Path,
+) -> tuple[list[tuple[Path, os.stat_result]], bool]:
+    """Return bounded direct entries after discarding links/reparse points."""
     iterator = directory.iterdir()
-    children: list[Path] = []
+    children: list[tuple[Path, os.stat_result]] = []
+    entries_seen = 0
     for child in iterator:
-        children.append(child)
-        if len(children) > _MAX_DIRECTORY_ENTRIES:
+        entries_seen += 1
+        if entries_seen > _MAX_DIRECTORY_ENTRIES:
             return [], True
-    return sorted(children, key=lambda path: (path.name.casefold(), path.name)), False
+        try:
+            info = child.lstat()
+        except OSError:
+            continue
+        attributes = getattr(info, "st_file_attributes", 0)
+        if stat.S_ISLNK(info.st_mode) or (
+            type(attributes) is int
+            and attributes & _WINDOWS_REPARSE_POINT
+        ):
+            continue
+        children.append((child, info))
+    return (
+        sorted(
+            children,
+            key=lambda entry: (entry[0].name.casefold(), entry[0].name),
+        ),
+        False,
+    )
 
 
 def _tree_entry_budget(max_files: int) -> int:
