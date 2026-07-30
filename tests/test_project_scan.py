@@ -20,6 +20,52 @@ def _state_paths(tmp_path):
     return StatePaths.resolve(environ={}, home=tmp_path / "home")
 
 
+def _create_windows_junction(link: Path, target: Path) -> None:
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"cannot create Windows junction: {created.stderr}")
+
+
+def _swap_directory_before_lexical_enumeration(
+    monkeypatch, queued: Path, target: Path
+) -> dict[str, bool]:
+    """Replace *queued* exactly when a path-only walker tries to enumerate it."""
+    real_iterdir = Path.iterdir
+    real_scandir = os.scandir
+    outcome = {"attempted": False, "denied": False, "swapped": False}
+
+    def attempt_swap() -> None:
+        if outcome["attempted"]:
+            return
+        outcome["attempted"] = True
+        try:
+            queued.rmdir()
+        except OSError:
+            outcome["denied"] = True
+            return
+        _create_windows_junction(queued, target)
+        outcome["swapped"] = True
+
+    def guarded_iterdir(path):
+        if path == queued:
+            attempt_swap()
+        return real_iterdir(path)
+
+    def guarded_scandir(path=None):
+        if not isinstance(path, int) and path is not None and Path(path) == queued:
+            attempt_swap()
+        return real_scandir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+    return outcome
+
+
 def _child_publish_scan_with_delayed_generation(
     state_root: str,
     project_root: str,
@@ -160,14 +206,7 @@ def test_scanner_ignores_junction_name_content_and_external_fingerprint(tmp_path
     secret = outside / "ExternalSecretTerm.py"
     secret.write_text("class ExternalPrivateThing:\n", encoding="utf-8")
     junction = project / "PrivateJunctionName"
-    created = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if created.returncode != 0:
-        pytest.skip(f"cannot create Windows junction: {created.stderr}")
+    _create_windows_junction(junction, outside)
     state_paths = _state_paths(tmp_path)
 
     result = scan_project(project, state_paths)
@@ -184,6 +223,160 @@ def test_scanner_ignores_junction_name_content_and_external_fingerprint(tmp_path
     )
 
     assert project_cache_is_stale(project, state_paths) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows queued-directory regression")
+def test_fingerprint_retains_direct_child_before_later_enumeration(
+    tmp_path, monkeypatch
+):
+    """Catch a queued child being replaced before fingerprint enumeration."""
+    project = tmp_path / "project"
+    project.mkdir()
+    queued = project / "QueuedChild"
+    queued.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external = outside / "ExternalDirectoryName"
+    external.mkdir()
+    secret = external / "ExternalSecretTerm.py"
+    secret.write_text("class ExternalPrivateThing:\n", encoding="utf-8")
+    outcome = _swap_directory_before_lexical_enumeration(
+        monkeypatch, queued, outside
+    )
+
+    before = project_scan_module._project_fingerprint(project, max_files=5_000)
+    secret.write_text(
+        "class MutatedExternalPrivateThing:\n" * 3, encoding="utf-8"
+    )
+    after = project_scan_module._project_fingerprint(project, max_files=5_000)
+
+    assert outcome["attempted"]
+    assert outcome["denied"] or not outcome["swapped"]
+    assert before == after
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows queued-directory regression")
+def test_scan_retains_nested_child_before_junction_chain_walk(
+    tmp_path, monkeypatch
+):
+    """Catch a nested queued child being replaced by an external junction chain."""
+    project = tmp_path / "project"
+    queued = project / "Parent" / "QueuedChild"
+    queued.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    external = outside / "ExternalDirectoryName"
+    external.mkdir(parents=True)
+    (external / "ExternalSecretTerm.py").write_text(
+        "class ExternalPrivateThing:\n", encoding="utf-8"
+    )
+    chain_target = tmp_path / "chain-target"
+    chain_secret = chain_target / "ChainSecretDirectory"
+    chain_secret.mkdir(parents=True)
+    _create_windows_junction(outside / "SecondHop", chain_target)
+    outcome = _swap_directory_before_lexical_enumeration(
+        monkeypatch, queued, outside
+    )
+
+    result = project_scan_module._scan_once(
+        project, "0" * 16, max_files=5_000, max_text_bytes=2_000_000
+    )
+
+    canonicals = {entry.canonical for entry in result.entries}
+    assert outcome["attempted"]
+    assert outcome["denied"] or not outcome["swapped"]
+    assert {"Parent", "QueuedChild"} <= canonicals
+    assert "ExternalDirectoryName" not in canonicals
+    assert "ExternalSecretTerm" not in canonicals
+    assert "ExternalPrivateThing" not in canonicals
+    assert "ChainSecretDirectory" not in canonicals
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained-handle cleanup")
+def test_scanner_closes_queued_directory_handles_on_file_limit(tmp_path):
+    """Catch a truncated traversal leaking handles that block later renames."""
+    project = tmp_path / "project"
+    first = project / "First"
+    pending = project / "Pending"
+    first.mkdir(parents=True)
+    pending.mkdir()
+    (first / "a.py").write_text("class FirstTerm:\n", encoding="utf-8")
+    (first / "b.py").write_text("class SecondTerm:\n", encoding="utf-8")
+    (pending / "untouched.py").write_text(
+        "class PendingTerm:\n", encoding="utf-8"
+    )
+
+    result = project_scan_module._scan_once(
+        project, "0" * 16, max_files=1, max_text_bytes=2_000_000
+    )
+    renamed = project / "RenamedPending"
+    pending.rename(renamed)
+
+    assert result.truncated is True
+    assert renamed.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained-handle cleanup")
+def test_scanner_closes_newly_queued_handles_on_unexpected_error(
+    tmp_path, monkeypatch
+):
+    """Catch an exception between child acquisition and queue transfer leaking it."""
+    project = tmp_path / "project"
+    queued = project / "AQueued"
+    queued.mkdir(parents=True)
+    trigger = project / "ZTrigger.py"
+    trigger.write_text("class TriggerTerm:\n", encoding="utf-8")
+    real_allowed = project_scan_module._is_allowed_text_file
+
+    def fail_after_child_acquisition(path):
+        if path == trigger:
+            raise RuntimeError("injected traversal failure")
+        return real_allowed(path)
+
+    monkeypatch.setattr(
+        project_scan_module,
+        "_is_allowed_text_file",
+        fail_after_child_acquisition,
+    )
+
+    with pytest.raises(RuntimeError, match="injected traversal failure"):
+        project_scan_module._scan_once(
+            project, "0" * 16, max_files=5_000, max_text_bytes=2_000_000
+        )
+    renamed = project / "RenamedAfterError"
+    queued.rename(renamed)
+
+    assert renamed.is_dir()
+
+
+def test_scanner_skips_one_descriptor_read_error_and_continues(
+    tmp_path, monkeypatch
+):
+    """Catch retained traversal turning one unreadable file into scan failure."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "a-bad.py").write_text("class UnreadableTerm:\n", encoding="utf-8")
+    (project / "z-good.py").write_text("class ReadableTerm:\n", encoding="utf-8")
+    real_read = project_scan_module._read_descriptor_limited
+    calls = 0
+
+    def fail_first_read(descriptor, limit):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected read failure")
+        return real_read(descriptor, limit)
+
+    monkeypatch.setattr(
+        project_scan_module, "_read_descriptor_limited", fail_first_read
+    )
+
+    result = project_scan_module._scan_once(
+        project, "0" * 16, max_files=5_000, max_text_bytes=2_000_000
+    )
+
+    assert calls == 2
+    assert "ReadableTerm" in {entry.canonical for entry in result.entries}
+    assert result.files_scanned == 1
 
 
 def test_scanner_never_opens_file_replaced_by_symlink_after_checks(

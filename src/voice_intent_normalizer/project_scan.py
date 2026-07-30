@@ -10,6 +10,7 @@ import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 from .lexicon import _entry_data, load_jsonl_bytes
@@ -137,6 +138,40 @@ class ScanResult:
     text_bytes_scanned: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectMetadata:
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectSource:
+    source: str
+    name: str
+    is_directory: bool
+    metadata: _ProjectMetadata
+    content: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectSnapshot:
+    sources: tuple[_ProjectSource, ...]
+    truncated: bool
+    files_scanned: int
+    text_bytes_scanned: int
+
+
+@dataclass(slots=True)
+class _RetainedProjectHandle:
+    path: Path
+    relative: Path
+    descriptor: int
+    is_directory: bool
+    metadata: _ProjectMetadata
+    identity: tuple[int, int]
+    root_key: str | None = None
+
+
 def _is_private_name(name: str) -> bool:
     """Return whether *name* is hidden or conventionally stores credentials."""
     lowered = name.casefold()
@@ -152,11 +187,6 @@ def _is_allowed_text_file(path: Path) -> bool:
     return (
         not _is_private_name(path.name) and path.suffix.casefold() in _TEXT_EXTENSIONS
     )
-
-
-def _relative_source(root: Path, path: Path) -> str:
-    """Return a portable, project-relative source location."""
-    return path.relative_to(root).as_posix()
 
 
 def _add_stem(
@@ -432,54 +462,17 @@ def _append_scan_diagnostic(diagnostics: list[str] | None) -> None:
 
 def _project_fingerprint(root: Path, *, max_files: int) -> str:
     """Hash bounded metadata only; source content never enters state."""
-    records: list[tuple[str, int, int]] = []
-    pending = [root]
-    files_seen = entries_seen = 0
-    max_entries = _tree_entry_budget(max_files)
-    truncated = False
-    while pending and not truncated:
-        directory = pending.pop()
-        try:
-            children, overflow = _bounded_directory_entries(directory)
-        except OSError:
-            continue
-        if overflow:
-            truncated = True
-            break
-        directories: list[Path] = []
-        for path, info in children:
-            entries_seen += 1
-            if entries_seen > max_entries:
-                truncated = True
-                break
-            if stat.S_ISDIR(info.st_mode):
-                if (
-                    path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
-                    and not _is_private_name(path.name)
-                ):
-                    # Directory names are scanner input too: they can produce
-                    # project candidates even when they contain no files.
-                    records.append(
-                        (
-                            _relative_source(root, path) + "/",
-                            info.st_size,
-                            info.st_mtime_ns,
-                        )
-                    )
-                    directories.append(path)
-                continue
-            if not stat.S_ISREG(info.st_mode) or not _is_allowed_text_file(path):
-                continue
-            if files_seen >= max_files:
-                truncated = True
-                break
-            files_seen += 1
-            records.append(
-                (_relative_source(root, path), info.st_size, info.st_mtime_ns)
-            )
-        pending.extend(reversed(directories))
+    snapshot = _secure_project_snapshot(root, max_files, None)
+    records = [
+        (
+            source.source + ("/" if source.is_directory else ""),
+            source.metadata.size,
+            source.metadata.mtime_ns,
+        )
+        for source in snapshot.sources
+    ]
     payload = json.dumps(
-        {"records": records, "truncated": truncated},
+        {"records": records, "truncated": snapshot.truncated},
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -490,143 +483,479 @@ def _scan_once(
     root: Path, project_id: str, max_files: int, max_text_bytes: int
 ) -> ScanResult:
     observations: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
-    pending = [root]
-    files_scanned = text_bytes_scanned = entries_seen = 0
-    truncated = False
-    max_entries = _tree_entry_budget(max_files)
-    while pending and not truncated:
-        directory = pending.pop()
-        try:
-            children, overflow = _bounded_directory_entries(directory)
-        except OSError:
+    snapshot = _secure_project_snapshot(root, max_files, max_text_bytes)
+    for source in snapshot.sources:
+        if source.is_directory:
+            _add_stem(
+                observations,
+                source.name,
+                source.source,
+                "directory-stem",
+            )
             continue
-        if overflow:
-            truncated = True
-            break
-        directories: list[Path] = []
-        for path, info in children:
-            entries_seen += 1
-            if entries_seen > max_entries:
-                truncated = True
-                break
-            if stat.S_ISDIR(info.st_mode):
-                if (
-                    path.name.casefold() not in _EXCLUDED_DIRECTORY_NAMES
-                    and not _is_private_name(path.name)
-                ):
-                    source = _relative_source(root, path)
-                    _add_stem(observations, path.name, source, "directory-stem")
-                    directories.append(path)
-                continue
-            if not stat.S_ISREG(info.st_mode) or not _is_allowed_text_file(path):
-                continue
-            if files_scanned >= max_files or max_text_bytes - text_bytes_scanned <= 0:
-                truncated = True
-                break
-            remaining = max_text_bytes - text_bytes_scanned
-            try:
-                content_bytes = _read_project_file(
-                    root, path, remaining + 1
-                )
-            except (OSError, ValueError):
-                continue
-            if len(content_bytes) > remaining:
-                truncated = True
-                break
-            files_scanned += 1
-            text_bytes_scanned += len(content_bytes)
-            if b"\0" in content_bytes:
-                continue
-            try:
-                content = content_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            source = _relative_source(root, path)
-            _add_stem(observations, path.stem, source, "file-stem")
-            _extract_text_terms(content, source, observations)
-        pending.extend(reversed(directories))
+        content_bytes = source.content
+        if content_bytes is None or b"\0" in content_bytes:
+            continue
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        _add_stem(
+            observations,
+            Path(source.name).stem,
+            source.source,
+            "file-stem",
+        )
+        _extract_text_terms(content, source.source, observations)
     return ScanResult(
         _entries_from_observations(observations, project_id),
+        snapshot.truncated,
+        snapshot.files_scanned,
+        snapshot.text_bytes_scanned,
+    )
+
+
+def _secure_project_snapshot(
+    root: Path,
+    max_files: int,
+    max_text_bytes: int | None,
+) -> _ProjectSnapshot:
+    """Walk a bounded project through retained no-follow directory authority."""
+    try:
+        root_handle = _open_retained_project_root(root)
+    except (OSError, ValueError):
+        return _ProjectSnapshot((), False, 0, 0)
+    pending = [root_handle]
+    sources: list[_ProjectSource] = []
+    files_selected = files_scanned = text_bytes_scanned = entries_seen = 0
+    max_entries = _tree_entry_budget(max_files)
+    truncated = False
+    try:
+        while pending and not truncated:
+            directory = pending.pop()
+            new_directories: list[_RetainedProjectHandle] = []
+            try:
+                try:
+                    names, overflow = _bounded_retained_names(directory)
+                except (OSError, ValueError):
+                    continue
+                if overflow:
+                    truncated = True
+                    continue
+                for name in names:
+                    entries_seen += 1
+                    if entries_seen > max_entries:
+                        truncated = True
+                        break
+                    if _is_private_name(name):
+                        continue
+                    path = directory.path / name
+                    # Preserve the public scanner's filename selection boundary
+                    # before opening the entry. The retained parent remains the
+                    # authority if the name changes immediately afterward.
+                    allowed_text = _is_allowed_text_file(path)
+                    try:
+                        child = _open_retained_project_child(directory, name)
+                    except (OSError, ValueError):
+                        continue
+                    if child is None:
+                        continue
+                    if child.is_directory:
+                        if name.casefold() in _EXCLUDED_DIRECTORY_NAMES:
+                            _close_retained_project_handle(child)
+                            continue
+                        new_directories.append(child)
+                        sources.append(
+                            _ProjectSource(
+                                child.relative.as_posix(),
+                                name,
+                                True,
+                                child.metadata,
+                            )
+                        )
+                        continue
+                    try:
+                        if not allowed_text:
+                            continue
+                        if files_selected >= max_files:
+                            truncated = True
+                            break
+                        content: bytes | None = None
+                        if max_text_bytes is None:
+                            files_selected += 1
+                        else:
+                            remaining = max_text_bytes - text_bytes_scanned
+                            if remaining <= 0:
+                                truncated = True
+                                break
+                            try:
+                                content = _read_descriptor_limited(
+                                    child.descriptor, remaining + 1
+                                )
+                            except (OSError, ValueError):
+                                continue
+                            if len(content) > remaining:
+                                truncated = True
+                                break
+                            files_selected += 1
+                            files_scanned += 1
+                            text_bytes_scanned += len(content)
+                        sources.append(
+                            _ProjectSource(
+                                child.relative.as_posix(),
+                                name,
+                                False,
+                                child.metadata,
+                                content,
+                            )
+                        )
+                    finally:
+                        _close_retained_project_handle(child)
+            except BaseException:
+                _close_retained_project_handles(new_directories)
+                raise
+            finally:
+                _close_retained_project_handle(directory)
+            if truncated:
+                _close_retained_project_handles(new_directories)
+                break
+            pending.extend(reversed(new_directories))
+    finally:
+        _close_retained_project_handles(pending)
+    return _ProjectSnapshot(
+        tuple(sources),
         truncated,
         files_scanned,
         text_bytes_scanned,
     )
 
 
-def _read_project_file(root: Path, path: Path, limit: int) -> bytes:
-    """Read a bounded direct regular file without escaping the project root."""
-    if type(limit) is not int or limit <= 0:
-        raise ValueError("project read limit must be a positive integer")
-    relative = path.relative_to(root)
-    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
-        raise ValueError("project source must be strictly beneath its root")
-    root_info = os.stat(root, follow_symlinks=False)
-    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
-        raise ValueError("project root must remain a direct directory")
-    root_identity = (root_info.st_dev, root_info.st_ino)
+def _open_retained_project_root(root: Path) -> _RetainedProjectHandle:
     if os.name == "nt":
-        descriptor = _open_windows_project_file(root, path, root_identity)
-        try:
-            return _read_descriptor_limited(descriptor, limit)
-        finally:
-            os.close(descriptor)
-    return _read_posix_project_file(root, relative, root_identity, limit)
+        import ntpath
+
+        root_key = ntpath.normcase(ntpath.normpath(os.fspath(root)))
+        retained = _open_windows_project_path(root, Path(), root_key)
+    else:
+        retained = _open_posix_project_root(root)
+    if not retained.is_directory:
+        _close_retained_project_handle(retained)
+        raise ValueError("project root must be a direct directory")
+    return retained
 
 
-def _read_posix_project_file(
-    root: Path,
-    relative: Path,
-    root_identity: tuple[int, int],
-    limit: int,
-) -> bytes:
-    """Walk every source component relative to one no-follow root descriptor."""
+def _open_retained_project_child(
+    parent: _RetainedProjectHandle, name: str
+) -> _RetainedProjectHandle | None:
+    if not name or name in {".", ".."} or Path(name).name != name:
+        return None
+    if os.name == "nt":
+        if parent.root_key is None:
+            raise ValueError("Windows project root key is missing")
+        return _open_windows_project_path(
+            parent.path / name,
+            parent.relative / name,
+            parent.root_key,
+        )
+    return _open_posix_project_child(parent, name)
+
+
+def _open_posix_project_root(root: Path) -> _RetainedProjectHandle:
     required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
     if any(not hasattr(os, name) for name in required):
-        raise OSError("secure project reads require POSIX no-follow flags")
-    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptors: list[int] = []
+        raise OSError("secure project traversal requires POSIX no-follow flags")
+    descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
     try:
-        current = os.open(root, directory_flags)
-        descriptors.append(current)
-        info = os.fstat(current)
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("project root must be a direct directory")
+        return _retained_from_stat(
+            root,
+            Path(),
+            descriptor,
+            True,
+            info,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_posix_project_child(
+    parent: _RetainedProjectHandle, name: str
+) -> _RetainedProjectHandle | None:
+    try:
+        initial = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return None
+    if stat.S_ISLNK(initial.st_mode):
+        return None
+    if stat.S_ISDIR(initial.st_mode):
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        expected_directory = True
+    elif stat.S_ISREG(initial.st_mode):
+        flags = (
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        expected_directory = False
+    else:
+        return None
+    descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+    try:
+        info = os.fstat(descriptor)
+        if expected_directory != stat.S_ISDIR(info.st_mode):
+            raise ValueError("project entry type changed during retained open")
+        if not expected_directory and not stat.S_ISREG(info.st_mode):
+            raise ValueError("project source must be a regular file")
+        return _retained_from_stat(
+            parent.path / name,
+            parent.relative / name,
+            descriptor,
+            expected_directory,
+            info,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _retained_from_stat(
+    path: Path,
+    relative: Path,
+    descriptor: int,
+    is_directory: bool,
+    info: os.stat_result,
+    *,
+    root_key: str | None = None,
+    identity: tuple[int, int] | None = None,
+) -> _RetainedProjectHandle:
+    return _RetainedProjectHandle(
+        path=path,
+        relative=relative,
+        descriptor=descriptor,
+        is_directory=is_directory,
+        metadata=_ProjectMetadata(info.st_size, info.st_mtime_ns),
+        identity=(info.st_dev, info.st_ino) if identity is None else identity,
+        root_key=root_key,
+    )
+
+
+def _bounded_retained_names(
+    directory: _RetainedProjectHandle,
+) -> tuple[list[str], bool]:
+    if not directory.is_directory:
+        raise ValueError("only retained directories can be enumerated")
+    if os.name == "nt":
+        _verify_windows_directory_binding(directory)
+        scan_target: str | Path | int = directory.path
+    else:
+        if os.scandir not in os.supports_fd:
+            raise OSError("secure POSIX traversal requires scandir(fd)")
+        info = os.fstat(directory.descriptor)
         if (
             not stat.S_ISDIR(info.st_mode)
-            or (info.st_dev, info.st_ino) != root_identity
+            or (info.st_dev, info.st_ino) != directory.identity
         ):
-            raise ValueError("project root identity changed during source open")
-        for component in relative.parts[:-1]:
-            current = os.open(component, directory_flags, dir_fd=current)
-            descriptors.append(current)
-            if not stat.S_ISDIR(os.fstat(current).st_mode):
-                raise ValueError("project source parent must be a directory")
-        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-        source = os.open(relative.parts[-1], file_flags, dir_fd=current)
-        descriptors.append(source)
-        if not stat.S_ISREG(os.fstat(source).st_mode):
-            raise ValueError("project source must be a regular file")
-        return _read_descriptor_limited(source, limit)
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
+            raise ValueError("retained project directory identity changed")
+        scan_target = directory.descriptor
+    names: list[str] = []
+    with os.scandir(scan_target) as entries:
+        for entry in entries:
+            names.append(entry.name)
+            if len(names) > _MAX_DIRECTORY_ENTRIES:
+                return [], True
+    if os.name == "nt":
+        _verify_windows_directory_binding(directory)
+    return sorted(names, key=lambda name: (name.casefold(), name)), False
 
 
-def _open_windows_project_file(
-    root: Path,
+def _close_retained_project_handle(handle: _RetainedProjectHandle) -> None:
+    descriptor = handle.descriptor
+    if descriptor < 0:
+        return
+    handle.descriptor = -1
+    try:
+        os.close(descriptor)
+    except OSError:
+        return
+
+
+def _close_retained_project_handles(
+    handles: Iterable[_RetainedProjectHandle],
+) -> None:
+    for handle in handles:
+        _close_retained_project_handle(handle)
+
+
+def _open_windows_project_path(
     path: Path,
-    root_identity: tuple[int, int],
-) -> int:
-    """Open a no-follow Windows file and verify its final handle containment."""
+    relative: Path,
+    root_key: str,
+) -> _RetainedProjectHandle:
     import ctypes
     import msvcrt
     import ntpath
-    from ctypes import wintypes
 
     from .paths import _extended_windows_path
+
+    kernel32, attributes_type, information_type = _windows_project_api()
+    ctypes.set_last_error(0)
+    native_handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x81,  # FILE_LIST_DIRECTORY/FILE_READ_DATA | FILE_READ_ATTRIBUTES
+        0x3,  # share read/write but deliberately deny delete/rename sharing
+        None,
+        3,  # OPEN_EXISTING
+        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if native_handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    descriptor: int | None = None
+    try:
+        attributes = attributes_type()
+        if not kernel32.GetFileInformationByHandleEx(
+            native_handle,
+            9,
+            ctypes.byref(attributes),
+            ctypes.sizeof(attributes),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.file_attributes & _WINDOWS_REPARSE_POINT:
+            raise ValueError("project entry must not be a Windows reparse point")
+        is_directory = bool(attributes.file_attributes & 0x10)
+        information = information_type()
+        if not kernel32.GetFileInformationByHandle(
+            native_handle, ctypes.byref(information)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        identity = (
+            int(information.volume_serial_number),
+            int(
+                (information.file_index_high << 32)
+                | information.file_index_low
+            ),
+        )
+        final_path = _windows_handle_final_path(kernel32, native_handle)
+        final_key = ntpath.normcase(ntpath.normpath(final_path))
+        expected_key = ntpath.normcase(ntpath.normpath(os.fspath(path)))
+        if (
+            final_key != expected_key
+            or ntpath.commonpath((root_key, final_key)) != root_key
+        ):
+            raise ValueError("retained project entry escaped its lexical path")
+        descriptor = msvcrt.open_osfhandle(
+            native_handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        native_handle = None
+        info = os.fstat(descriptor)
+        if is_directory != stat.S_ISDIR(info.st_mode):
+            raise ValueError("Windows project entry type changed during open")
+        if not is_directory and not stat.S_ISREG(info.st_mode):
+            raise ValueError("Windows project source must be a regular file")
+        return _retained_from_stat(
+            path,
+            relative,
+            descriptor,
+            is_directory,
+            info,
+            root_key=root_key,
+            identity=identity,
+        )
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    finally:
+        if native_handle is not None:
+            kernel32.CloseHandle(native_handle)
+
+
+def _verify_windows_directory_binding(
+    directory: _RetainedProjectHandle,
+) -> None:
+    import ctypes
+    import msvcrt
+    import ntpath
+
+    if directory.root_key is None:
+        raise ValueError("Windows retained directory has no root key")
+    kernel32, attributes_type, information_type = _windows_project_api()
+    native_handle = msvcrt.get_osfhandle(directory.descriptor)
+    attributes = attributes_type()
+    if not kernel32.GetFileInformationByHandleEx(
+        native_handle,
+        9,
+        ctypes.byref(attributes),
+        ctypes.sizeof(attributes),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if (
+        not attributes.file_attributes & 0x10
+        or attributes.file_attributes & _WINDOWS_REPARSE_POINT
+    ):
+        raise ValueError("retained project directory became invalid")
+    information = information_type()
+    if not kernel32.GetFileInformationByHandle(
+        native_handle, ctypes.byref(information)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    identity = (
+        int(information.volume_serial_number),
+        int((information.file_index_high << 32) | information.file_index_low),
+    )
+    final_key = ntpath.normcase(
+        ntpath.normpath(_windows_handle_final_path(kernel32, native_handle))
+    )
+    expected_key = ntpath.normcase(ntpath.normpath(os.fspath(directory.path)))
+    if identity != directory.identity or final_key != expected_key:
+        raise ValueError("retained Windows directory binding changed")
+    probe = _open_windows_project_path(
+        directory.path,
+        directory.relative,
+        directory.root_key,
+    )
+    try:
+        if not probe.is_directory or probe.identity != directory.identity:
+            raise ValueError("Windows directory path no longer names its handle")
+    finally:
+        _close_retained_project_handle(probe)
+
+
+@lru_cache(maxsize=1)
+def _windows_project_api():
+    import ctypes
+    from ctypes import wintypes
 
     class _FileAttributeTagInfo(ctypes.Structure):
         _fields_ = [
             ("file_attributes", wintypes.DWORD),
             ("reparse_tag", wintypes.DWORD),
+        ]
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
         ]
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -647,6 +976,11 @@ def _open_windows_project_file(
         wintypes.DWORD,
     )
     kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
     kernel32.GetFinalPathNameByHandleW.argtypes = (
         wintypes.HANDLE,
         wintypes.LPWSTR,
@@ -656,49 +990,19 @@ def _open_windows_project_file(
     kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32, _FileAttributeTagInfo, _ByHandleFileInformation
 
-    handle = kernel32.CreateFileW(
-        _extended_windows_path(path),
-        0x80000000,  # GENERIC_READ
-        0x7,  # share read/write/delete; the exact handle remains authoritative
-        None,
-        3,  # OPEN_EXISTING
-        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
-        None,
+
+def _windows_handle_final_path(kernel32, native_handle: int) -> str:
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        native_handle, buffer, len(buffer), 0
     )
-    if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        attributes = _FileAttributeTagInfo()
-        if not kernel32.GetFileInformationByHandleEx(
-            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if attributes.file_attributes & (0x10 | _WINDOWS_REPARSE_POINT):
-            raise ValueError("project source must be a direct regular file")
-        buffer = ctypes.create_unicode_buffer(32768)
-        length = kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
-        if length == 0 or length >= len(buffer):
-            raise ctypes.WinError(ctypes.get_last_error() or 206)
-        final_path = _plain_windows_path(buffer.value)
-        root_path = ntpath.normcase(ntpath.normpath(os.fspath(root)))
-        final_key = ntpath.normcase(ntpath.normpath(final_path))
-        if ntpath.commonpath((root_path, final_key)) != root_path:
-            raise ValueError("project source escaped its root")
-        root_after = os.stat(root, follow_symlinks=False)
-        if (root_after.st_dev, root_after.st_ino) != root_identity:
-            raise ValueError("project root identity changed during source open")
-        descriptor = msvcrt.open_osfhandle(
-            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        )
-        handle = None
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
-            raise ValueError("project source must be a regular file")
-        return descriptor
-    finally:
-        if handle is not None:
-            kernel32.CloseHandle(handle)
+    if length == 0 or length >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error() or 206)
+    return _plain_windows_path(buffer.value)
 
 
 def _plain_windows_path(value: str) -> str:
@@ -721,37 +1025,6 @@ def _read_descriptor_limited(descriptor: int, limit: int) -> bytes:
         total += len(chunk)
         chunks.append(chunk)
     return b"".join(chunks)
-
-
-def _bounded_directory_entries(
-    directory: Path,
-) -> tuple[list[tuple[Path, os.stat_result]], bool]:
-    """Return bounded direct entries after discarding links/reparse points."""
-    iterator = directory.iterdir()
-    children: list[tuple[Path, os.stat_result]] = []
-    entries_seen = 0
-    for child in iterator:
-        entries_seen += 1
-        if entries_seen > _MAX_DIRECTORY_ENTRIES:
-            return [], True
-        try:
-            info = child.lstat()
-        except OSError:
-            continue
-        attributes = getattr(info, "st_file_attributes", 0)
-        if stat.S_ISLNK(info.st_mode) or (
-            type(attributes) is int
-            and attributes & _WINDOWS_REPARSE_POINT
-        ):
-            continue
-        children.append((child, info))
-    return (
-        sorted(
-            children,
-            key=lambda entry: (entry[0].name.casefold(), entry[0].name),
-        ),
-        False,
-    )
 
 
 def _tree_entry_budget(max_files: int) -> int:
