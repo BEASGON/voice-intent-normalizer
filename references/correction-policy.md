@@ -2,14 +2,44 @@
 
 ## Response handling
 
-| Response state | Host behavior |
-| --- | --- |
-| Valid `apply` action | Interpret this turn using `corrected_text`; show returned notices. |
-| Valid `ask` action | Display `question` and wait; never execute the task or choose a candidate first. |
-| Valid `keep` action | Use original text with no correction receipt. |
-| Valid action with non-fatal diagnostics | Honor the decision even with `personal_invalid`, `read_only_state`, or another non-fatal diagnostic; show notices and report relevant diagnostics briefly. |
-| Command failure, invalid JSON, or no valid action | Fail open: retain the original text and do not invent a correction. |
-| `status=degraded` without a decision | Fail open: retain the original text and report local correction as unavailable. |
+The following JSON contract is authoritative for hosts.
+
+<!-- voice-intent-response-contract:start -->
+```json
+{
+  "valid_apply": {
+    "use_text": "corrected_text",
+    "show_notices": true
+  },
+  "valid_ask": {
+    "show_question": true,
+    "wait": true,
+    "execute_candidate": false
+  },
+  "valid_keep": {
+    "use_text": "original_text",
+    "show_correction_receipt": false
+  },
+  "valid_decision_with_nonfatal_diagnostics": {
+    "honor_decision": true,
+    "show_notices": true,
+    "report_diagnostics": true,
+    "examples": ["personal_invalid", "read_only_state"]
+  },
+  "command_or_response_failure": {
+    "fail_open": true,
+    "use_text": "original_text",
+    "invent_correction": false
+  },
+  "degraded_without_decision": {
+    "fail_open": true,
+    "use_text": "original_text",
+    "report_unavailable": true
+  }
+}
+```
+<!-- voice-intent-response-contract:end -->
+## Safety boundaries
 
 High-impact text (paths, commands, code identifiers, numbers, publishing, or
 permission changes) requires stronger evidence. A proper-noun receipt says how

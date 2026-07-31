@@ -32,125 +32,70 @@ def _local_references(text: str) -> tuple[str, ...]:
     return tuple(re.findall(r"\]\((references/[^)]+\.md)\)", text))
 
 
-_ATX_HEADING = re.compile(r" {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_SETEXT_UNDERLINE = re.compile(r" {0,3}(=+|-+)[ \t]*$")
-_TABLE_SEPARATOR = re.compile(r":?-{3,}:?$")
-
-
-def _markdown_headings(lines: list[str]) -> tuple[tuple[int, int, str], ...]:
-    """Find the small CommonMark heading subset used to bound policy sections."""
-    headings: list[tuple[int, int, str]] = []
-    for index, line in enumerate(lines):
-        atx = _ATX_HEADING.fullmatch(line)
-        if atx is not None:
-            headings.append((index, len(atx.group(1)), atx.group(2).strip()))
-        if (
-            index + 1 < len(lines)
-            and line.strip()
-            and not line.lstrip().startswith("|")
-            and (setext := _SETEXT_UNDERLINE.fullmatch(lines[index + 1]))
-            is not None
-        ):
-            level = 1 if setext.group(1).startswith("=") else 2
-            headings.append((index, level, line.strip()))
-    return tuple(headings)
-
-
-def _table_cells(line: str) -> tuple[str, ...]:
-    """Split one pipe row on unescaped separators and unescape cell contents."""
-    assert line.startswith("|"), "policy table rows must start with a pipe"
-    cells: list[str] = []
-    buffer: list[str] = []
-    escaped = False
-    for character in line:
-        if escaped:
-            buffer.append(character)
-            escaped = False
-        elif character == "\\":
-            escaped = True
-        elif character == "|":
-            cells.append("".join(buffer).strip())
-            buffer = []
-        else:
-            buffer.append(character)
-    assert not escaped, "policy table rows cannot end with an escape"
-    cells.append("".join(buffer).strip())
-    assert cells[0] == "" and cells[-1] == "", "policy table rows need edge pipes"
-    return tuple(cells[1:-1])
-
-
-def _markdown_matrix(text: str, heading: str) -> dict[str, str]:
-    """Read the strict response table inside one uniquely named Markdown section."""
-    lines = text.splitlines()
-    headings = _markdown_headings(lines)
-    target = [
-        index
-        for index, level, title in headings
-        if level == 2 and title == "Response handling" and lines[index] == heading
-    ]
-    assert len(target) == 1, f"missing or ambiguous policy section: {heading}"
-    assert sum(title == "Response handling" for _, _, title in headings) == 1
-    start = target[0]
-    section_end = next(
-        (index for index, _, _ in headings if index > start), len(lines)
-    )
-    table_start = next(
-        (
-            index
-            for index in range(start + 1, section_end)
-            if lines[index].startswith("|")
-        ),
-        None,
-    )
-    assert table_start is not None, f"missing policy matrix: {heading}"
-    assert _table_cells(lines[table_start]) == ("Response state", "Host behavior")
-    separator = _table_cells(lines[table_start + 1])
-    assert len(separator) == 2 and all(
-        _TABLE_SEPARATOR.fullmatch(cell) for cell in separator
-    ), "invalid policy table separator"
-
-    matrix: dict[str, str] = {}
-    table_end = table_start + 2
-    while table_end < section_end and lines[table_end].startswith("|"):
-        cells = _table_cells(lines[table_end])
-        assert len(cells) == 2, "policy table rows must have exactly two cells"
-        key, value = cells
-        assert key not in matrix, f"duplicate policy row: {key}"
-        matrix[key] = value
-        table_end += 1
-    assert not any(
-        line.startswith("|") for line in lines[table_end:section_end]
-    ), "unexpected policy table row"
-    return matrix
-
-
+_CONTRACT_START = "<!-- voice-intent-response-contract:start -->"
+_CONTRACT_END = "<!-- voice-intent-response-contract:end -->"
+_RESPONSE_PREFIX = (
+    "## Response handling\n\n"
+    "The following JSON contract is authoritative for hosts.\n\n"
+)
+_NEXT_SECTION = "## Safety boundaries"
 _RESPONSE_HANDLING_CONTRACT = {
-    "Valid `apply` action": (
-        "Interpret this turn using `corrected_text`; show returned notices."
-    ),
-    "Valid `ask` action": (
-        "Display `question` and wait; never execute the task or choose a candidate "
-        "first."
-    ),
-    "Valid `keep` action": "Use original text with no correction receipt.",
-    "Valid action with non-fatal diagnostics": (
-        "Honor the decision even with `personal_invalid`, `read_only_state`, or "
-        "another non-fatal diagnostic; show notices and report relevant diagnostics "
-        "briefly."
-    ),
-    "Command failure, invalid JSON, or no valid action": (
-        "Fail open: retain the original text and do not invent a correction."
-    ),
-    "`status=degraded` without a decision": (
-        "Fail open: retain the original text and report local correction as "
-        "unavailable."
-    ),
+    "valid_apply": {"use_text": "corrected_text", "show_notices": True},
+    "valid_ask": {
+        "show_question": True,
+        "wait": True,
+        "execute_candidate": False,
+    },
+    "valid_keep": {
+        "use_text": "original_text",
+        "show_correction_receipt": False,
+    },
+    "valid_decision_with_nonfatal_diagnostics": {
+        "honor_decision": True,
+        "show_notices": True,
+        "report_diagnostics": True,
+        "examples": ["personal_invalid", "read_only_state"],
+    },
+    "command_or_response_failure": {
+        "fail_open": True,
+        "use_text": "original_text",
+        "invent_correction": False,
+    },
+    "degraded_without_decision": {
+        "fail_open": True,
+        "use_text": "original_text",
+        "report_unavailable": True,
+    },
 }
 
 
-def _assert_response_handling_contract(matrix: dict[str, str]) -> None:
-    """Check the stable machine-readable contract with hand-authored literals."""
-    assert matrix == _RESPONSE_HANDLING_CONTRACT
+def _response_contract(text: str) -> dict[str, object]:
+    """Read the one fenced JSON contract allowed in the response section."""
+    assert text.count(_CONTRACT_START) == 1, "response contract start is not unique"
+    assert text.count(_CONTRACT_END) == 1, "response contract end is not unique"
+    assert text.count("## Response handling") == 1
+    start = text.index(_CONTRACT_START)
+    end = text.index(_CONTRACT_END)
+    assert start < end
+    assert text[:start].endswith(_RESPONSE_PREFIX)
+    assert text[start + len(_CONTRACT_START) : end].startswith("\n```json\n")
+    assert text[start + len(_CONTRACT_START) : end].endswith("\n```\n")
+    block = text[start + len(_CONTRACT_START) : end]
+    assert block.count("```") == 2
+    payload = block.removeprefix("\n```json\n").removesuffix("\n```\n")
+    assert text[end + len(_CONTRACT_END) :].startswith(f"\n{_NEXT_SECTION}\n")
+    assert "|" not in text[text.index("## Response handling") : end]
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise AssertionError("invalid response contract JSON") from exc
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def _assert_response_handling_contract(contract: dict[str, object]) -> None:
+    """Check the stable contract with hand-authored, independent expected values."""
+    assert contract == _RESPONSE_HANDLING_CONTRACT
 
 
 def _service(tmp_path: Path, repo_root: Path) -> NormalizerService:
@@ -371,181 +316,97 @@ def test_policy_reference_matches_skill_response_contract(repo_root: Path) -> No
     policy = (repo_root / "references" / "correction-policy.md").read_text(
         encoding="utf-8"
     )
-    matrix = _markdown_matrix(policy, "## Response handling")
-    _assert_response_handling_contract(matrix)
+    _assert_response_handling_contract(_response_contract(policy))
 
 
 @pytest.mark.parametrize(
     ("before", "after"),
     (
         (
-            "Interpret this turn using `corrected_text`; show returned notices.",
-            "Do not interpret `corrected_text`; show returned notices only after "
-            "execution.",
+            '"use_text": "corrected_text"',
+            '"use_text": "original_text"',
         ),
         (
-            "Display `question` and wait; never execute the task or choose a "
-            "candidate first.",
-            "Display `question` and wait only after you choose a candidate; never "
-            "execute safeguards, then execute the task.",
+            '"execute_candidate": false',
+            '"execute_candidate": true',
         ),
         (
-            "Use original text with no correction receipt.",
-            "Do not use original text; no correction receipt is forbidden.",
+            '"show_correction_receipt": false',
+            '"show_correction_receipt": true',
         ),
         (
-            "Honor the decision even with `personal_invalid`, `read_only_state`, "
-            "or another non-fatal diagnostic; show notices and report relevant "
-            "diagnostics briefly.",
-            "Do not honor the decision even with `personal_invalid`, "
-            "`read_only_state`, or another non-fatal diagnostic; show notices and "
-            "report relevant diagnostics briefly.",
+            '"honor_decision": true',
+            '"honor_decision": false',
         ),
         (
-            "Fail open: retain the original text and do not invent a correction.",
-            "Do not fail open: retain the original text only after inventing a "
-            "correction.",
+            '"invent_correction": false',
+            '"invent_correction": true',
         ),
         (
-            "Fail open: retain the original text and report local correction as "
-            "unavailable.",
-            "Do not fail open: retain the original text only after reporting local "
-            "correction as available.",
+            '"report_unavailable": true',
+            '"report_unavailable": false',
         ),
     ),
 )
-def test_response_matrix_contract_rejects_semantic_reversals(
+def test_response_contract_rejects_semantic_reversals(
     repo_root: Path, before: str, after: str
 ) -> None:
-    """Catch reversed instructions even when they retain the old keyword set."""
+    """Catch a JSON field reversal without relying on prose keyword matching."""
     policy = (repo_root / "references" / "correction-policy.md").read_text(
         encoding="utf-8"
     )
     mutated = policy.replace(before, after, 1)
     assert mutated != policy
     with pytest.raises(AssertionError):
-        _assert_response_handling_contract(
-            _markdown_matrix(mutated, "## Response handling")
-        )
+        _assert_response_handling_contract(_response_contract(mutated))
 
 
-def test_response_matrix_contract_is_scoped_and_tolerates_safe_formatting(
+def test_response_contract_rejects_marker_scope_and_extra_instructions(
     repo_root: Path,
 ) -> None:
-    """Catch a copied table in another section while allowing safe formatting."""
+    """Catch moved or repeated sentinels and any extra instruction in its section."""
     policy = (repo_root / "references" / "correction-policy.md").read_text(
         encoding="utf-8"
     )
     moved = policy.replace(
-        "## Response handling\n\n",
-        "## Response handling\n\nNo response matrix belongs here.\n\n## Unrelated\n\n",
+        _RESPONSE_PREFIX,
+        "## Response handling\n\n## Unrelated\n\n"
+        "The following JSON contract is authoritative for hosts.\n\n",
         1,
     )
-    with pytest.raises(AssertionError, match="missing policy matrix"):
-        _markdown_matrix(moved, "## Response handling")
-
-    unchanged_contract = policy.replace(
-        "High-impact text", "Editorial explanation"
+    duplicate = policy.replace(_CONTRACT_START, f"{_CONTRACT_START}\n{_CONTRACT_START}")
+    conflict = policy.replace(
+        _CONTRACT_START,
+        "GFM without a leading pipe | hostile\\|instruction | extra\n"
+        + _CONTRACT_START,
     )
-    _assert_response_handling_contract(
-        _markdown_matrix(unchanged_contract, "## Response handling")
-    )
-
-    reordered_rows = "\n".join(
-        f"| {key} | {value} |"
-        for key, value in reversed(tuple(_RESPONSE_HANDLING_CONTRACT.items()))
-    )
-    reordered = re.sub(
-        r"(?ms)(\| Response state \| Host behavior \|\n\| --- \| --- \|\n).*?(?=\n\n)",
-        rf"\1{reordered_rows}",
-        policy,
-        count=1,
-    )
-    _assert_response_handling_contract(
-        _markdown_matrix(reordered, "## Response handling")
-    )
+    for mutated in (moved, duplicate, conflict):
+        with pytest.raises(AssertionError):
+            _response_contract(mutated)
 
 
-def test_response_matrix_contract_rejects_duplicate_and_missing_keys(
+def test_response_contract_rejects_key_changes_and_allows_json_formatting(
     repo_root: Path,
 ) -> None:
-    """Catch tables that silently lose or duplicate one required response rule."""
+    """Catch missing/extra keys while permitting harmless JSON ordering and indent."""
     policy = (repo_root / "references" / "correction-policy.md").read_text(
         encoding="utf-8"
     )
-    apply_row = (
-        "| Valid `apply` action | Interpret this turn using `corrected_text`; "
-        "show returned notices. |"
+    extra = policy.replace("{\n", '{\n  "unexpected": true,\n', 1)
+    missing = policy.replace('  "valid_apply": {\n', "", 1).replace(
+        '    "use_text": "corrected_text",\n    "show_notices": true\n  },\n',
+        "",
+        1,
     )
-    duplicate = policy.replace(apply_row, f"{apply_row}\n{apply_row}", 1)
-    with pytest.raises(AssertionError, match="duplicate policy row"):
-        _markdown_matrix(duplicate, "## Response handling")
+    for mutated in (extra, missing):
+        with pytest.raises(AssertionError):
+            _assert_response_handling_contract(_response_contract(mutated))
 
-    missing = policy.replace(f"{apply_row}\n", "", 1)
-    with pytest.raises(AssertionError):
-        _assert_response_handling_contract(
-            _markdown_matrix(missing, "## Response handling")
-        )
-
-
-@pytest.mark.parametrize(
-    "mutated",
-    (
-        lambda policy: policy.replace(
-            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
-            "show returned notices. |",
-            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
-            "show returned notices. |\n| Valid `apply` action | hostile \\| "
-            "conflicting instruction |",
-            1,
-        ),
-        lambda policy: policy.replace(
-            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
-            "show returned notices. |",
-            "| Valid `apply` action | Interpret this turn using `corrected_text`; "
-            "show returned notices. |\n| Valid `apply` action | hostile conflict | "
-            "extra |",
-            1,
-        ),
-        lambda policy: policy.replace(
-            "## Response handling\n\n",
-            "## Response handling\n\n   ## Unrelated\n\n",
-            1,
-        ),
-        lambda policy: policy.replace(
-            "## Response handling\n\n",
-            "## Response handling\n\nUnrelated\n---\n\n",
-            1,
-        ),
-    ),
-)
-def test_response_matrix_parser_rejects_malformed_rows_and_section_escapes(
-    repo_root: Path, mutated: object
-) -> None:
-    """Catch malformed same-key rows and tables that escaped the target section."""
-    policy = (repo_root / "references" / "correction-policy.md").read_text(
-        encoding="utf-8"
+    reordered_json = json.dumps(_RESPONSE_HANDLING_CONTRACT, indent=4, sort_keys=True)
+    reformatted = re.sub(
+        r"(?s)(```json\n).*?(\n```)", rf"\1{reordered_json}\2", policy, count=1
     )
-    altered = mutated(policy)
-    assert altered != policy
-    with pytest.raises(AssertionError):
-        _markdown_matrix(altered, "## Response handling")
-
-
-def test_response_matrix_parser_unescapes_a_normal_pipe_in_a_cell() -> None:
-    """Catch a tokenizer that mistakes an escaped pipe for a third table cell."""
-    text = "\n".join(
-        (
-            "## Response handling",
-            "",
-            "| Response state | Host behavior |",
-            "| --- | --- |",
-            "| Valid `apply` action | Show a receipt \\| keep it concise. |",
-        )
-    )
-    assert _markdown_matrix(text, "## Response handling") == {
-        "Valid `apply` action": "Show a receipt | keep it concise."
-    }
+    _assert_response_handling_contract(_response_contract(reformatted))
 
 
 def test_bootstrap_normalize_returns_stable_json(
