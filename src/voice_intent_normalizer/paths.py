@@ -292,6 +292,34 @@ class StateRootLease:
         else:
             raise OSError("retained directories have incompatible identities")
 
+    def move_no_replace(
+        self, source: str | Path, destination: str | Path
+    ) -> None:
+        """Atomically move one entry without replacing the destination.
+
+        Windows provides exclusive rename through ``os.rename``. POSIX uses
+        whichever native descriptor-relative exclusive-rename operation the
+        host exposes and fails closed when neither API is available.
+        """
+        source_parts = _relative_path_parts(source)
+        destination_parts = _relative_path_parts(destination)
+        source_binding, source_name = self._file_binding(source_parts)
+        destination_binding, destination_name = self._file_binding(destination_parts)
+        if source_binding.path is not None and destination_binding.path is not None:
+            os.rename(
+                source_binding.path / source_name,
+                destination_binding.path / destination_name,
+            )
+            return
+        if source_binding.descriptor is None or destination_binding.descriptor is None:
+            raise OSError("retained directories have incompatible identities")
+        _move_posix_no_replace(
+            source_binding.descriptor,
+            source_name,
+            destination_binding.descriptor,
+            destination_name,
+        )
+
     def rmdir(self, relative: str | Path, *, missing_ok: bool = False) -> None:
         """Remove one empty retained directory entry without following it."""
         parts = _relative_path_parts(relative)
@@ -397,6 +425,68 @@ def _require_posix_dir_fd_support() -> None:
     for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
         if not hasattr(os, name):
             raise OSError(f"secure POSIX state roots require {name}")
+
+
+def _move_posix_no_replace(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+) -> None:
+    """Use a native exclusive rename and fail closed when none is available."""
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    rename_at_exclusive = getattr(library, "renameatx_np", None)
+    if rename_at_exclusive is not None:
+        rename_at_exclusive.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename_at_exclusive.restype = ctypes.c_int
+        result = rename_at_exclusive(
+            source_directory,
+            source_bytes,
+            destination_directory,
+            destination_bytes,
+            0x00000004,  # Darwin RENAME_EXCL
+        )
+        if not result:
+            return
+        error = ctypes.get_errno()
+        if error not in {errno.ENOSYS, errno.ENOTSUP}:
+            raise OSError(error, os.strerror(error), destination_name)
+
+    rename_at_no_replace = getattr(library, "renameat2", None)
+    if rename_at_no_replace is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "secure no-replace move is unavailable on this POSIX host",
+        )
+    rename_at_no_replace.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename_at_no_replace.restype = ctypes.c_int
+    result = rename_at_no_replace(
+        source_directory,
+        source_bytes,
+        destination_directory,
+        destination_bytes,
+        1,  # Linux RENAME_NOREPLACE
+    )
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination_name)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
