@@ -293,32 +293,59 @@ class StateRootLease:
             raise OSError("retained directories have incompatible identities")
 
     def move_no_replace(
-        self, source: str | Path, destination: str | Path
-    ) -> None:
-        """Atomically move one entry without replacing the destination.
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        expected_sha256: str,
+        limit: int,
+        canonical_json: bool = False,
+    ) -> bool:
+        """Publish the exact validated source without replacing a destination.
 
-        Windows provides exclusive rename through ``os.rename``. POSIX uses
-        whichever native descriptor-relative exclusive-rename operation the
-        host exposes and fails closed when neither API is available.
+        Windows validates and renames the same retained handle, then returns
+        ``True``. Portable POSIX has no unlink/rename-by-handle primitive, so
+        it captures the validated bytes from the retained descriptor, writes
+        them to an exclusive destination, and returns ``False`` without
+        removing a live source name.
         """
+        if (
+            not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_sha256)
+            or limit < 0
+        ):
+            raise ValueError("invalid identity-bound move contract")
         source_parts = _relative_path_parts(source)
         destination_parts = _relative_path_parts(destination)
         source_binding, source_name = self._file_binding(source_parts)
         destination_binding, destination_name = self._file_binding(destination_parts)
         if source_binding.path is not None and destination_binding.path is not None:
-            os.rename(
-                source_binding.path / source_name,
-                destination_binding.path / destination_name,
-            )
-            return
-        if source_binding.descriptor is None or destination_binding.descriptor is None:
+            with _open_windows_regular_file_for_move(
+                source_binding.path / source_name
+            ) as descriptor:
+                data = _read_descriptor_bytes(descriptor, limit)
+                if (
+                    _identity_bound_content_hash(data, canonical_json)
+                    != expected_sha256
+                ):
+                    raise ValueError("identity-bound move source changed")
+                _move_windows_handle_no_replace(
+                    descriptor,
+                    destination_binding.path / destination_name,
+                )
+            return True
+        if (
+            source_binding.descriptor is None
+            or destination_binding.descriptor is None
+        ):
             raise OSError("retained directories have incompatible identities")
-        _move_posix_no_replace(
-            source_binding.descriptor,
-            source_name,
-            destination_binding.descriptor,
-            destination_name,
-        )
+        with self.open_regular(source, "identity-bound move source") as descriptor:
+            data = _read_descriptor_bytes(descriptor, limit)
+        if _identity_bound_content_hash(data, canonical_json) != expected_sha256:
+            raise ValueError("identity-bound move source changed")
+        self.write_bytes_exclusive(destination, data)
+        return False
 
     def rmdir(self, relative: str | Path, *, missing_ok: bool = False) -> None:
         """Remove one empty retained directory entry without following it."""
@@ -427,68 +454,6 @@ def _require_posix_dir_fd_support() -> None:
             raise OSError(f"secure POSIX state roots require {name}")
 
 
-def _move_posix_no_replace(
-    source_directory: int,
-    source_name: str,
-    destination_directory: int,
-    destination_name: str,
-) -> None:
-    """Use a native exclusive rename and fail closed when none is available."""
-    import ctypes
-    import errno
-
-    library = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source_name)
-    destination_bytes = os.fsencode(destination_name)
-    rename_at_exclusive = getattr(library, "renameatx_np", None)
-    if rename_at_exclusive is not None:
-        rename_at_exclusive.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        rename_at_exclusive.restype = ctypes.c_int
-        result = rename_at_exclusive(
-            source_directory,
-            source_bytes,
-            destination_directory,
-            destination_bytes,
-            0x00000004,  # Darwin RENAME_EXCL
-        )
-        if not result:
-            return
-        error = ctypes.get_errno()
-        if error not in {errno.ENOSYS, errno.ENOTSUP}:
-            raise OSError(error, os.strerror(error), destination_name)
-
-    rename_at_no_replace = getattr(library, "renameat2", None)
-    if rename_at_no_replace is None:
-        raise OSError(
-            errno.ENOTSUP,
-            "secure no-replace move is unavailable on this POSIX host",
-        )
-    rename_at_no_replace.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    rename_at_no_replace.restype = ctypes.c_int
-    result = rename_at_no_replace(
-        source_directory,
-        source_bytes,
-        destination_directory,
-        destination_bytes,
-        1,  # Linux RENAME_NOREPLACE
-    )
-    if result:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
-
-
 def _write_all(descriptor: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -496,6 +461,33 @@ def _write_all(descriptor: int, data: bytes) -> None:
         if written <= 0:
             raise OSError("state write made no progress")
         view = view[written:]
+
+
+def _read_descriptor_bytes(descriptor: int, limit: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, limit + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("identity-bound move source exceeds size limit")
+        chunks.append(chunk)
+
+
+def _identity_bound_content_hash(data: bytes, canonical_json: bool) -> str:
+    if canonical_json:
+        import json
+
+        payload = json.loads(data.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("identity-bound JSON source must be an object")
+        data = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def _write_windows_bytes_atomic(directory: Path, name: str, data: bytes) -> None:
@@ -631,6 +623,121 @@ def _open_windows_regular_file(path: Path) -> int:
     finally:
         if handle is not None:
             kernel32.CloseHandle(handle)
+
+
+@contextmanager
+def _open_windows_regular_file_for_move(path: Path) -> Iterator[int]:
+    """Retain one exact Windows file with read/delete access and no writers."""
+    if os.name != "nt":
+        raise OSError("Windows handle-bound moves are unavailable")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x80010000,  # GENERIC_READ | DELETE
+        0x5,  # FILE_SHARE_READ | FILE_SHARE_DELETE; deny writers
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            raise FileNotFoundError(error, os.strerror(error), path)
+        raise ctypes.WinError(error)
+    descriptor = -1
+    try:
+        attributes = _FileAttributeTagInfo()
+        ctypes.set_last_error(0)
+        if not kernel32.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.file_attributes & (0x10 | _WINDOWS_REPARSE_POINT):
+            raise ValueError("move source must be a direct regular file")
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        handle = None
+        yield descriptor
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        elif handle is not None:
+            kernel32.CloseHandle(handle)
+
+
+def _move_windows_handle_no_replace(descriptor: int, destination: Path) -> None:
+    """Rename the exact open file handle to an absent Windows destination."""
+    if os.name != "nt":
+        raise OSError("Windows handle-bound moves are unavailable")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    destination_text = _extended_windows_path(destination)
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", wintypes.BOOLEAN),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", ctypes.c_wchar * (len(destination_text) + 1)),
+        ]
+
+    information = _FileRenameInfo()
+    information.replace_if_exists = False
+    information.root_directory = None
+    information.file_name_length = len(destination_text.encode("utf-16-le"))
+    information.file_name = destination_text
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    if not kernel32.SetFileInformationByHandle(
+        msvcrt.get_osfhandle(descriptor),
+        3,  # FileRenameInfo
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def validate_state_root(root: str | Path) -> Path:

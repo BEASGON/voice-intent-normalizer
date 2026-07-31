@@ -562,6 +562,147 @@ def test_generic_transaction_never_unlinks_a_replaced_live_source_name(
     assert not (target / "SKILL.md").exists()
 
 
+def test_generic_quarantine_never_moves_a_replacement_opened_after_validation(
+    tmp_path: Path, monkeypatch
+):
+    """Replacing a checked live name must not move unrelated bytes."""
+    repository = Path(__file__).resolve().parents[1]
+    root = tmp_path / "skills"
+    root.mkdir()
+    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
+    adapter = GenericAdapter(repository, state)
+    assert adapter.install(InstallOptions(output_dir=root)).status == "installed"
+    live = root / "voice-intent-normalizer" / "SKILL.md"
+    replacement = b"unrelated live replacement"
+    original_open = StateRootLease._open_regular_file
+    original_write_recovery = GenericAdapter._write_recovery
+    armed = False
+    injected = False
+
+    def arm_after_journal(current, transaction):
+        nonlocal armed
+        path = original_write_recovery(current, transaction)
+        armed = True
+        return path
+
+    def replace_after_open(binding, name, label):
+        nonlocal injected
+        descriptor = original_open(binding, name, label)
+        if armed and not injected and name == "SKILL.md":
+            live.unlink()
+            live.write_bytes(replacement)
+            injected = True
+        return descriptor
+
+    monkeypatch.setattr(GenericAdapter, "_write_recovery", arm_after_journal)
+    monkeypatch.setattr(
+        StateRootLease,
+        "_open_regular_file",
+        staticmethod(replace_after_open),
+    )
+
+    result = adapter.uninstall(UninstallOptions(output_dir=root))
+
+    quarantined = tuple(
+        path
+        for directory in root.glob(".voice-intent-normalizer.quarantine-*")
+        for path in directory.rglob("*")
+        if path.is_file()
+    )
+    assert injected
+    assert result.status == "degraded"
+    assert live.read_bytes() == replacement
+    assert all(path.read_bytes() != replacement for path in quarantined)
+
+
+def test_generic_publication_never_moves_a_replaced_staging_source(
+    tmp_path: Path, monkeypatch
+):
+    """Replacing a checked staged name must not publish unrelated bytes."""
+    repository = Path(__file__).resolve().parents[1]
+    root = tmp_path / "skills"
+    root.mkdir()
+    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
+    replacement = b"unrelated staging replacement"
+    original_open = StateRootLease._open_regular_file
+    original_write_recovery = GenericAdapter._write_recovery
+    armed = False
+    injected = False
+    replaced_source: Path | None = None
+
+    def arm_after_journal(current, transaction):
+        nonlocal armed
+        path = original_write_recovery(current, transaction)
+        armed = True
+        return path
+
+    def replace_after_open(binding, name, label):
+        nonlocal injected, replaced_source
+        descriptor = original_open(binding, name, label)
+        if armed and not injected and name == "SKILL.md":
+            staging = next(root.glob(".voice-intent-normalizer.staging-*"))
+            replaced_source = staging / "SKILL.md"
+            replaced_source.unlink()
+            replaced_source.write_bytes(replacement)
+            injected = True
+        return descriptor
+
+    monkeypatch.setattr(GenericAdapter, "_write_recovery", arm_after_journal)
+    monkeypatch.setattr(
+        StateRootLease,
+        "_open_regular_file",
+        staticmethod(replace_after_open),
+    )
+
+    result = GenericAdapter(repository, state).install(
+        InstallOptions(output_dir=root)
+    )
+
+    target = root / "voice-intent-normalizer" / "SKILL.md"
+    assert injected
+    assert result.status == "degraded"
+    assert replaced_source is not None
+    assert replaced_source.read_bytes() == replacement
+    assert not target.exists() or target.read_bytes() != replacement
+
+
+def test_generic_same_package_install_id_mismatch_never_reanchors_status(
+    tmp_path: Path,
+):
+    repository = Path(__file__).resolve().parents[1]
+    root = tmp_path / "skills"
+    root.mkdir()
+    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
+    adapter = GenericAdapter(repository, state)
+    assert adapter.install(InstallOptions(output_dir=root)).status == "installed"
+    target = root / "voice-intent-normalizer"
+    manifest_path = target / ".voice-intent-normalizer-install.json"
+    status_path = state.adapter_status_file("generic")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["install_id"] = "0" * 32
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    status_before = status_path.read_bytes()
+    package_before = {
+        path.relative_to(target): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+
+    result = adapter.install(InstallOptions(output_dir=root))
+
+    package_after = {
+        path.relative_to(target): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    assert result.status in {"failed", "degraded"}
+    assert status_path.read_bytes() == status_before
+    assert package_after == package_before
+
+
 def test_generic_upgrade_rejects_manifest_that_disagrees_with_status_anchor(
     tmp_path: Path,
 ):
@@ -613,7 +754,7 @@ def test_generic_upgrade_rejects_manifest_that_disagrees_with_status_anchor(
     assert status["transaction"] is None
 
 
-def test_generic_success_and_noop_leave_no_populated_staging_or_source_hardlinks(
+def test_generic_success_and_noop_never_leave_source_hardlinks(
     tmp_path: Path,
 ):
     repository = Path(__file__).resolve().parents[1]
@@ -628,10 +769,17 @@ def test_generic_success_and_noop_leave_no_populated_staging_or_source_hardlinks
     assert first.status == "installed"
     assert second.status == "already-installed"
     staging = tuple(root.glob(".voice-intent-normalizer.staging-*"))
-    assert all(
-        not any(path.is_file() for path in directory.rglob("*"))
-        for directory in staging
-    )
+    if os.name == "nt":
+        assert all(
+            not any(path.is_file() for path in directory.rglob("*"))
+            for directory in staging
+        )
+    else:
+        assert any(
+            path.is_file()
+            for directory in staging
+            for path in directory.rglob("*")
+        )
     assert os.stat(root / "voice-intent-normalizer" / "SKILL.md").st_nlink == 1
 
 
@@ -796,7 +944,7 @@ def test_generic_quarantine_move_failure_is_resumable(
     original_replace = StateRootLease.move_no_replace
     moves = 0
 
-    def fail_third_move(lease, source, destination):
+    def fail_third_move(lease, source, destination, **contract):
         nonlocal moves
         source_path = Path(source)
         destination_path = Path(destination)
@@ -811,7 +959,7 @@ def test_generic_quarantine_move_failure_is_resumable(
             moves += 1
             if moves == 3:
                 raise OSError("injected move failure")
-        return original_replace(lease, source, destination)
+        return original_replace(lease, source, destination, **contract)
 
     monkeypatch.setattr(StateRootLease, "move_no_replace", fail_third_move)
 
@@ -1210,7 +1358,7 @@ def test_generic_upgrade_move_failure_is_resumable(
     original_replace = StateRootLease.move_no_replace
     new_moves = 0
 
-    def fail_new_move(lease, source, destination):
+    def fail_new_move(lease, source, destination, **contract):
         nonlocal new_moves
         source_path = Path(source)
         destination_path = Path(destination)
@@ -1223,7 +1371,7 @@ def test_generic_upgrade_move_failure_is_resumable(
             new_moves += 1
             if new_moves == 3:
                 raise OSError("injected upgrade failure")
-        return original_replace(lease, source, destination)
+        return original_replace(lease, source, destination, **contract)
 
     monkeypatch.setattr(StateRootLease, "move_no_replace", fail_new_move)
 
@@ -1385,16 +1533,104 @@ def test_identity_bound_move_is_exclusive_and_preserves_conflicting_source(
     with guard_state_root(
         root, retained_dirs=("source", "destination")
     ) as lease:
-        lease.move_no_replace("source/moved.txt", "destination/moved.txt")
+        lease.move_no_replace(
+            "source/moved.txt",
+            "destination/moved.txt",
+            expected_sha256=hashlib.sha256(b"managed").hexdigest(),
+            limit=1024,
+        )
         with pytest.raises(OSError):
             lease.move_no_replace(
-                "source/conflict.txt", "destination/conflict.txt"
+                "source/conflict.txt",
+                "destination/conflict.txt",
+                expected_sha256=hashlib.sha256(b"source").hexdigest(),
+                limit=1024,
             )
 
     assert not (source / "moved.txt").exists()
     assert (destination / "moved.txt").read_text(encoding="utf-8") == "managed"
     assert (source / "conflict.txt").read_text(encoding="utf-8") == "source"
     assert (destination / "conflict.txt").read_text(encoding="utf-8") == "destination"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound rename contract")
+def test_windows_identity_bound_move_never_renames_a_replacement_name(
+    tmp_path: Path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    import voice_intent_normalizer.paths as paths_module
+    from voice_intent_normalizer.paths import guard_state_root
+
+    root = tmp_path / "root"
+    source = root / "source"
+    destination = root / "destination"
+    source.mkdir(parents=True)
+    destination.mkdir()
+    live = source / "file.txt"
+    live.write_bytes(b"managed")
+    replacement = b"unrelated replacement"
+    original_open = paths_module._open_windows_regular_file_for_move
+    injected = False
+
+    @contextmanager
+    def replace_after_handle_open(path):
+        nonlocal injected
+        with original_open(path) as descriptor:
+            live.unlink()
+            live.write_bytes(replacement)
+            injected = True
+            yield descriptor
+
+    monkeypatch.setattr(
+        paths_module,
+        "_open_windows_regular_file_for_move",
+        replace_after_handle_open,
+    )
+
+    with guard_state_root(
+        root, retained_dirs=("source", "destination")
+    ) as lease:
+        with pytest.raises(OSError):
+            lease.move_no_replace(
+                "source/file.txt",
+                "destination/file.txt",
+                expected_sha256=hashlib.sha256(b"managed").hexdigest(),
+                limit=1024,
+            )
+
+    assert injected
+    assert live.read_bytes() == replacement
+    assert not (destination / "file.txt").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX retained-copy fallback contract")
+def test_posix_identity_bound_move_copies_without_unlinking_the_source(
+    tmp_path: Path,
+):
+    from voice_intent_normalizer.paths import guard_state_root
+
+    root = tmp_path / "root"
+    source = root / "source"
+    destination = root / "destination"
+    source.mkdir(parents=True)
+    destination.mkdir()
+    live = source / "file.txt"
+    live.write_bytes(b"managed")
+
+    with guard_state_root(
+        root, retained_dirs=("source", "destination")
+    ) as lease:
+        removed = lease.move_no_replace(
+            "source/file.txt",
+            "destination/file.txt",
+            expected_sha256=hashlib.sha256(b"managed").hexdigest(),
+            limit=1024,
+        )
+
+    assert removed is False
+    assert live.read_bytes() == b"managed"
+    assert (destination / "file.txt").read_bytes() == b"managed"
 
 
 def test_generic_uninstall_leaves_empty_managed_directories(tmp_path: Path):
@@ -1469,12 +1705,12 @@ def test_generic_upgrade_never_overwrites_new_unknown_file(
     original_publish = StateRootLease.move_no_replace
     injected = False
 
-    def inject_unknown(lease, source, destination):
+    def inject_unknown(lease, source, destination, **contract):
         nonlocal injected
         if Path(destination) == Path("voice-intent-normalizer/LICENSE"):
             injected = True
             (target / "LICENSE").write_text("user-owned", encoding="utf-8")
-        return original_publish(lease, source, destination)
+        return original_publish(lease, source, destination, **contract)
 
     monkeypatch.setattr(StateRootLease, "move_no_replace", inject_unknown)
 
@@ -1722,7 +1958,7 @@ def test_generic_resumes_mid_upgrade_without_overwriting_unknown(
     original_publish = StateRootLease.move_no_replace
     publishes = 0
 
-    def crash_during_new_publish(lease, source, destination):
+    def crash_during_new_publish(lease, source, destination, **contract):
         nonlocal publishes
         source_path = Path(source)
         destination_path = Path(destination)
@@ -1735,7 +1971,7 @@ def test_generic_resumes_mid_upgrade_without_overwriting_unknown(
             publishes += 1
             if publishes == 3:
                 raise KeyboardInterrupt()
-        return original_publish(lease, source, destination)
+        return original_publish(lease, source, destination, **contract)
 
     monkeypatch.setattr(
         StateRootLease, "move_no_replace", crash_during_new_publish

@@ -483,7 +483,7 @@ class GenericAdapter:
         try:
             status = self._read_status()
         except Exception:
-            status = None
+            return self._failed("protected adapter status is invalid")
         if status is None or not self._status_matches(
             status, root, current.manifest
         ):
@@ -522,11 +522,16 @@ class GenericAdapter:
         try:
             status = self._read_status()
         except Exception:
-            status = None
+            return self._failed("protected adapter status is invalid")
         desired_capability = self._capability(options).value
+        if status is not None and not self._status_matches(
+            status, root, current.manifest
+        ):
+            return self._failed(
+                "managed package does not match protected adapter status"
+            )
         if (
             status is not None
-            and self._status_matches(status, root, current.manifest)
             and status.get("capability") == desired_capability
         ):
             return AdapterResult(
@@ -1835,8 +1840,12 @@ class GenericAdapter:
                 target_hash, _, quarantine_hash = states[relative]
                 if target_hash == old_hash:
                     if quarantine_hash is None:
-                        lease.move_no_replace(
-                            target_relative, quarantine_relative
+                        source_removed = lease.move_no_replace(
+                            target_relative,
+                            quarantine_relative,
+                            expected_sha256=str(old_hash),
+                            limit=self._transaction_file_limit(relative),
+                            canonical_json=relative == _MANIFEST,
                         )
                         if (
                             self._lease_hash_or_none(lease, quarantine_relative)
@@ -1846,9 +1855,15 @@ class GenericAdapter:
                                 "transaction quarantine captured an unknown source"
                             )
                         changed.append(quarantine / relative)
-                        changed.append(target / relative)
                         self._record_changes((quarantine / relative,))
-                        self._record_changes((target / relative,))
+                        if source_removed:
+                            changed.append(target / relative)
+                            self._record_changes((target / relative,))
+                        else:
+                            raise OSError(
+                                "identity-bound source removal is unavailable "
+                                "on this platform"
+                            )
 
             for relative in new_files:
                 target_relative = Path(_NAME) / relative
@@ -1858,7 +1873,13 @@ class GenericAdapter:
                 )
                 current_hash = self._lease_hash_or_none(lease, target_relative)
                 if current_hash is None:
-                    lease.move_no_replace(staging_relative, target_relative)
+                    source_removed = lease.move_no_replace(
+                        staging_relative,
+                        target_relative,
+                        expected_sha256=str(expected_hash),
+                        limit=self._transaction_file_limit(relative),
+                        canonical_json=relative == _MANIFEST,
+                    )
                     if (
                         self._lease_hash_or_none(lease, target_relative)
                         != expected_hash
@@ -1866,10 +1887,11 @@ class GenericAdapter:
                         raise ValueError(
                             "transaction publication captured an unknown source"
                         )
-                    changed.append(staging / relative)
                     changed.append(target / relative)
-                    self._record_changes((staging / relative,))
                     self._record_changes((target / relative,))
+                    if source_removed:
+                        changed.append(staging / relative)
+                        self._record_changes((staging / relative,))
                 elif current_hash != expected_hash:
                     raise ValueError(
                         "transaction would overwrite an unknown destination"
@@ -1934,6 +1956,10 @@ class GenericAdapter:
             raise ValueError("invalid transaction hashes")
         value = hashes.get(relative)
         return str(value) if isinstance(value, str) else None
+
+    @staticmethod
+    def _transaction_file_limit(relative: str) -> int:
+        return _MANIFEST_LIMIT if relative == _MANIFEST else _MANAGED_FILE_LIMIT
 
     @staticmethod
     def _lease_hash_or_none(
