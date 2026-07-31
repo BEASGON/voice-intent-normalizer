@@ -6,11 +6,14 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
 
+from .adapters.base import AdapterResult, InstallOptions, UninstallOptions
+from .adapters.generic import GenericAdapter
+from .installer import Installer
 from .models import Candidate, CorrectionDecision, Scope
 from .paths import StatePaths, guard_project_root
 from .project_scan import scan_project
@@ -61,9 +64,21 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--json", action="store_true")
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--platform", action="append", default=[])
+    doctor.add_argument("--all-detected", action="store_true")
     for name in ("install", "uninstall"):
         command = commands.add_parser(name)
         command.add_argument("--json", action="store_true")
+        command.add_argument("--platform", action="append", default=[])
+        command.add_argument("--all-detected", action="store_true")
+        command.add_argument("--output-dir")
+        command.add_argument("--workspace")
+        command.add_argument("--strict", action="store_true")
+    install = commands.choices["install"]
+    install.add_argument(
+        "--auto-update", action=argparse.BooleanOptionalAction, default=None
+    )
+    install.add_argument("--implicit-invocation-confirmed", action="store_true")
     commands.add_parser("hook")
     return parser
 
@@ -74,6 +89,14 @@ def default_service() -> NormalizerService:
     return NormalizerService(StatePaths.resolve(), repository / "assets" / "lexicons")
 
 
+def default_installer(paths: StatePaths | None = None) -> Installer:
+    """Return only adapters implemented by this build stage."""
+    repository = Path(__file__).resolve().parents[2]
+    state = StatePaths.resolve() if paths is None else paths
+    generic = GenericAdapter(repository, state)
+    return Installer({generic.platform: generic})
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -81,6 +104,8 @@ def main(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     stdin: TextIO | None = None,
+    installer: Installer | None = None,
+    input_func: Callable[[str], str] | None = None,
 ) -> int:
     """Run one command with validation errors separated from degraded results."""
     output = sys.stdout if stdout is None else stdout
@@ -103,13 +128,21 @@ def main(
         return hook_main(stdin=source, stdout=output, stderr=errors, service=service)
     try:
         active_service = default_service() if service is None else service
-        return _dispatch(args, active_service, output)
+        active_installer = installer
+        if active_installer is None:
+            configured_paths = getattr(active_service, "paths", None)
+            active_installer = default_installer(configured_paths)
+        _complete_human_install_options(args, input_func)
+        return _dispatch(args, active_service, active_installer, output)
     except Exception:
         return _degraded(args, output, "local_operation_unavailable")
 
 
 def _dispatch(
-    args: argparse.Namespace, service: NormalizerService, output: TextIO
+    args: argparse.Namespace,
+    service: NormalizerService,
+    installer: Installer,
+    output: TextIO,
 ) -> int:
     if args.command == "normalize":
         decision = service.normalize(
@@ -164,7 +197,7 @@ def _dispatch(
                 "files_scanned": result.files_scanned,
             },
         )
-    if args.command == "doctor":
+    if args.command == "doctor" and not args.platform and not args.all_detected:
         writable = _state_writable(service.paths.root)
         return _write_result(
             output,
@@ -175,7 +208,38 @@ def _dispatch(
                 "diagnostics": [] if writable else ["state_unavailable"],
             },
         )
-    if args.command in {"update", "install", "uninstall"}:
+    if args.command == "install":
+        platforms = _selected_platforms(args, installer)
+        results = installer.install(
+            platforms,
+            InstallOptions(
+                strict=args.strict,
+                output_dir=None if args.output_dir is None else Path(args.output_dir),
+                workspace=None if args.workspace is None else Path(args.workspace),
+                auto_update=bool(args.auto_update),
+                implicit_invocation_confirmed=args.implicit_invocation_confirmed,
+            ),
+        )
+        return _write_installer_results(output, args, results)
+    if args.command == "uninstall":
+        return _write_installer_results(
+            output,
+            args,
+            installer.uninstall(
+                _selected_platforms(args, installer),
+                UninstallOptions(
+                    output_dir=None
+                    if args.output_dir is None
+                    else Path(args.output_dir),
+                    workspace=None if args.workspace is None else Path(args.workspace),
+                ),
+            ),
+        )
+    if args.command == "doctor":
+        return _write_installer_results(
+            output, args, installer.doctor(_selected_platforms(args, installer))
+        )
+    if args.command == "update":
         return _degraded(
             args, output, f"{args.command} is not configured in this build"
         )
@@ -291,6 +355,62 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise _UsageError("--limit must be positive")
     if args.command == "learn" and args.scope == "project" and not args.project_root:
         raise _UsageError("--project-root is required for project learning")
+    if args.command in {"install", "uninstall"} and args.json:
+        if not args.platform and not args.all_detected:
+            raise _UsageError("--platform or --all-detected is required in JSON mode")
+    if args.command == "install" and args.json and args.auto_update is None:
+        raise _UsageError("--auto-update or --no-auto-update is required in JSON mode")
+
+
+def _complete_human_install_options(
+    args: argparse.Namespace, input_func: Callable[[str], str] | None
+) -> None:
+    if args.command != "install" or args.json:
+        return
+    ask = input if input_func is None else input_func
+    if not args.platform and not args.all_detected:
+        values = ask("Platforms (comma-separated): ")
+        args.platform = [value.strip() for value in values.split(",") if value.strip()]
+    if args.auto_update is None:
+        response = (
+            ask("Enable daily public hotword updates? [Y/n]: ").strip().casefold()
+        )
+        args.auto_update = response not in {"n", "no", "false", "0"}
+
+
+def _selected_platforms(
+    args: argparse.Namespace, installer: Installer
+) -> tuple[str, ...]:
+    if args.all_detected:
+        return installer.detected()
+    return tuple(args.platform)
+
+
+def _write_installer_results(
+    output: TextIO, args: argparse.Namespace, results: tuple[AdapterResult, ...]
+) -> int:
+    payload = [_adapter_result(result) for result in results]
+    if args.json:
+        _write_json(output, payload)
+    else:
+        for result in results:
+            _write_text(
+                output,
+                f"{result.platform}: {result.status} ({result.capability.value})\n",
+            )
+            for message in result.messages:
+                _write_text(output, f"  {message}\n")
+    return 0
+
+
+def _adapter_result(result: AdapterResult) -> dict[str, object]:
+    return {
+        "platform": result.platform,
+        "status": result.status,
+        "capability": result.capability.value,
+        "messages": list(result.messages),
+        "changed_paths": [str(path) for path in result.changed_paths],
+    }
 
 
 def _configure_utf8(*streams: object) -> None:
