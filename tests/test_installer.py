@@ -173,6 +173,31 @@ def test_uninstall_uses_explicit_skill_root_not_tampered_status(tmp_path: Path):
     assert (root / "voice-intent-normalizer").exists()
 
 
+def test_uninstall_restores_every_file_when_status_removal_fails(
+    tmp_path: Path, monkeypatch
+):
+    repository = Path(__file__).resolve().parents[1]
+    root = tmp_path / "skills"
+    root.mkdir()
+    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
+    adapter = GenericAdapter(repository, state)
+    adapter.install(InstallOptions(output_dir=root))
+    target = root / "voice-intent-normalizer"
+    marker = target / "SKILL.md"
+    before = marker.read_bytes()
+    monkeypatch.setattr(
+        adapter,
+        "_remove_status",
+        lambda: (_ for _ in ()).throw(OSError("status unavailable")),
+    )
+
+    result = adapter.uninstall(UninstallOptions(output_dir=root))
+
+    assert result.status == "failed"
+    assert marker.read_bytes() == before
+    assert state.adapter_status_file("generic").exists()
+
+
 def test_generic_refuses_to_overwrite_unmanaged_directory(tmp_path: Path):
     repository = Path(__file__).resolve().parents[1]
     root = tmp_path / "skills"
