@@ -14,7 +14,8 @@ The following JSON contract is authoritative for hosts.
   "valid_ask": {
     "show_question": true,
     "wait": true,
-    "execute_candidate": false
+    "execute_task": false,
+    "choose_candidate": false
   },
   "valid_keep": {
     "use_text": "original_text",

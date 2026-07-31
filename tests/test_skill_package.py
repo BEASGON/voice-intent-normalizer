@@ -44,7 +44,8 @@ _RESPONSE_HANDLING_CONTRACT = {
     "valid_ask": {
         "show_question": True,
         "wait": True,
-        "execute_candidate": False,
+        "execute_task": False,
+        "choose_candidate": False,
     },
     "valid_keep": {
         "use_text": "original_text",
@@ -326,10 +327,8 @@ def test_policy_reference_matches_skill_response_contract(repo_root: Path) -> No
             '"use_text": "corrected_text"',
             '"use_text": "original_text"',
         ),
-        (
-            '"execute_candidate": false',
-            '"execute_candidate": true',
-        ),
+        ('"execute_task": false', '"execute_task": true'),
+        ('"choose_candidate": false', '"choose_candidate": true'),
         (
             '"show_correction_receipt": false',
             '"show_correction_receipt": true',
@@ -398,7 +397,11 @@ def test_response_contract_rejects_key_changes_and_allows_json_formatting(
         "",
         1,
     )
-    for mutated in (extra, missing):
+    nested_extra = policy.replace(
+        '    "wait": true,\n', '    "wait": true,\n    "unexpected": true,\n', 1
+    )
+    nested_missing = policy.replace('    "choose_candidate": false\n', "", 1)
+    for mutated in (extra, missing, nested_extra, nested_missing):
         with pytest.raises(AssertionError):
             _assert_response_handling_contract(_response_contract(mutated))
 
@@ -407,6 +410,17 @@ def test_response_contract_rejects_key_changes_and_allows_json_formatting(
         r"(?s)(```json\n).*?(\n```)", rf"\1{reordered_json}\2", policy, count=1
     )
     _assert_response_handling_contract(_response_contract(reformatted))
+
+
+def test_high_impact_ask_contract_waits_for_confirmation() -> None:
+    """ASK never executes a task or selects a candidate before confirmation."""
+    ask = _RESPONSE_HANDLING_CONTRACT["valid_ask"]
+    assert ask == {
+        "show_question": True,
+        "wait": True,
+        "execute_task": False,
+        "choose_candidate": False,
+    }
 
 
 def test_bootstrap_normalize_returns_stable_json(
