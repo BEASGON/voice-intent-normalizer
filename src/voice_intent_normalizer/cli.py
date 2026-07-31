@@ -236,6 +236,7 @@ def _dispatch(
                     if args.output_dir is None
                     else Path(args.output_dir),
                     workspace=None if args.workspace is None else Path(args.workspace),
+                    strict=args.strict,
                 ),
             ),
         )

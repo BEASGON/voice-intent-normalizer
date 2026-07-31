@@ -31,6 +31,7 @@ class UninstallOptions:
     remove_shared_data: bool = False
     output_dir: Path | None = None
     workspace: Path | None = None
+    strict: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,17 +10,46 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
-from ..paths import StatePaths, guard_state_root, validate_state_root
+import tomllib
+
+from ..paths import (
+    StatePaths,
+    StateRootLease,
+    guard_state_root,
+    state_root_lock_key,
+    validate_state_root,
+)
 from ..updater import _retained_lease_update_lock
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
 
 _MANIFEST = ".voice-intent-normalizer-install.json"
 _NAME = "voice-intent-normalizer"
 _STATUS_RELATIVE = Path("adapters") / "generic.json"
+_RECOVERY_RELATIVE = Path("adapters") / "generic-recovery.json"
 _PACKAGE_FILES = ("SKILL.md", "pyproject.toml", "LICENSE")
 _PACKAGE_DIRECTORIES = ("agents", "assets", "references")
+_REQUIRED_FILES = (
+    "SKILL.md",
+    "scripts/voice_intent.py",
+    "src/voice_intent_normalizer/__init__.py",
+    "src/voice_intent_normalizer/cli.py",
+)
+_MANIFEST_LIMIT = 2 * 1024 * 1024
+_MANAGED_FILE_LIMIT = 64 * 1024 * 1024
+_WINDOWS_REPARSE_POINT = 0x400
+
+
+@dataclass(frozen=True, slots=True)
+class _Inspection:
+    state: str
+    manifest: dict[str, object] | None = None
+    root_identity: tuple[int, int] | None = None
+    target_identity: tuple[int, int] | None = None
 
 
 class GenericAdapter:
@@ -32,164 +61,302 @@ class GenericAdapter:
         self.repository = Path(repository).resolve(strict=True)
         self.state_paths = state_paths
         self._configured_skill_root: Path | None = None
+        self._active_state_lease: StateRootLease | None = None
+        self._active_skill_lease: StateRootLease | None = None
+        self._active_skill_root: Path | None = None
+        self._active_moved: tuple[Path, ...] = ()
 
     def detect(self) -> AdapterResult:
         return self.doctor()
 
     def install(self, options: InstallOptions) -> AdapterResult:
-        with guard_state_root(
-            self.state_paths.root,
-            create=True,
-            retained_dirs=("adapters",),
-            create_retained=True,
-        ) as lease:
-            with _retained_lease_update_lock(lease):
+        try:
+            with self._state_operation(create=True):
                 return self._install_locked(options)
+        except Exception:
+            return self._failed("generic installation was not completed")
 
     def _install_locked(self, options: InstallOptions) -> AdapterResult:
         if options.output_dir is None:
             return self._failed("a skill root is required")
+        root = self._safe_skill_root(options.output_dir)
+        self._configured_skill_root = root
+        target = root / _NAME
+        staging = root / f".{_NAME}.staging-{secrets.token_hex(12)}"
         try:
-            root = self._safe_skill_root(options.output_dir)
-            self._configured_skill_root = root
-            target = root / _NAME
-            self._ensure_direct_target(target)
-            if target.exists():
-                if not self._managed(target):
-                    return self._failed(
-                        "existing skill directory is not installer-managed"
-                    )
-                return AdapterResult(
-                    self.platform,
-                    "already-installed",
-                    self._capability(options),
-                    ("managed skill files are already installed",),
+            self._copy_runtime(staging)
+            self._validate_staging(staging)
+            self._write_manifest(staging, root)
+            staged = self._inspect_package(root, staging, expected_name=staging.name)
+            if staged.state != "valid" or staged.manifest is None:
+                raise ValueError("staged package failed integrity validation")
+            if not target.exists() and not target.is_symlink():
+                return self._commit_new_install(
+                    root,
+                    target,
+                    staging,
+                    staged.manifest,
+                    options,
+                    staged.root_identity,
+                    staged.target_identity,
                 )
-            staging = root / f".{_NAME}.staging-{secrets.token_hex(12)}"
-            try:
-                self._copy_runtime(staging)
-                self._validate_staging(staging)
-                self._write_manifest(staging, root)
-                os.replace(staging, target)
-            except Exception:
-                self._remove_staging(staging)
-                raise
-            try:
-                status_path = self._write_status(target, options)
-            except Exception:
-                return AdapterResult(
-                    self.platform,
-                    "degraded",
-                    self._capability(options),
-                    ("skill files installed; shared status recording is pending",),
-                    self._managed_files(target),
-                )
-            return AdapterResult(
-                self.platform,
-                "installed",
-                self._capability(options),
-                (
-                    "skill discovery must be enabled by the selected host",
-                    self._manual_message(options),
-                ),
-                self._managed_files(target) + (status_path,),
+            return self._repair_or_reuse(
+                root, target, staging, staged.manifest, options
             )
         except Exception:
-            return self._failed("generic installation was not completed")
+            self._remove_staging(staging)
+            raise
 
     def doctor(self) -> AdapterResult:
         try:
-            status = self._read_status()
+            with self._state_operation(create=False, lock_missing=False):
+                return self._doctor_locked()
         except Exception:
             return self._failed("shared adapter status is unavailable")
-        if status is None:
+
+    def _doctor_locked(self) -> AdapterResult:
+        recovery = self._read_recovery()
+        status_error = False
+        try:
+            status = self._read_status()
+        except Exception:
+            status = None
+            status_error = True
+
+        root = self._configured_skill_root
+        if root is None and status is not None:
+            raw_root = status.get("skill_root")
+            if isinstance(raw_root, str):
+                root = Path(raw_root)
+
+        if root is None:
+            messages = ["installed files: absent"]
+            if status_error:
+                messages.append("adapter status: invalid")
+            else:
+                messages.append("adapter status: missing")
+            if recovery is not None:
+                messages.append(
+                    "recovery required: installer transaction is incomplete"
+                )
+            messages.append("manual action required")
             return AdapterResult(
                 self.platform,
-                "not-installed",
+                "degraded" if status_error or recovery is not None else "not-installed",
                 CapabilityLevel.UNAVAILABLE,
-                (
-                    "installed files: absent",
-                    "shared state: unavailable",
-                    "manual action required",
-                ),
+                tuple(messages),
             )
-        target = Path(status["managed_directory"])
+
         try:
-            self._ensure_direct_target(target)
-        except (OSError, ValueError):
-            return self._failed("managed skill directory is not a direct directory")
-        installed = self._managed(target)
-        capability = CapabilityLevel(
-            status.get("capability", CapabilityLevel.MANUAL.value)
+            root = self._safe_skill_root(root)
+            target = root / _NAME
+            inspection = self._inspect_package(root, target)
+        except Exception:
+            inspection = _Inspection("invalid")
+
+        messages = [
+            f"managed package: {self._inspection_message(inspection.state)}",
+            (
+                "required file SKILL.md: valid"
+                if inspection.state == "valid"
+                else "required file SKILL.md: invalid"
+            ),
+            "skill discovery: host-dependent",
+            "automatic trigger: unavailable",
+            "strict hook: unavailable",
+            "shared state: available",
+        ]
+        if status_error:
+            messages.append("adapter status: invalid")
+        elif status is None:
+            messages.append("adapter status: missing")
+        else:
+            messages.append("adapter status: present")
+        if recovery is not None:
+            messages.append("recovery required: installer transaction is incomplete")
+
+        capability = CapabilityLevel.MANUAL
+        if status is not None:
+            try:
+                capability = CapabilityLevel(str(status["capability"]))
+            except (KeyError, ValueError):
+                status_error = True
+        messages.append(self._manual_message_for(capability))
+        healthy = (
+            inspection.state == "valid"
+            and status is not None
+            and not status_error
+            and recovery is None
+            and self._status_matches(status, root, inspection.manifest)
         )
         return AdapterResult(
             self.platform,
-            "installed" if installed else "degraded",
-            capability,
-            (
-                f"installed files: {'present' if installed else 'missing'}",
-                "skill discovery: host-dependent",
-                "automatic trigger: unavailable",
-                "strict hook: unavailable",
-                "shared state: available",
-                self._manual_message_for(capability),
-            ),
+            "installed" if healthy else "degraded",
+            capability if healthy else CapabilityLevel.MANUAL,
+            tuple(messages),
         )
 
     def uninstall(self, options: UninstallOptions) -> AdapterResult:
-        with guard_state_root(
-            self.state_paths.root,
-            create=True,
-            retained_dirs=("adapters",),
-            create_retained=True,
-        ) as lease:
-            with _retained_lease_update_lock(lease):
-                return self._uninstall_locked(options)
-
-    def _uninstall_locked(self, options: UninstallOptions) -> AdapterResult:
         if options.remove_shared_data:
-            return self._failed("shared-data removal requires a separate manual action")
-        try:
-            status = self._read_status()
-            if status is None:
-                return AdapterResult(
-                    self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
-                )
-            root_value = options.output_dir or self._configured_skill_root
-            if root_value is None:
-                return self._failed("skill root is required for safe uninstall")
-            root = self._safe_skill_root(root_value)
-            target = root / _NAME
-            if Path(status["managed_directory"]) != target:
-                return self._failed("shared status does not match selected skill root")
-            if Path(status["skill_root"]) != root:
-                return self._failed("shared status does not match selected skill root")
-            self._ensure_direct_target(target)
-            if not self._managed(target):
-                return self._failed("managed ownership cannot be verified")
-            manifest = json.loads((target / _MANIFEST).read_text(encoding="utf-8"))
-            if status["install_id"] != manifest["install_id"]:
-                return self._failed("shared status does not match installed package")
-            quarantine, moved = self._quarantine_managed_files(target)
-            try:
-                status_path = self._remove_status()
-            except Exception:
-                self._restore_quarantine(quarantine, target, moved)
-                return self._failed(
-                    "adapter status could not be updated; files restored"
-                )
-            self._discard_quarantine(quarantine)
-            self._remove_empty_dirs(target)
-            changed = tuple(moved)
-            return AdapterResult(
-                self.platform,
-                "uninstalled",
-                CapabilityLevel.MANUAL,
-                ("shared personal and project data were preserved",),
-                changed + (() if status_path is None else (status_path,)),
+            return self._failed(
+                "shared-data removal is intentionally separate and was not performed"
             )
+        try:
+            with self._state_operation(create=True):
+                return self._uninstall_locked(options)
         except Exception:
             return self._failed("generic uninstall was not completed")
+
+    def _uninstall_locked(self, options: UninstallOptions) -> AdapterResult:
+        status = self._read_status()
+        if status is None:
+            return AdapterResult(
+                self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
+            )
+        root_value = options.output_dir or self._configured_skill_root
+        if root_value is None:
+            return self._failed("skill root is required for safe uninstall")
+        root = self._safe_skill_root(root_value)
+        self._configured_skill_root = root
+        target = root / _NAME
+        inspection = self._inspect_package(root, target)
+        if inspection.state != "valid" or inspection.manifest is None:
+            return self._failed("managed ownership cannot be verified")
+        manifest = inspection.manifest
+        if not self._status_matches(status, root, manifest):
+            return self._failed("shared status does not match selected skill root")
+
+        paths = self._manifest_paths(target, manifest)
+        quarantine = root / f".{_NAME}.quarantine-{secrets.token_hex(12)}"
+        self._prepare_quarantine(quarantine, target, paths)
+        recovery_path = self._write_recovery(
+            "uninstall", root, target, quarantine, paths, manifest
+        )
+        moved: tuple[Path, ...] = ()
+        status_path: Path | None = None
+        status_failure: str | None = None
+        try:
+            with self._skill_transaction(
+                root,
+                target,
+                quarantine,
+                paths,
+                (),
+                expected_root_identity=inspection.root_identity,
+                expected_target_identity=inspection.target_identity,
+            ) as lease:
+                self._verify_manifest_under_lease(
+                    lease, target, manifest, require_hashes=True
+                )
+                moved = self._quarantine_managed_files(target, quarantine)
+                try:
+                    status_path = self._remove_status()
+                except Exception:
+                    self._restore_quarantine(quarantine, target, moved)
+                    status_failure = "adapter status could not be updated"
+                if status_failure is None:
+                    try:
+                        self._discard_quarantine(quarantine)
+                    except Exception:
+                        changed = self._changed_after_failed_restore(
+                            target, quarantine, moved
+                        )
+                        return AdapterResult(
+                            self.platform,
+                            "degraded",
+                            CapabilityLevel.UNAVAILABLE,
+                            (
+                                "uninstall cleanup is incomplete",
+                                "recovery is recorded; run doctor before retrying",
+                            ),
+                            changed + (status_path, recovery_path),
+                        )
+        except Exception:
+            changed = self._changed_after_failed_restore(target, quarantine, paths)
+            if changed:
+                return AdapterResult(
+                    self.platform,
+                    "degraded",
+                    CapabilityLevel.UNAVAILABLE,
+                    (
+                        "managed files could not be quarantined",
+                        "recovery is recorded; run doctor before retrying",
+                    ),
+                    changed + (recovery_path,),
+                )
+            self._cleanup_quarantine_dirs(root, quarantine, paths)
+            self._remove_recovery(missing_ok=True)
+            return self._failed(
+                "managed files could not be quarantined; files restored"
+            )
+
+        if status_failure is not None:
+            return self._restoration_result(
+                root,
+                target,
+                quarantine,
+                moved,
+                status_failure,
+            )
+
+        removed_dirs = self._remove_known_empty_dirs(root, target, paths)
+        quarantine_dirs = self._cleanup_quarantine_dirs(root, quarantine, paths)
+        try:
+            self._remove_recovery()
+        except Exception:
+            return AdapterResult(
+                self.platform,
+                "degraded",
+                CapabilityLevel.UNAVAILABLE,
+                (
+                    "skill files were removed but recovery metadata remains",
+                    "run doctor before retrying",
+                ),
+                paths
+                + removed_dirs
+                + quarantine_dirs
+                + ((status_path,) if status_path is not None else ())
+                + (recovery_path,),
+            )
+        assert status_path is not None
+        return AdapterResult(
+            self.platform,
+            "uninstalled",
+            CapabilityLevel.MANUAL,
+            ("shared personal and project data were preserved",),
+            paths + removed_dirs + (status_path,),
+        )
+
+    @contextmanager
+    def _state_operation(
+        self, *, create: bool, lock_missing: bool = True
+    ) -> Iterator[StateRootLease | None]:
+        with guard_state_root(
+            self.state_paths.root,
+            create=create,
+            retained_dirs=("adapters",),
+            create_retained=create,
+        ) as lease:
+            if not lease.root_exists and not lock_missing:
+                previous = self._active_state_lease
+                self._active_state_lease = lease
+                try:
+                    yield lease
+                finally:
+                    self._active_state_lease = previous
+                return
+            with _retained_lease_update_lock(lease):
+                previous = self._active_state_lease
+                self._active_state_lease = lease
+                try:
+                    yield lease
+                finally:
+                    self._active_state_lease = previous
+
+    def _state_lease(self) -> StateRootLease:
+        if self._active_state_lease is None:
+            raise RuntimeError("adapter state operation is not locked")
+        return self._active_state_lease
 
     def _safe_skill_root(self, value: Path) -> Path:
         root = validate_state_root(value)
@@ -197,12 +364,305 @@ class GenericAdapter:
             raise ValueError("skill root must be an existing direct directory")
         return root
 
-    @staticmethod
-    def _ensure_direct_target(target: Path) -> None:
-        if target.exists() or target.is_symlink():
-            info = os.lstat(target)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise ValueError("skill destination must be a direct directory")
+    def _commit_new_install(
+        self,
+        root: Path,
+        target: Path,
+        staging: Path,
+        manifest: dict[str, object],
+        options: InstallOptions,
+        expected_root_identity: tuple[int, int] | None,
+        expected_staging_identity: tuple[int, int] | None,
+    ) -> AdapterResult:
+        with guard_state_root(root) as lease:
+            if (
+                expected_root_identity is not None
+                and self._directory_identity(lease.stat("."))
+                != expected_root_identity
+            ):
+                raise OSError("skill root identity changed before commit")
+            if (
+                expected_staging_identity is not None
+                and self._directory_identity(lease.stat(staging.name))
+                != expected_staging_identity
+            ):
+                raise OSError("staging identity changed before commit")
+            if lease.exists(_NAME):
+                raise FileExistsError("skill destination appeared during installation")
+            lease.replace(staging.name, _NAME)
+        inspection = self._inspect_package(root, target)
+        if (
+            inspection.state != "valid"
+            or inspection.manifest is None
+            or inspection.manifest["install_id"] != manifest["install_id"]
+        ):
+            raise ValueError("installed package identity changed during commit")
+        changed = self._package_changed_paths(target, manifest)
+        try:
+            status_path = self._write_status(target, options)
+        except Exception:
+            return AdapterResult(
+                self.platform,
+                "degraded",
+                self._capability(options),
+                (
+                    "skill files installed; shared status recording is pending",
+                    "run install again to repair adapter status",
+                ),
+                changed,
+            )
+        return AdapterResult(
+            self.platform,
+            "installed",
+            self._capability(options),
+            (
+                "skill discovery must be enabled by the selected host",
+                self._manual_message(options),
+            ),
+            changed + (status_path,),
+        )
+
+    def _repair_or_reuse(
+        self,
+        root: Path,
+        target: Path,
+        staging: Path,
+        desired: dict[str, object],
+        options: InstallOptions,
+    ) -> AdapterResult:
+        current = self._inspect_package(root, target, allow_hash_failure=True)
+        if current.manifest is None or current.state in {
+            "missing",
+            "manifest-invalid",
+            "alias-invalid",
+        }:
+            return self._failed("existing skill directory is not installer-managed")
+        same_package = (
+            current.state == "valid"
+            and current.manifest.get("format") == 3
+            and current.manifest.get("package_hash") == desired.get("package_hash")
+            and current.manifest.get("package_version")
+            == desired.get("package_version")
+        )
+        status = None
+        try:
+            status = self._read_status()
+        except Exception:
+            status = None
+        desired_capability = self._capability(options).value
+        if same_package:
+            if (
+                status is not None
+                and self._status_matches(status, root, current.manifest)
+                and status.get("capability") == desired_capability
+            ):
+                self._remove_staging(staging)
+                return AdapterResult(
+                    self.platform,
+                    "already-installed",
+                    self._capability(options),
+                    ("managed skill files are already installed",),
+                )
+            status_path = self._write_status(target, options)
+            self._remove_staging(staging)
+            return AdapterResult(
+                self.platform,
+                "repaired",
+                self._capability(options),
+                ("adapter status and capability were rebuilt",),
+                (status_path,),
+            )
+        return self._upgrade_package(root, target, staging, current, desired, options)
+
+    def _upgrade_package(
+        self,
+        root: Path,
+        target: Path,
+        staging: Path,
+        current: _Inspection,
+        desired: dict[str, object],
+        options: InstallOptions,
+    ) -> AdapterResult:
+        assert current.manifest is not None
+        old_paths = self._manifest_paths(target, current.manifest)
+        new_paths = self._manifest_paths(target, desired)
+        old_relatives = {path.relative_to(target) for path in old_paths}
+        for path in new_paths:
+            if path.exists() and path.relative_to(target) not in old_relatives:
+                return self._failed("managed upgrade would overwrite an unknown file")
+
+        created_dirs = self._prepare_target_directories(target, desired)
+        quarantine = root / f".{_NAME}.quarantine-{secrets.token_hex(12)}"
+        self._prepare_quarantine(quarantine, target, old_paths)
+        recovery_path = self._write_recovery(
+            "upgrade", root, target, quarantine, old_paths, current.manifest
+        )
+        staged_paths = self._manifest_paths(staging, desired)
+        moved_old: tuple[Path, ...] = ()
+        moved_new: list[Path] = []
+        move_failure: str | None = None
+        try:
+            with self._skill_transaction(
+                root,
+                target,
+                quarantine,
+                old_paths,
+                tuple(staged_paths),
+                staging=staging,
+                desired_paths=new_paths,
+                expected_root_identity=current.root_identity,
+                expected_target_identity=current.target_identity,
+            ) as lease:
+                self._verify_manifest_under_lease(
+                    lease, target, current.manifest, require_hashes=False
+                )
+                moved_old = self._quarantine_managed_files(
+                    target, quarantine, allow_missing=True
+                )
+                try:
+                    for source, destination in zip(
+                        staged_paths, new_paths, strict=True
+                    ):
+                        lease.replace(
+                            source.relative_to(root), destination.relative_to(root)
+                        )
+                        moved_new.append(destination)
+                except Exception:
+                    for destination, source in reversed(
+                        list(zip(moved_new, staged_paths, strict=False))
+                    ):
+                        if destination.exists():
+                            lease.replace(
+                                destination.relative_to(root),
+                                source.relative_to(root),
+                            )
+                    self._restore_quarantine(quarantine, target, moved_old)
+                    move_failure = "managed upgrade was rolled back"
+                if move_failure is None:
+                    try:
+                        status_path = self._write_status(target, options)
+                    except Exception:
+                        return AdapterResult(
+                            self.platform,
+                            "degraded",
+                            self._capability(options),
+                            (
+                                "managed package was repaired; "
+                                "status recording is pending",
+                                "recovery is recorded; run install again",
+                            ),
+                            tuple(new_paths) + created_dirs + (recovery_path,),
+                        )
+                    try:
+                        self._discard_quarantine(quarantine)
+                    except Exception:
+                        return AdapterResult(
+                            self.platform,
+                            "degraded",
+                            self._capability(options),
+                            (
+                                "managed package was repaired but "
+                                "backup cleanup failed",
+                                "recovery is recorded; run doctor before retrying",
+                            ),
+                            tuple(new_paths)
+                            + created_dirs
+                            + self._quarantine_changed_paths(
+                                quarantine, target, moved_old
+                            )
+                            + (status_path, recovery_path),
+                        )
+        except Exception:
+            if moved_old:
+                return self._restoration_result(
+                    root,
+                    target,
+                    quarantine,
+                    moved_old,
+                    "managed upgrade could not be completed",
+                )
+            raise
+
+        if move_failure is not None:
+            self._remove_staging(staging)
+            return self._restoration_result(
+                root,
+                target,
+                quarantine,
+                moved_old,
+                move_failure,
+            )
+
+        self._remove_staging(staging)
+        self._cleanup_quarantine_dirs(root, quarantine, old_paths)
+        self._remove_recovery(missing_ok=True)
+        operation = (
+            "upgraded"
+            if current.state == "valid"
+            and current.manifest.get("package_version")
+            != desired.get("package_version")
+            else "repaired"
+        )
+        return AdapterResult(
+            self.platform,
+            operation,
+            self._capability(options),
+            ("managed package integrity and adapter status were refreshed",),
+            tuple(new_paths) + created_dirs + (status_path,),
+        )
+
+    @contextmanager
+    def _skill_transaction(
+        self,
+        root: Path,
+        target: Path,
+        quarantine: Path,
+        old_paths: Sequence[Path],
+        staged_paths: Sequence[Path],
+        *,
+        staging: Path | None = None,
+        desired_paths: Sequence[Path] = (),
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_target_identity: tuple[int, int] | None = None,
+    ) -> Iterator[StateRootLease]:
+        retained = set(self._parent_directories(root, old_paths))
+        retained.update(self._parent_directories(root, desired_paths))
+        retained.update(
+            self._parent_directories(
+                root,
+                tuple(quarantine / path.relative_to(target) for path in old_paths),
+            )
+        )
+        if staging is not None:
+            retained.update(self._parent_directories(root, staged_paths))
+        retained.discard(Path("."))
+        with guard_state_root(
+            root,
+            retained_dirs=tuple(sorted(retained, key=lambda p: (len(p.parts), str(p)))),
+        ) as lease:
+            if (
+                expected_root_identity is not None
+                and self._directory_identity(lease.stat(".")) != expected_root_identity
+            ):
+                raise OSError("skill root identity changed before transaction")
+            if (
+                expected_target_identity is not None
+                and self._directory_identity(lease.stat(_NAME))
+                != expected_target_identity
+            ):
+                raise OSError("managed target identity changed before transaction")
+            previous_lease = self._active_skill_lease
+            previous_root = self._active_skill_root
+            previous_moved = self._active_moved
+            self._active_skill_lease = lease
+            self._active_skill_root = root
+            self._active_moved = tuple(old_paths)
+            try:
+                yield lease
+            finally:
+                self._active_skill_lease = previous_lease
+                self._active_skill_root = previous_root
+                self._active_moved = previous_moved
 
     def _copy_runtime(self, staging: Path) -> None:
         staging.mkdir(mode=0o700)
@@ -222,66 +682,94 @@ class GenericAdapter:
     @staticmethod
     def _copy_file(source: Path, destination: Path) -> None:
         info = os.lstat(source)
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+        ):
             raise ValueError("runtime source must be a direct regular file")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(source.read_bytes())
+        data = source.read_bytes()
+        after = os.lstat(source)
+        if (info.st_dev, info.st_ino, info.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ):
+            raise OSError("runtime source changed while it was copied")
+        destination.write_bytes(data)
 
     def _copy_tree(self, source: Path, destination: Path) -> None:
-        for path in source.rglob("*"):
-            relative = path.relative_to(source)
-            target = destination / relative
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode):
-                raise ValueError("runtime source contains an alias")
-            if stat.S_ISDIR(info.st_mode):
-                target.mkdir(parents=True, exist_ok=True)
-            elif stat.S_ISREG(info.st_mode):
-                self._copy_file(path, target)
-            else:
-                raise ValueError("runtime source contains a non-regular file")
+        for current, directories, files in os.walk(source, followlinks=False):
+            current_path = Path(current)
+            current_info = os.lstat(current_path)
+            self._require_direct_directory(current_info)
+            for name in tuple(directories):
+                info = os.lstat(current_path / name)
+                self._require_direct_directory(info)
+                (destination / (current_path / name).relative_to(source)).mkdir(
+                    parents=True, exist_ok=True
+                )
+            for name in files:
+                path = current_path / name
+                self._copy_file(path, destination / path.relative_to(source))
 
     def _copy_python_tree(self, source: Path, destination: Path) -> None:
-        for path in source.rglob("*.py"):
-            self._copy_file(path, destination / path.relative_to(source))
+        for current, directories, files in os.walk(source, followlinks=False):
+            current_path = Path(current)
+            self._require_direct_directory(os.lstat(current_path))
+            for name in tuple(directories):
+                self._require_direct_directory(os.lstat(current_path / name))
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                path = current_path / name
+                self._copy_file(path, destination / path.relative_to(source))
 
     @staticmethod
-    def _remove_staging(staging: Path) -> None:
-        """Best-effort cleanup which never follows an injected alias."""
-        if not staging.exists() or staging.is_symlink():
-            return
-        for path in sorted(
-            staging.rglob("*"), key=lambda item: len(item.parts), reverse=True
+    def _require_direct_directory(info: os.stat_result) -> None:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
         ):
-            try:
-                info = os.lstat(path)
-                if stat.S_ISLNK(info.st_mode):
-                    path.unlink()
-                elif stat.S_ISREG(info.st_mode):
-                    path.unlink()
-                elif stat.S_ISDIR(info.st_mode):
-                    path.rmdir()
-            except OSError:
-                continue
-        try:
-            staging.rmdir()
-        except OSError:
-            return
+            raise ValueError("runtime source contains a directory alias")
 
     @staticmethod
     def _validate_staging(staging: Path) -> None:
-        """Prove the copied skill can bootstrap without the development checkout."""
-        skill = staging / "SKILL.md"
-        script = staging / "scripts" / "voice_intent.py"
-        for path in (skill, script):
+        for relative in _REQUIRED_FILES:
+            path = staging / relative
             info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+            ):
                 raise ValueError("staged skill is incomplete")
-        with tempfile.TemporaryDirectory(prefix="voice-intent-stage-") as state:
+        skill_text = (staging / "SKILL.md").read_text(encoding="utf-8")
+        if "name: voice-intent-normalizer" not in skill_text:
+            raise ValueError("staged skill metadata is invalid")
+        with tempfile.TemporaryDirectory(prefix="voice-intent-stage-") as sandbox:
+            state = Path(sandbox) / "state"
+            working = Path(sandbox) / "cwd"
+            working.mkdir()
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(Path(sandbox) / "untrusted"),
+                "VOICE_INTENT_HOME": str(state),
+            }
+            if os.name == "nt":
+                environment["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
             result = subprocess.run(
-                [sys.executable, "-I", str(script), "doctor", "--json"],
-                cwd=staging,
-                env={"PATH": os.environ.get("PATH", ""), "VOICE_INTENT_HOME": state},
+                [
+                    sys.executable,
+                    "-I",
+                    str(staging / "scripts" / "voice_intent.py"),
+                    "doctor",
+                    "--json",
+                ],
+                cwd=working,
+                env=environment,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -298,116 +786,219 @@ class GenericAdapter:
 
     @staticmethod
     def _write_manifest(target: Path, root: Path) -> None:
-        files = sorted(
-            str(path.relative_to(target)).replace("\\", "/")
-            for path in target.rglob("*")
-            if path.is_file()
+        files = tuple(
+            sorted(
+                str(path.relative_to(target)).replace("\\", "/")
+                for path in target.rglob("*")
+                if path.is_file()
+            )
         )
         hashes = {
             relative: hashlib.sha256((target / relative).read_bytes()).hexdigest()
             for relative in files
         }
+        version_payload = tomllib.loads(
+            (target / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        package_version = version_payload["project"]["version"]
+        package_hash = GenericAdapter._package_hash(
+            str(package_version), hashes, _REQUIRED_FILES
+        )
+        payload = {
+            "files": list(files),
+            "format": 3,
+            "hashes": hashes,
+            "install_id": secrets.token_hex(16),
+            "owner": _NAME,
+            "package_hash": package_hash,
+            "package_version": str(package_version),
+            "required_files": list(_REQUIRED_FILES),
+            "skill_root": str(root),
+            "skill_root_key": state_root_lock_key(root),
+        }
         (target / _MANIFEST).write_text(
-            json.dumps(
-                {
-                    "files": files,
-                    "format": 2,
-                    "hashes": hashes,
-                    "install_id": secrets.token_hex(16),
-                    "owner": _NAME,
-                    "skill_root": str(root),
-                },
-                sort_keys=True,
-            ),
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
             encoding="utf-8",
         )
 
-    @staticmethod
-    def _managed(target: Path) -> bool:
+    def _inspect_package(
+        self,
+        root: Path,
+        target: Path,
+        *,
+        allow_hash_failure: bool = False,
+        expected_name: str = _NAME,
+    ) -> _Inspection:
+        raw = b""
+        root_identity: tuple[int, int] | None = None
+        target_identity: tuple[int, int] | None = None
+        if target.name != expected_name:
+            return _Inspection("manifest-invalid")
         try:
-            manifest = target / _MANIFEST
-            info = os.lstat(manifest)
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                return False
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            files = GenericAdapter._manifest_files(payload)
-            hashes = payload.get("hashes")
-            if (
-                payload.get("owner") != _NAME
-                or payload.get("format") != 2
-                or not isinstance(payload.get("install_id"), str)
-                or not isinstance(hashes, dict)
-                or files is None
-                or set(hashes) != set(files)
-            ):
-                return False
-            return all(
-                isinstance(hashes[name], str)
-                and hashlib.sha256((target / name).read_bytes()).hexdigest()
-                == hashes[name]
-                for name in files
-            )
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
+            with guard_state_root(root, retained_dirs=(expected_name,)) as lease:
+                if not lease.available(expected_name):
+                    return _Inspection("missing")
+                root_identity = self._directory_identity(lease.stat("."))
+                target_identity = self._directory_identity(lease.stat(expected_name))
+                raw = lease.read_bytes(
+                    Path(expected_name) / _MANIFEST,
+                    _MANIFEST_LIMIT,
+                    "installer manifest",
+                )
+            payload = json.loads(raw.decode("utf-8"))
+            manifest = self._validate_manifest_structure(payload, root)
+            retained = self._manifest_parent_directories(expected_name, manifest)
+            with guard_state_root(root, retained_dirs=retained) as lease:
+                if (
+                    self._directory_identity(lease.stat(".")) != root_identity
+                    or self._directory_identity(lease.stat(expected_name))
+                    != target_identity
+                ):
+                    raise OSError("managed target identity changed during inspection")
+                intact = self._verify_manifest_under_lease(
+                    lease,
+                    target,
+                    manifest,
+                    require_hashes=not allow_hash_failure,
+                )
+            if not intact:
+                return _Inspection(
+                    "hash-mismatch",
+                    manifest,
+                    root_identity,
+                    target_identity,
+                )
+            if manifest.get("format") != 3:
+                return _Inspection("legacy", manifest, root_identity, target_identity)
+            return _Inspection("valid", manifest, root_identity, target_identity)
+        except FileNotFoundError:
+            if allow_hash_failure:
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                    manifest = self._validate_manifest_structure(payload, root)
+                    return _Inspection(
+                        "hash-mismatch",
+                        manifest,
+                        root_identity,
+                        target_identity,
+                    )
+                except Exception:
+                    return _Inspection("manifest-invalid")
+            return _Inspection("hash-mismatch")
+        except ValueError:
+            if allow_hash_failure:
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                    manifest = self._validate_manifest_structure(payload, root)
+                    return _Inspection(
+                        "hash-mismatch",
+                        manifest,
+                        root_identity,
+                        target_identity,
+                    )
+                except Exception:
+                    return _Inspection("manifest-invalid")
+            return _Inspection("hash-mismatch")
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return _Inspection("alias-invalid")
 
-    def _write_status(self, target: Path, options: InstallOptions) -> Path:
-        capability = self._capability(options)
-        manifest = json.loads((target / _MANIFEST).read_text(encoding="utf-8"))
-        payload = json.dumps(
-            {
-                "capability": capability.value,
-                "install_id": manifest["install_id"],
-                "managed_directory": str(target),
-                "skill_root": manifest["skill_root"],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        with guard_state_root(
-            self.state_paths.root,
-            create=True,
-            retained_dirs=("adapters",),
-            create_retained=True,
-        ) as lease:
-            lease.write_bytes_atomic(_STATUS_RELATIVE, payload)
-        return self.state_paths.adapter_status_file(self.platform)
-
-    def _read_status(self) -> dict[str, str] | None:
-        with guard_state_root(
-            self.state_paths.root, retained_dirs=("adapters",)
-        ) as lease:
-            if not lease.available("adapters") or not lease.exists(_STATUS_RELATIVE):
-                return None
-            raw = lease.read_bytes(_STATUS_RELATIVE, 16 * 1024, "adapter status")
-        payload = json.loads(raw.decode("utf-8"))
-        if set(payload) != {
-            "capability",
+    def _validate_manifest_structure(
+        self, payload: object, root: Path
+    ) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid installer manifest")
+        format_value = payload.get("format")
+        expected = {
+            "files",
+            "format",
+            "hashes",
             "install_id",
-            "managed_directory",
+            "owner",
             "skill_root",
-        }:
-            raise ValueError("invalid adapter status")
+        }
+        if format_value == 3:
+            expected |= {
+                "package_hash",
+                "package_version",
+                "required_files",
+                "skill_root_key",
+            }
+        elif format_value != 2:
+            raise ValueError("unsupported installer manifest")
+        if set(payload) != expected:
+            raise ValueError("invalid installer manifest fields")
+        files = self._manifest_files(payload)
+        hashes = payload.get("hashes")
+        if (
+            payload.get("owner") != _NAME
+            or not isinstance(payload.get("install_id"), str)
+            or not payload["install_id"]
+            or not isinstance(hashes, dict)
+            or files is None
+            or set(hashes) != set(files)
+            or not all(isinstance(hashes[name], str) for name in files)
+        ):
+            raise ValueError("invalid installer manifest")
+        supplied_root = payload.get("skill_root")
+        if not isinstance(supplied_root, str):
+            raise ValueError("invalid installer root")
+        if state_root_lock_key(supplied_root) != state_root_lock_key(root):
+            raise ValueError("installer manifest root mismatch")
+        if format_value == 3:
+            required = payload.get("required_files")
+            if required != list(_REQUIRED_FILES) or not set(_REQUIRED_FILES) <= set(
+                files
+            ):
+                raise ValueError("required managed files are missing")
+            if (
+                payload.get("skill_root_key") != state_root_lock_key(root)
+                or not isinstance(payload.get("package_version"), str)
+                or not isinstance(payload.get("package_hash"), str)
+                or payload["package_hash"]
+                != self._package_hash(
+                    str(payload["package_version"]),
+                    {name: str(hashes[name]) for name in files},
+                    _REQUIRED_FILES,
+                )
+            ):
+                raise ValueError("invalid package identity")
         return payload
 
-    def _remove_status(self) -> Path | None:
-        with guard_state_root(
-            self.state_paths.root, retained_dirs=("adapters",)
-        ) as lease:
-            if not lease.available("adapters") or not lease.exists(_STATUS_RELATIVE):
-                return None
-            lease.unlink(_STATUS_RELATIVE)
-        return self.state_paths.adapter_status_file(self.platform)
-
-    @staticmethod
-    def _managed_files(target: Path) -> tuple[Path, ...]:
-        payload = json.loads((target / _MANIFEST).read_text(encoding="utf-8"))
-        files = GenericAdapter._manifest_files(payload)
-        if files is None:
-            raise ValueError("invalid installer manifest")
-        return tuple(target / Path(relative) for relative in files) + (
-            target / _MANIFEST,
-        )
+    def _verify_manifest_under_lease(
+        self,
+        lease: StateRootLease,
+        target: Path,
+        manifest: dict[str, object],
+        *,
+        require_hashes: bool,
+    ) -> bool:
+        root = lease.root
+        hashes = manifest["hashes"]
+        assert isinstance(hashes, dict)
+        missing = False
+        mismatch = False
+        for relative in self._manifest_files(manifest) or ():
+            path = target / relative
+            lease_relative = path.relative_to(root)
+            try:
+                info = lease.stat(lease_relative)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+                ):
+                    raise ValueError("managed entry is not a direct regular file")
+                data = lease.read_bytes(
+                    lease_relative, _MANAGED_FILE_LIMIT, "managed package file"
+                )
+            except FileNotFoundError:
+                missing = True
+                continue
+            if hashlib.sha256(data).hexdigest() != hashes[relative]:
+                mismatch = True
+        if require_hashes and (missing or mismatch):
+            raise ValueError("managed package hash mismatch")
+        return not missing and not mismatch
 
     @staticmethod
     def _manifest_files(payload: object) -> tuple[str, ...] | None:
@@ -428,93 +1019,437 @@ class GenericAdapter:
             ):
                 return None
             normalized = str(path).replace("\\", "/")
-            if normalized in files:
+            if normalized in files or normalized == _MANIFEST:
                 return None
             files.append(normalized)
         return tuple(files)
 
-    def _quarantine_managed_files(self, target: Path) -> tuple[Path, tuple[Path, ...]]:
-        """Preflight every owned file, then atomically move it aside for rollback."""
-        paths = self._managed_files(target)
-        for path in paths:
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise ValueError("managed file ownership cannot be verified")
-        quarantine = target.parent / f".{_NAME}.quarantine-{secrets.token_hex(12)}"
+    @staticmethod
+    def _package_hash(
+        version: str, hashes: dict[str, str], required: Sequence[str]
+    ) -> str:
+        raw = json.dumps(
+            {"hashes": hashes, "required": list(required), "version": version},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _directory_identity(info: os.stat_result) -> tuple[int, int]:
+        return info.st_dev, info.st_ino
+
+    def _write_status(self, target: Path, options: InstallOptions) -> Path:
+        root = target.parent
+        inspection = self._inspect_package(root, target)
+        if inspection.state != "valid" or inspection.manifest is None:
+            raise ValueError("cannot record status for an invalid package")
+        manifest = inspection.manifest
+        payload = {
+            "capability": self._capability(options).value,
+            "format": 2,
+            "install_id": manifest["install_id"],
+            "managed_directory": str(target),
+            "owner": _NAME,
+            "skill_root": str(root),
+            "skill_root_key": state_root_lock_key(root),
+        }
+        self._state_lease().write_bytes_atomic(
+            _STATUS_RELATIVE,
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        return self.state_paths.adapter_status_file(self.platform)
+
+    def _read_status(self) -> dict[str, object] | None:
+        lease = self._state_lease()
+        if not lease.root_exists or not lease.available("adapters"):
+            return None
+        if not lease.exists(_STATUS_RELATIVE):
+            return None
+        raw = lease.read_bytes(_STATUS_RELATIVE, 16 * 1024, "adapter status")
+        payload = json.loads(raw.decode("utf-8"))
+        expected = {
+            "capability",
+            "format",
+            "install_id",
+            "managed_directory",
+            "owner",
+            "skill_root",
+            "skill_root_key",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected
+            or payload.get("format") != 2
+            or payload.get("owner") != _NAME
+            or not all(
+                isinstance(payload.get(name), str)
+                for name in (
+                    "capability",
+                    "install_id",
+                    "managed_directory",
+                    "skill_root",
+                    "skill_root_key",
+                )
+            )
+        ):
+            raise ValueError("invalid adapter status")
+        CapabilityLevel(str(payload["capability"]))
+        return payload
+
+    def _remove_status(self) -> Path:
+        lease = self._state_lease()
+        if not lease.exists(_STATUS_RELATIVE):
+            raise FileNotFoundError("adapter status is missing")
+        lease.unlink(_STATUS_RELATIVE)
+        return self.state_paths.adapter_status_file(self.platform)
+
+    def _status_matches(
+        self,
+        status: dict[str, object],
+        root: Path,
+        manifest: dict[str, object] | None,
+    ) -> bool:
+        if manifest is None:
+            return False
+        target = root / _NAME
+        try:
+            return (
+                status.get("owner") == _NAME
+                and status.get("format") == 2
+                and status.get("install_id") == manifest.get("install_id")
+                and status.get("skill_root_key") == state_root_lock_key(root)
+                and state_root_lock_key(str(status.get("skill_root")))
+                == state_root_lock_key(root)
+                and state_root_lock_key(
+                    str(Path(str(status.get("managed_directory"))).parent)
+                )
+                == state_root_lock_key(root)
+                and Path(str(status.get("managed_directory"))).name == target.name
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _write_recovery(
+        self,
+        operation: str,
+        root: Path,
+        target: Path,
+        quarantine: Path,
+        paths: Sequence[Path],
+        manifest: dict[str, object],
+    ) -> Path:
+        payload = {
+            "files": [
+                str(path.relative_to(target)).replace("\\", "/") for path in paths
+            ],
+            "format": 1,
+            "install_id": manifest["install_id"],
+            "managed_directory": str(target),
+            "operation": operation,
+            "owner": _NAME,
+            "quarantine": str(quarantine),
+            "skill_root": str(root),
+            "skill_root_key": state_root_lock_key(root),
+        }
+        self._state_lease().write_bytes_atomic(
+            _RECOVERY_RELATIVE,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        return self.state_paths.root / _RECOVERY_RELATIVE
+
+    def _read_recovery(self) -> dict[str, object] | None:
+        lease = self._state_lease()
+        if not lease.root_exists or not lease.available("adapters"):
+            return None
+        if not lease.exists(_RECOVERY_RELATIVE):
+            return None
+        raw = lease.read_bytes(_RECOVERY_RELATIVE, 64 * 1024, "adapter recovery")
+        payload = json.loads(raw.decode("utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format") != 1
+            or payload.get("owner") != _NAME
+        ):
+            raise ValueError("invalid adapter recovery record")
+        return payload
+
+    def _remove_recovery(self, *, missing_ok: bool = False) -> None:
+        self._state_lease().unlink(_RECOVERY_RELATIVE, missing_ok=missing_ok)
+
+    def _prepare_quarantine(
+        self, quarantine: Path, target: Path, paths: Sequence[Path]
+    ) -> None:
         quarantine.mkdir(mode=0o700)
+        for path in paths:
+            (quarantine / path.relative_to(target)).parent.mkdir(
+                parents=True, exist_ok=True
+            )
+
+    def _prepare_target_directories(
+        self, target: Path, manifest: dict[str, object]
+    ) -> tuple[Path, ...]:
+        before = {path for path in target.rglob("*") if path.is_dir()}
+        for relative in self._manifest_files(manifest) or ():
+            (target / relative).parent.mkdir(parents=True, exist_ok=True)
+        after = {path for path in target.rglob("*") if path.is_dir()}
+        return tuple(
+            sorted(after - before, key=lambda path: (len(path.parts), str(path)))
+        )
+
+    def _quarantine_managed_files(
+        self,
+        target: Path,
+        quarantine: Path | None = None,
+        *,
+        allow_missing: bool = False,
+    ) -> tuple[Path, ...]:
+        if quarantine is None:
+            raise ValueError("quarantine directory is required")
+        lease = self._skill_lease()
         moved: list[Path] = []
         try:
-            for path in paths:
+            for path in self._active_moved:
+                relative = path.relative_to(self._active_skill_root)
+                if not lease.exists(relative):
+                    if allow_missing:
+                        continue
+                    raise FileNotFoundError(path)
                 destination = quarantine / path.relative_to(target)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(path, destination)
+                lease.replace(
+                    relative, destination.relative_to(self._active_skill_root)
+                )
                 moved.append(path)
         except Exception:
             self._restore_quarantine(quarantine, target, tuple(moved))
             raise
-        return quarantine, tuple(moved)
+        return tuple(moved)
 
-    @staticmethod
     def _restore_quarantine(
-        quarantine: Path, target: Path, moved: tuple[Path, ...]
+        self, quarantine: Path, target: Path, moved: tuple[Path, ...]
     ) -> None:
+        lease = self._skill_lease()
+        root = self._active_skill_root
+        assert root is not None
         for path in reversed(moved):
             try:
                 source = quarantine / path.relative_to(target)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(source, path)
+                if lease.exists(source.relative_to(root)):
+                    lease.replace(source.relative_to(root), path.relative_to(root))
             except OSError:
                 continue
 
-    @staticmethod
-    def _discard_quarantine(quarantine: Path) -> None:
-        for path in sorted(
-            quarantine.rglob("*"), key=lambda item: len(item.parts), reverse=True
-        ):
-            info = os.lstat(path)
-            if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                path.unlink()
-            elif stat.S_ISDIR(info.st_mode):
-                path.rmdir()
-        quarantine.rmdir()
+    def _discard_quarantine(self, quarantine: Path) -> None:
+        lease = self._skill_lease()
+        root = self._active_skill_root
+        assert root is not None
+        target = root / _NAME
+        for path in self._active_moved:
+            candidate = quarantine / path.relative_to(target)
+            lease.unlink(candidate.relative_to(root), missing_ok=True)
+
+    def _skill_lease(self) -> StateRootLease:
+        if self._active_skill_lease is None:
+            raise RuntimeError("skill transaction is not bound")
+        return self._active_skill_lease
+
+    def _restoration_result(
+        self,
+        root: Path,
+        target: Path,
+        quarantine: Path,
+        moved: tuple[Path, ...],
+        message: str,
+    ) -> AdapterResult:
+        changed = self._changed_after_failed_restore(target, quarantine, moved)
+        if not changed:
+            self._cleanup_quarantine_dirs(root, quarantine, moved)
+            try:
+                self._remove_recovery(missing_ok=True)
+            except Exception:
+                changed = (self.state_paths.root / _RECOVERY_RELATIVE,)
+        if changed:
+            return AdapterResult(
+                self.platform,
+                "degraded",
+                CapabilityLevel.UNAVAILABLE,
+                (
+                    message,
+                    "recovery is recorded; run doctor before retrying",
+                ),
+                changed + (self.state_paths.root / _RECOVERY_RELATIVE,),
+            )
+        return self._failed(f"{message}; files restored")
 
     @staticmethod
-    def _remove_empty_dirs(target: Path) -> None:
-        for path in sorted(
-            target.rglob("*"), key=lambda item: len(item.parts), reverse=True
+    def _changed_after_failed_restore(
+        target: Path, quarantine: Path, moved: Sequence[Path]
+    ) -> tuple[Path, ...]:
+        changed: set[Path] = set()
+        for path in moved:
+            if not path.exists():
+                changed.add(path)
+            candidate = quarantine / path.relative_to(target)
+            if candidate.exists():
+                changed.add(candidate)
+                for parent in candidate.parents:
+                    if parent == quarantine or quarantine in parent.parents:
+                        changed.add(parent)
+                    if parent == quarantine:
+                        break
+        return tuple(sorted(changed, key=lambda path: (len(path.parts), str(path))))
+
+    @staticmethod
+    def _quarantine_changed_paths(
+        quarantine: Path, target: Path, moved: Sequence[Path]
+    ) -> tuple[Path, ...]:
+        return tuple(
+            quarantine / path.relative_to(target)
+            for path in moved
+            if (quarantine / path.relative_to(target)).exists()
+        )
+
+    def _cleanup_quarantine_dirs(
+        self, root: Path, quarantine: Path, paths: Sequence[Path]
+    ) -> tuple[Path, ...]:
+        directories = {
+            quarantine,
+            *(
+                parent
+                for path in paths
+                for parent in (quarantine / path.relative_to(root / _NAME)).parents
+                if quarantine in (parent, *parent.parents)
+            ),
+        }
+        return self._remove_directories(root, directories)
+
+    def _remove_known_empty_dirs(
+        self, root: Path, target: Path, paths: Sequence[Path]
+    ) -> tuple[Path, ...]:
+        directories = {
+            target,
+            *(
+                parent
+                for path in paths
+                for parent in path.parents
+                if target in (parent, *parent.parents)
+            ),
+        }
+        return self._remove_directories(root, directories)
+
+    @staticmethod
+    def _remove_directories(root: Path, directories: set[Path]) -> tuple[Path, ...]:
+        removed: list[Path] = []
+        for directory in sorted(
+            directories, key=lambda path: (len(path.parts), str(path)), reverse=True
         ):
-            if path.is_dir() and not path.is_symlink():
+            if directory == root:
+                continue
+            try:
+                relative = directory.relative_to(root)
+                parent = relative.parent
+                retained = () if parent == Path(".") else (parent,)
+                with guard_state_root(root, retained_dirs=retained) as lease:
+                    lease.rmdir(relative)
+                removed.append(directory)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+        return tuple(removed)
+
+    @staticmethod
+    def _remove_staging(staging: Path) -> None:
+        if not staging.exists() or staging.is_symlink():
+            return
+        for current, directories, files in os.walk(
+            staging, topdown=False, followlinks=False
+        ):
+            current_path = Path(current)
+            for name in files:
+                path = current_path / name
                 try:
-                    path.rmdir()
+                    info = os.lstat(path)
+                    if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                        path.unlink()
+                except OSError:
+                    continue
+            for name in directories:
+                path = current_path / name
+                try:
+                    info = os.lstat(path)
+                    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                        path.rmdir()
                 except OSError:
                     continue
         try:
-            target.rmdir()
+            staging.rmdir()
         except OSError:
             return
 
-    def _remove_managed_files(self, target: Path) -> tuple[Path, ...]:
-        changed: list[Path] = []
-        for path in self._managed_files(target):
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise ValueError("managed file ownership cannot be verified")
-            path.unlink()
-            changed.append(path)
-        for directory in sorted(
-            (path for path in target.rglob("*") if path.is_dir()),
-            key=lambda path: len(path.parts),
-            reverse=True,
-        ):
-            try:
-                directory.rmdir()
-            except OSError:
-                continue
-        try:
-            target.rmdir()
-        except OSError:
-            pass
-        return tuple(changed)
+    @staticmethod
+    def _manifest_paths(target: Path, manifest: dict[str, object]) -> tuple[Path, ...]:
+        files = GenericAdapter._manifest_files(manifest)
+        if files is None:
+            raise ValueError("invalid installer manifest")
+        return tuple(target / relative for relative in files) + (target / _MANIFEST,)
+
+    @staticmethod
+    def _manifest_parent_directories(
+        target_name: str, manifest: dict[str, object]
+    ) -> tuple[Path, ...]:
+        files = GenericAdapter._manifest_files(manifest) or ()
+        retained = {Path(target_name)}
+        for relative in files:
+            parent = Path(target_name) / Path(relative).parent
+            while parent != Path("."):
+                retained.add(parent)
+                if parent == Path(target_name):
+                    break
+                parent = parent.parent
+        return tuple(sorted(retained, key=lambda path: (len(path.parts), str(path))))
+
+    @staticmethod
+    def _parent_directories(root: Path, paths: Sequence[Path]) -> tuple[Path, ...]:
+        retained: set[Path] = set()
+        for path in paths:
+            relative_parent = path.relative_to(root).parent
+            while relative_parent != Path("."):
+                retained.add(relative_parent)
+                relative_parent = relative_parent.parent
+        return tuple(retained)
+
+    @staticmethod
+    def _package_changed_paths(
+        target: Path, manifest: dict[str, object]
+    ) -> tuple[Path, ...]:
+        paths = GenericAdapter._manifest_paths(target, manifest)
+        directories = {target}
+        for path in paths:
+            for parent in path.parents:
+                if target in (parent, *parent.parents):
+                    directories.add(parent)
+                if parent == target:
+                    break
+        return (
+            tuple(sorted(directories, key=lambda path: (len(path.parts), str(path))))
+            + paths
+        )
+
+    @staticmethod
+    def _inspection_message(state: str) -> str:
+        return {
+            "valid": "valid",
+            "hash-mismatch": "hash mismatch",
+            "missing": "missing",
+            "legacy": "upgrade required",
+            "alias-invalid": "unsafe path",
+            "manifest-invalid": "manifest invalid",
+            "invalid": "invalid",
+        }.get(state, "invalid")
 
     @staticmethod
     def _capability(options: InstallOptions) -> CapabilityLevel:
@@ -524,9 +1459,15 @@ class GenericAdapter:
             else CapabilityLevel.MANUAL
         )
 
-    def _failed(self, message: str) -> AdapterResult:
+    def _failed(
+        self, message: str, changed_paths: tuple[Path, ...] = ()
+    ) -> AdapterResult:
         return AdapterResult(
-            self.platform, "failed", CapabilityLevel.UNAVAILABLE, (message,)
+            self.platform,
+            "failed",
+            CapabilityLevel.UNAVAILABLE,
+            (message,),
+            changed_paths,
         )
 
     @staticmethod

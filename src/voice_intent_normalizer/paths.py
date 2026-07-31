@@ -209,6 +209,44 @@ class StateRootLease:
             if not missing_ok:
                 raise
 
+    def replace(self, source: str | Path, destination: str | Path) -> None:
+        """Atomically move one entry between two retained parent directories."""
+        source_parts = _relative_path_parts(source)
+        destination_parts = _relative_path_parts(destination)
+        source_binding, source_name = self._file_binding(source_parts)
+        destination_binding, destination_name = self._file_binding(destination_parts)
+        if source_binding.path is not None and destination_binding.path is not None:
+            os.replace(
+                source_binding.path / source_name,
+                destination_binding.path / destination_name,
+            )
+            return
+        if source_binding.descriptor is None or destination_binding.descriptor is None:
+            raise OSError("retained directories have incompatible identities")
+        _require_posix_dir_fd_support()
+        os.replace(
+            source_name,
+            destination_name,
+            src_dir_fd=source_binding.descriptor,
+            dst_dir_fd=destination_binding.descriptor,
+        )
+
+    def rmdir(self, relative: str | Path, *, missing_ok: bool = False) -> None:
+        """Remove one empty retained directory entry without following it."""
+        parts = _relative_path_parts(relative)
+        binding, name = self._file_binding(parts)
+        try:
+            if binding.path is not None:
+                os.rmdir(binding.path / name)
+            elif binding.descriptor is not None:
+                _require_posix_dir_fd_support()
+                os.rmdir(name, dir_fd=binding.descriptor)
+            else:
+                raise OSError("retained state directory has no usable identity")
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
     def listdir(self, relative: str | Path) -> tuple[str, ...]:
         """List an exactly retained directory identity."""
         parts = _relative_path_parts(relative)
