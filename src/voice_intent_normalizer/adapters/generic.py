@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
-import shutil
 import stat
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 from ..paths import StatePaths, guard_state_root, validate_state_root
+from ..updater import _retained_lease_update_lock
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
 
 _MANIFEST = ".voice-intent-normalizer-install.json"
@@ -27,15 +31,27 @@ class GenericAdapter:
     def __init__(self, repository: str | Path, state_paths: StatePaths) -> None:
         self.repository = Path(repository).resolve(strict=True)
         self.state_paths = state_paths
+        self._configured_skill_root: Path | None = None
 
     def detect(self) -> AdapterResult:
         return self.doctor()
 
     def install(self, options: InstallOptions) -> AdapterResult:
+        with guard_state_root(
+            self.state_paths.root,
+            create=True,
+            retained_dirs=("adapters",),
+            create_retained=True,
+        ) as lease:
+            with _retained_lease_update_lock(lease):
+                return self._install_locked(options)
+
+    def _install_locked(self, options: InstallOptions) -> AdapterResult:
         if options.output_dir is None:
             return self._failed("a skill root is required")
         try:
             root = self._safe_skill_root(options.output_dir)
+            self._configured_skill_root = root
             target = root / _NAME
             self._ensure_direct_target(target)
             if target.exists():
@@ -52,16 +68,22 @@ class GenericAdapter:
             staging = root / f".{_NAME}.staging-{secrets.token_hex(12)}"
             try:
                 self._copy_runtime(staging)
-                self._write_manifest(staging)
+                self._validate_staging(staging)
+                self._write_manifest(staging, root)
                 os.replace(staging, target)
             except Exception:
-                shutil.rmtree(staging, ignore_errors=True)
+                self._remove_staging(staging)
                 raise
             try:
                 status_path = self._write_status(target, options)
             except Exception:
-                shutil.rmtree(target, ignore_errors=True)
-                raise
+                return AdapterResult(
+                    self.platform,
+                    "degraded",
+                    self._capability(options),
+                    ("skill files installed; shared status recording is pending",),
+                    self._managed_files(target),
+                )
             return AdapterResult(
                 self.platform,
                 "installed",
@@ -115,18 +137,50 @@ class GenericAdapter:
         )
 
     def uninstall(self, options: UninstallOptions) -> AdapterResult:
+        with guard_state_root(
+            self.state_paths.root,
+            create=True,
+            retained_dirs=("adapters",),
+            create_retained=True,
+        ) as lease:
+            with _retained_lease_update_lock(lease):
+                return self._uninstall_locked(options)
+
+    def _uninstall_locked(self, options: UninstallOptions) -> AdapterResult:
+        if options.remove_shared_data:
+            return self._failed("shared-data removal requires a separate manual action")
         try:
             status = self._read_status()
             if status is None:
                 return AdapterResult(
                     self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
                 )
-            target = Path(status["managed_directory"])
+            root_value = options.output_dir or self._configured_skill_root
+            if root_value is None:
+                return self._failed("skill root is required for safe uninstall")
+            root = self._safe_skill_root(root_value)
+            target = root / _NAME
+            if Path(status["managed_directory"]) != target:
+                return self._failed("shared status does not match selected skill root")
+            if Path(status["skill_root"]) != root:
+                return self._failed("shared status does not match selected skill root")
             self._ensure_direct_target(target)
             if not self._managed(target):
                 return self._failed("managed ownership cannot be verified")
-            changed = self._remove_managed_files(target)
-            status_path = self._remove_status()
+            manifest = json.loads((target / _MANIFEST).read_text(encoding="utf-8"))
+            if status["install_id"] != manifest["install_id"]:
+                return self._failed("shared status does not match installed package")
+            quarantine, moved = self._quarantine_managed_files(target)
+            try:
+                status_path = self._remove_status()
+            except Exception:
+                self._restore_quarantine(quarantine, target, moved)
+                return self._failed(
+                    "adapter status could not be updated; files restored"
+                )
+            self._discard_quarantine(quarantine)
+            self._remove_empty_dirs(target)
+            changed = tuple(moved)
             return AdapterResult(
                 self.platform,
                 "uninstalled",
@@ -171,7 +225,7 @@ class GenericAdapter:
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
             raise ValueError("runtime source must be a direct regular file")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
+        destination.write_bytes(source.read_bytes())
 
     def _copy_tree(self, source: Path, destination: Path) -> None:
         for path in source.rglob("*"):
@@ -192,15 +246,77 @@ class GenericAdapter:
             self._copy_file(path, destination / path.relative_to(source))
 
     @staticmethod
-    def _write_manifest(target: Path) -> None:
+    def _remove_staging(staging: Path) -> None:
+        """Best-effort cleanup which never follows an injected alias."""
+        if not staging.exists() or staging.is_symlink():
+            return
+        for path in sorted(
+            staging.rglob("*"), key=lambda item: len(item.parts), reverse=True
+        ):
+            try:
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode):
+                    path.unlink()
+                elif stat.S_ISREG(info.st_mode):
+                    path.unlink()
+                elif stat.S_ISDIR(info.st_mode):
+                    path.rmdir()
+            except OSError:
+                continue
+        try:
+            staging.rmdir()
+        except OSError:
+            return
+
+    @staticmethod
+    def _validate_staging(staging: Path) -> None:
+        """Prove the copied skill can bootstrap without the development checkout."""
+        skill = staging / "SKILL.md"
+        script = staging / "scripts" / "voice_intent.py"
+        for path in (skill, script):
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ValueError("staged skill is incomplete")
+        with tempfile.TemporaryDirectory(prefix="voice-intent-stage-") as state:
+            result = subprocess.run(
+                [sys.executable, "-I", str(script), "doctor", "--json"],
+                cwd=staging,
+                env={"PATH": os.environ.get("PATH", ""), "VOICE_INTENT_HOME": state},
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        if result.returncode != 0:
+            raise ValueError("staged skill bootstrap validation failed")
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "ok",
+            "degraded",
+        }:
+            raise ValueError("staged skill bootstrap validation failed")
+
+    @staticmethod
+    def _write_manifest(target: Path, root: Path) -> None:
         files = sorted(
             str(path.relative_to(target)).replace("\\", "/")
             for path in target.rglob("*")
             if path.is_file()
         )
+        hashes = {
+            relative: hashlib.sha256((target / relative).read_bytes()).hexdigest()
+            for relative in files
+        }
         (target / _MANIFEST).write_text(
             json.dumps(
-                {"files": files, "owner": _NAME, "schema_version": 1},
+                {
+                    "files": files,
+                    "format": 2,
+                    "hashes": hashes,
+                    "install_id": secrets.token_hex(16),
+                    "owner": _NAME,
+                    "skill_root": str(root),
+                },
                 sort_keys=True,
             ),
             encoding="utf-8",
@@ -214,18 +330,36 @@ class GenericAdapter:
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 return False
             payload = json.loads(manifest.read_text(encoding="utf-8"))
-            return (
-                payload.get("owner") == _NAME
-                and payload.get("schema_version") == 1
-                and GenericAdapter._manifest_files(payload) is not None
+            files = GenericAdapter._manifest_files(payload)
+            hashes = payload.get("hashes")
+            if (
+                payload.get("owner") != _NAME
+                or payload.get("format") != 2
+                or not isinstance(payload.get("install_id"), str)
+                or not isinstance(hashes, dict)
+                or files is None
+                or set(hashes) != set(files)
+            ):
+                return False
+            return all(
+                isinstance(hashes[name], str)
+                and hashlib.sha256((target / name).read_bytes()).hexdigest()
+                == hashes[name]
+                for name in files
             )
         except (OSError, ValueError, json.JSONDecodeError):
             return False
 
     def _write_status(self, target: Path, options: InstallOptions) -> Path:
         capability = self._capability(options)
+        manifest = json.loads((target / _MANIFEST).read_text(encoding="utf-8"))
         payload = json.dumps(
-            {"capability": capability.value, "managed_directory": str(target)},
+            {
+                "capability": capability.value,
+                "install_id": manifest["install_id"],
+                "managed_directory": str(target),
+                "skill_root": manifest["skill_root"],
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -247,7 +381,12 @@ class GenericAdapter:
                 return None
             raw = lease.read_bytes(_STATUS_RELATIVE, 16 * 1024, "adapter status")
         payload = json.loads(raw.decode("utf-8"))
-        if set(payload) != {"capability", "managed_directory"}:
+        if set(payload) != {
+            "capability",
+            "install_id",
+            "managed_directory",
+            "skill_root",
+        }:
             raise ValueError("invalid adapter status")
         return payload
 
@@ -282,8 +421,10 @@ class GenericAdapter:
             if not isinstance(value, str):
                 return None
             path = Path(value)
-            if path.anchor or not path.parts or any(
-                part in {"", ".", ".."} for part in path.parts
+            if (
+                path.anchor
+                or not path.parts
+                or any(part in {"", ".", ".."} for part in path.parts)
             ):
                 return None
             normalized = str(path).replace("\\", "/")
@@ -291,6 +432,66 @@ class GenericAdapter:
                 return None
             files.append(normalized)
         return tuple(files)
+
+    def _quarantine_managed_files(self, target: Path) -> tuple[Path, tuple[Path, ...]]:
+        """Preflight every owned file, then atomically move it aside for rollback."""
+        paths = self._managed_files(target)
+        for path in paths:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ValueError("managed file ownership cannot be verified")
+        quarantine = target.parent / f".{_NAME}.quarantine-{secrets.token_hex(12)}"
+        quarantine.mkdir(mode=0o700)
+        moved: list[Path] = []
+        try:
+            for path in paths:
+                destination = quarantine / path.relative_to(target)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, destination)
+                moved.append(path)
+        except Exception:
+            self._restore_quarantine(quarantine, target, tuple(moved))
+            raise
+        return quarantine, tuple(moved)
+
+    @staticmethod
+    def _restore_quarantine(
+        quarantine: Path, target: Path, moved: tuple[Path, ...]
+    ) -> None:
+        for path in reversed(moved):
+            try:
+                source = quarantine / path.relative_to(target)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, path)
+            except OSError:
+                continue
+
+    @staticmethod
+    def _discard_quarantine(quarantine: Path) -> None:
+        for path in sorted(
+            quarantine.rglob("*"), key=lambda item: len(item.parts), reverse=True
+        ):
+            info = os.lstat(path)
+            if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                path.unlink()
+            elif stat.S_ISDIR(info.st_mode):
+                path.rmdir()
+        quarantine.rmdir()
+
+    @staticmethod
+    def _remove_empty_dirs(target: Path) -> None:
+        for path in sorted(
+            target.rglob("*"), key=lambda item: len(item.parts), reverse=True
+        ):
+            if path.is_dir() and not path.is_symlink():
+                try:
+                    path.rmdir()
+                except OSError:
+                    continue
+        try:
+            target.rmdir()
+        except OSError:
+            return
 
     def _remove_managed_files(self, target: Path) -> tuple[Path, ...]:
         changed: list[Path] = []

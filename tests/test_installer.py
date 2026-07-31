@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -59,6 +60,23 @@ def test_installer_preserves_requested_order_and_reports_operational_failure():
     assert results[0] == installed
     assert results[1].status == "degraded"
     assert results[2] == manual
+
+
+def test_installer_deduplicates_and_never_stops_other_platforms_in_strict_mode():
+    installer = Installer(
+        {
+            "broken": _Adapter("broken", OSError("offline")),
+            "working": _Adapter(
+                "working", AdapterResult("working", "installed", CapabilityLevel.MANUAL)
+            ),
+        }
+    )
+
+    results = installer.install(
+        ("broken", "broken", "working"), InstallOptions(strict=True)
+    )
+
+    assert [result.platform for result in results] == ["broken", "working"]
 
 
 def test_generic_install_copies_runnable_allowlisted_package_and_preserves_files(
@@ -133,6 +151,28 @@ def test_generic_uninstall_preserves_shared_personal_data(tmp_path: Path):
     assert not (root / "voice-intent-normalizer").exists()
 
 
+def test_uninstall_uses_explicit_skill_root_not_tampered_status(tmp_path: Path):
+    repository = Path(__file__).resolve().parents[1]
+    root = tmp_path / "skills"
+    root.mkdir()
+    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
+    adapter = GenericAdapter(repository, state)
+    adapter.install(InstallOptions(output_dir=root))
+    victim = tmp_path / "victim"
+    shutil.copytree(root / "voice-intent-normalizer", victim)
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    status = state.adapter_status_file("generic")
+    payload = json.loads(status.read_text(encoding="utf-8"))
+    payload["managed_directory"] = str(victim)
+    status.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = adapter.uninstall(UninstallOptions(output_dir=root))
+
+    assert result.status == "failed"
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (root / "voice-intent-normalizer").exists()
+
+
 def test_generic_refuses_to_overwrite_unmanaged_directory(tmp_path: Path):
     repository = Path(__file__).resolve().parents[1]
     root = tmp_path / "skills"
@@ -148,7 +188,7 @@ def test_generic_refuses_to_overwrite_unmanaged_directory(tmp_path: Path):
     assert marker.read_text(encoding="utf-8") == "do not replace"
 
 
-def test_generic_rolls_back_package_when_status_recording_fails(
+def test_generic_keeps_identity_bound_package_when_status_recording_fails(
     tmp_path: Path, monkeypatch
 ):
     repository = Path(__file__).resolve().parents[1]
@@ -164,8 +204,8 @@ def test_generic_rolls_back_package_when_status_recording_fails(
 
     result = adapter.install(InstallOptions(output_dir=root))
 
-    assert result.status == "failed"
-    assert not (root / "voice-intent-normalizer").exists()
+    assert result.status == "degraded"
+    assert (root / "voice-intent-normalizer").is_dir()
 
 
 def test_generic_reinstall_preserves_unmanaged_files_and_uninstall_keeps_them(
@@ -284,3 +324,17 @@ def test_cli_install_forwards_repeated_platforms_to_injected_installer():
     assert installer.request[0] == ("generic", "other")
     assert installer.request[1].auto_update is False
     assert json.loads(stdout.getvalue())[1]["status"] == "degraded"
+
+
+def test_cli_rejects_platform_with_all_detected_before_calling_installer():
+    from io import StringIO
+
+    from voice_intent_normalizer import cli
+
+    code = cli.main(
+        ["uninstall", "--platform", "generic", "--all-detected", "--json"],
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 2

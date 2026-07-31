@@ -79,6 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-update", action=argparse.BooleanOptionalAction, default=None
     )
     install.add_argument("--implicit-invocation-confirmed", action="store_true")
+    commands.choices["uninstall"].add_argument(
+        "--remove-shared-data", action="store_true"
+    )
     commands.add_parser("hook")
     return parser
 
@@ -228,6 +231,7 @@ def _dispatch(
             installer.uninstall(
                 _selected_platforms(args, installer),
                 UninstallOptions(
+                    remove_shared_data=args.remove_shared_data,
                     output_dir=None
                     if args.output_dir is None
                     else Path(args.output_dir),
@@ -355,6 +359,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise _UsageError("--limit must be positive")
     if args.command == "learn" and args.scope == "project" and not args.project_root:
         raise _UsageError("--project-root is required for project learning")
+    if (
+        args.command in {"install", "uninstall", "doctor"}
+        and args.platform
+        and args.all_detected
+    ):
+        raise _UsageError("--platform and --all-detected cannot be combined")
     if args.command in {"install", "uninstall"} and args.json:
         if not args.platform and not args.all_detected:
             raise _UsageError("--platform or --all-detected is required in JSON mode")

@@ -24,11 +24,15 @@ class Installer:
         return tuple(self._adapters)
 
     def detected(self) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name, adapter in self._adapters.items()
-            if adapter.detect().capability is not CapabilityLevel.UNAVAILABLE
-        )
+        detected: list[str] = []
+        for name, adapter in self._adapters.items():
+            try:
+                result = adapter.detect()
+            except Exception:
+                continue
+            if result.capability is not CapabilityLevel.UNAVAILABLE:
+                detected.append(name)
+        return tuple(detected)
 
     def install(
         self, platforms: Sequence[str], options: InstallOptions
@@ -47,7 +51,11 @@ class Installer:
         self, method: str, platforms: Sequence[str], options: object
     ) -> tuple[AdapterResult, ...]:
         results: list[AdapterResult] = []
+        seen: set[str] = set()
         for name in platforms:
+            if name in seen:
+                continue
+            seen.add(name)
             adapter = self._adapters.get(name)
             if adapter is None:
                 results.append(
@@ -70,9 +78,4 @@ class Installer:
                     ("platform operation unavailable",),
                 )
             results.append(result)
-            if getattr(options, "strict", False) and result.status in {
-                "failed",
-                "degraded",
-            }:
-                break
         return tuple(results)
