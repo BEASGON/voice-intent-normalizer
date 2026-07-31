@@ -231,6 +231,78 @@ class StateRootLease:
             dst_dir_fd=destination_binding.descriptor,
         )
 
+    def publish_no_replace(
+        self, source: str | Path, destination: str | Path
+    ) -> None:
+        """Atomically publish one regular file without replacing any entry.
+
+        A hard-link publish gives the destination name exclusive-create
+        semantics on both Windows and POSIX.  Unlinking the source afterwards
+        turns it into a move.  A crash between those operations can leave two
+        names for the same inode, which the install recovery record can resolve
+        without ever overwriting a user-created destination.
+        """
+        source_parts = _relative_path_parts(source)
+        destination_parts = _relative_path_parts(destination)
+        source_binding, source_name = self._file_binding(source_parts)
+        destination_binding, destination_name = self._file_binding(destination_parts)
+        source_info = self.stat(source)
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or stat.S_ISLNK(source_info.st_mode)
+            or getattr(source_info, "st_file_attributes", 0)
+            & _WINDOWS_REPARSE_POINT
+        ):
+            raise ValueError("publish source must be a direct regular file")
+        if source_binding.path is not None and destination_binding.path is not None:
+            os.link(
+                source_binding.path / source_name,
+                destination_binding.path / destination_name,
+                follow_symlinks=False,
+            )
+        elif (
+            source_binding.descriptor is not None
+            and destination_binding.descriptor is not None
+        ):
+            _require_posix_dir_fd_support()
+            if os.link not in os.supports_dir_fd:
+                raise OSError("secure no-replace publish requires linkat support")
+            os.link(
+                source_name,
+                destination_name,
+                src_dir_fd=source_binding.descriptor,
+                dst_dir_fd=destination_binding.descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            raise OSError("retained directories have incompatible identities")
+        self.unlink(source)
+
+    def rename_no_replace(
+        self, source: str | Path, destination: str | Path
+    ) -> None:
+        """Atomically rename one entry only when the destination is absent."""
+        source_parts = _relative_path_parts(source)
+        destination_parts = _relative_path_parts(destination)
+        source_binding, source_name = self._file_binding(source_parts)
+        destination_binding, destination_name = self._file_binding(destination_parts)
+        if source_binding.path is not None and destination_binding.path is not None:
+            # Windows rename is exclusive: unlike os.replace it fails when the
+            # destination already exists.
+            os.rename(
+                source_binding.path / source_name,
+                destination_binding.path / destination_name,
+            )
+            return
+        if source_binding.descriptor is None or destination_binding.descriptor is None:
+            raise OSError("retained directories have incompatible identities")
+        _rename_posix_no_replace(
+            source_binding.descriptor,
+            source_name,
+            destination_binding.descriptor,
+            destination_name,
+        )
+
     def rmdir(self, relative: str | Path, *, missing_ok: bool = False) -> None:
         """Remove one empty retained directory entry without following it."""
         parts = _relative_path_parts(relative)
@@ -336,6 +408,43 @@ def _require_posix_dir_fd_support() -> None:
     for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
         if not hasattr(os, name):
             raise OSError(f"secure POSIX state roots require {name}")
+
+
+def _rename_posix_no_replace(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+) -> None:
+    """Use native exclusive rename support, failing closed when unavailable."""
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "secure no-replace directory publish requires renameat2",
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    )
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination_name)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:

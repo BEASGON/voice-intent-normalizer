@@ -1,0 +1,8 @@
+include SKILL.md
+include LICENSE
+include pyproject.toml
+include setup.py
+include agents/openai.yaml
+recursive-include assets/lexicons *.jsonl
+recursive-include references *.md
+include scripts/voice_intent.py

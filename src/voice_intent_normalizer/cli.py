@@ -88,16 +88,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def default_service() -> NormalizerService:
     """Create the local service using packaged lexicons when they are present."""
-    repository = Path(__file__).resolve().parents[2]
+    repository = _runtime_repository()
     return NormalizerService(StatePaths.resolve(), repository / "assets" / "lexicons")
 
 
 def default_installer(paths: StatePaths | None = None) -> Installer:
     """Return only adapters implemented by this build stage."""
-    repository = Path(__file__).resolve().parents[2]
+    repository = _runtime_repository()
     state = StatePaths.resolve() if paths is None else paths
     generic = GenericAdapter(repository, state)
     return Installer({generic.platform: generic})
+
+
+def _runtime_repository() -> Path:
+    """Return the authoritative checkout or the wheel's bundled skill files."""
+    checkout = Path(__file__).resolve().parents[2]
+    if (checkout / "SKILL.md").is_file():
+        return checkout
+    bundle = Path(__file__).resolve().parent / "_skill_bundle"
+    if not (bundle / "SKILL.md").is_file():
+        raise RuntimeError("runtime skill bundle is unavailable")
+    return bundle
 
 
 def main(
