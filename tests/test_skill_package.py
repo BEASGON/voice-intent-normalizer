@@ -70,6 +70,18 @@ _RESPONSE_HANDLING_CONTRACT = {
 }
 
 
+def _object_without_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    """Build one JSON object only when every key is unique."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AssertionError(f"duplicate response contract key: {key}")
+        result[key] = value
+    return result
+
+
 def _response_contract(text: str) -> dict[str, object]:
     """Read the one fenced JSON contract allowed in the response section."""
     assert text.count(_CONTRACT_START) == 1, "response contract start is not unique"
@@ -87,7 +99,7 @@ def _response_contract(text: str) -> dict[str, object]:
     assert text[end + len(_CONTRACT_END) :].startswith(f"\n{_NEXT_SECTION}\n")
     assert "|" not in text[text.index("## Response handling") : end]
     try:
-        parsed = json.loads(payload)
+        parsed = json.loads(payload, object_pairs_hook=_object_without_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise AssertionError("invalid response contract JSON") from exc
     assert isinstance(parsed, dict)
@@ -410,6 +422,56 @@ def test_response_contract_rejects_key_changes_and_allows_json_formatting(
         r"(?s)(```json\n).*?(\n```)", rf"\1{reordered_json}\2", policy, count=1
     )
     _assert_response_handling_contract(_response_contract(reformatted))
+
+
+def test_response_contract_rejects_duplicate_keys_at_every_object_level(
+    repo_root: Path,
+) -> None:
+    """Reject duplicate JSON keys instead of accepting a last-value-wins contract."""
+    policy = (repo_root / "references" / "correction-policy.md").read_text(
+        encoding="utf-8"
+    )
+    ask = (
+        '  "valid_ask": {\n'
+        '    "show_question": true,\n'
+        '    "wait": true,\n'
+        '    "execute_task": false,\n'
+        '    "choose_candidate": false\n'
+        "  },\n"
+    )
+    dangerous_ask = (
+        '  "valid_ask": {"show_question": true, "wait": true, '
+        '"execute_task": true, "choose_candidate": false},\n'
+    )
+    duplicate_top_dangerous_first = policy.replace(ask, dangerous_ask + ask, 1)
+    duplicate_top_dangerous_last = policy.replace(ask, ask + dangerous_ask, 1)
+    duplicate_nested_dangerous_first = policy.replace(
+        '    "wait": true,\n    "execute_task": false,\n',
+        '    "wait": true,\n    "execute_task": true,\n'
+        '    "execute_task": false,\n',
+        1,
+    )
+    duplicate_nested_dangerous_last = policy.replace(
+        '    "execute_task": false,\n',
+        '    "execute_task": false,\n    "execute_task": true,\n',
+        1,
+    )
+    duplicate_nested_same_value = policy.replace(
+        '    "wait": true,\n', '    "wait": true,\n    "wait": true,\n', 1
+    )
+
+    for mutated in (
+        duplicate_top_dangerous_first,
+        duplicate_top_dangerous_last,
+        duplicate_nested_dangerous_first,
+        duplicate_nested_dangerous_last,
+        duplicate_nested_same_value,
+    ):
+        payload = re.search(r"(?s)```json\n(.*?)\n```", mutated)
+        assert payload is not None
+        assert isinstance(json.loads(payload.group(1)), dict)
+        with pytest.raises(AssertionError):
+            _response_contract(mutated)
 
 
 def test_high_impact_ask_contract_waits_for_confirmation() -> None:
