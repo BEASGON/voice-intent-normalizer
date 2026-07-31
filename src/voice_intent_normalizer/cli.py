@@ -8,6 +8,7 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
+from importlib import resources
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -102,13 +103,58 @@ def default_installer(paths: StatePaths | None = None) -> Installer:
 
 def _runtime_repository() -> Path:
     """Return the authoritative checkout or the wheel's bundled skill files."""
-    checkout = Path(__file__).resolve().parents[2]
-    if (checkout / "SKILL.md").is_file():
+    module = Path(__file__).resolve()
+    checkout = module.parents[2]
+    checkout_module = (
+        checkout / "src" / "voice_intent_normalizer" / "cli.py"
+    ).resolve()
+    if module == checkout_module and _runtime_repository_complete(checkout):
         return checkout
-    bundle = Path(__file__).resolve().parent / "_skill_bundle"
-    if not (bundle / "SKILL.md").is_file():
+    bundle_resource = resources.files("voice_intent_normalizer").joinpath(
+        "_skill_bundle"
+    )
+    try:
+        bundle = Path(os.fspath(bundle_resource)).resolve(strict=True)
+    except (OSError, TypeError):
+        raise RuntimeError("runtime skill bundle is not a physical directory") from None
+    if not _runtime_repository_complete(bundle):
         raise RuntimeError("runtime skill bundle is unavailable")
     return bundle
+
+
+def _runtime_repository_complete(repository: Path) -> bool:
+    required = (
+        "SKILL.md",
+        "LICENSE",
+        "pyproject.toml",
+        "agents/openai.yaml",
+        "assets/lexicons/base-zh.jsonl",
+        "assets/lexicons/hotwords-snapshot.jsonl",
+        "assets/lexicons/domains/ai.jsonl",
+        "assets/lexicons/domains/product-design.jsonl",
+        "assets/lexicons/domains/software-development.jsonl",
+        "references/correction-policy.md",
+        "references/domain-packs.md",
+        "references/lexicon-schema.md",
+        "scripts/voice_intent.py",
+        "src/voice_intent_normalizer/__init__.py",
+        "src/voice_intent_normalizer/cli.py",
+        "src/voice_intent_normalizer/hook.py",
+        "src/voice_intent_normalizer/installer.py",
+        "src/voice_intent_normalizer/learning.py",
+        "src/voice_intent_normalizer/lexicon.py",
+        "src/voice_intent_normalizer/matching.py",
+        "src/voice_intent_normalizer/models.py",
+        "src/voice_intent_normalizer/paths.py",
+        "src/voice_intent_normalizer/policy.py",
+        "src/voice_intent_normalizer/project_scan.py",
+        "src/voice_intent_normalizer/service.py",
+        "src/voice_intent_normalizer/updater.py",
+        "src/voice_intent_normalizer/adapters/__init__.py",
+        "src/voice_intent_normalizer/adapters/base.py",
+        "src/voice_intent_normalizer/adapters/generic.py",
+    )
+    return all((repository / relative).is_file() for relative in required)
 
 
 def main(

@@ -193,6 +193,28 @@ class StateRootLease:
             raise OSError("retained state directory has no usable identity")
         _write_posix_bytes_atomic(binding.descriptor, name, data)
 
+    def write_bytes_exclusive(self, relative: str | Path, data: bytes) -> None:
+        """Create one regular file exclusively beneath a retained parent."""
+        if not isinstance(data, bytes):
+            raise TypeError("state data must be bytes")
+        parts = _relative_path_parts(relative)
+        binding, name = self._file_binding(parts)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if binding.path is not None:
+            flags |= getattr(os, "O_BINARY", 0)
+            descriptor = os.open(binding.path / name, flags, 0o600)
+        elif binding.descriptor is not None:
+            _require_posix_dir_fd_support()
+            flags |= os.O_CLOEXEC | os.O_NOFOLLOW
+            descriptor = os.open(name, flags, 0o600, dir_fd=binding.descriptor)
+        else:
+            raise OSError("retained state directory has no usable identity")
+        try:
+            _write_all(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def unlink(self, relative: str | Path, *, missing_ok: bool = False) -> None:
         """Remove one bound directory entry without following it."""
         parts = _relative_path_parts(relative)
@@ -234,14 +256,7 @@ class StateRootLease:
     def publish_no_replace(
         self, source: str | Path, destination: str | Path
     ) -> None:
-        """Atomically publish one regular file without replacing any entry.
-
-        A hard-link publish gives the destination name exclusive-create
-        semantics on both Windows and POSIX.  Unlinking the source afterwards
-        turns it into a move.  A crash between those operations can leave two
-        names for the same inode, which the install recovery record can resolve
-        without ever overwriting a user-created destination.
-        """
+        """Publish one regular file exclusively while retaining its source."""
         source_parts = _relative_path_parts(source)
         destination_parts = _relative_path_parts(destination)
         source_binding, source_name = self._file_binding(source_parts)
@@ -276,32 +291,6 @@ class StateRootLease:
             )
         else:
             raise OSError("retained directories have incompatible identities")
-        self.unlink(source)
-
-    def rename_no_replace(
-        self, source: str | Path, destination: str | Path
-    ) -> None:
-        """Atomically rename one entry only when the destination is absent."""
-        source_parts = _relative_path_parts(source)
-        destination_parts = _relative_path_parts(destination)
-        source_binding, source_name = self._file_binding(source_parts)
-        destination_binding, destination_name = self._file_binding(destination_parts)
-        if source_binding.path is not None and destination_binding.path is not None:
-            # Windows rename is exclusive: unlike os.replace it fails when the
-            # destination already exists.
-            os.rename(
-                source_binding.path / source_name,
-                destination_binding.path / destination_name,
-            )
-            return
-        if source_binding.descriptor is None or destination_binding.descriptor is None:
-            raise OSError("retained directories have incompatible identities")
-        _rename_posix_no_replace(
-            source_binding.descriptor,
-            source_name,
-            destination_binding.descriptor,
-            destination_name,
-        )
 
     def rmdir(self, relative: str | Path, *, missing_ok: bool = False) -> None:
         """Remove one empty retained directory entry without following it."""
@@ -408,43 +397,6 @@ def _require_posix_dir_fd_support() -> None:
     for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
         if not hasattr(os, name):
             raise OSError(f"secure POSIX state roots require {name}")
-
-
-def _rename_posix_no_replace(
-    source_directory: int,
-    source_name: str,
-    destination_directory: int,
-    destination_name: str,
-) -> None:
-    """Use native exclusive rename support, failing closed when unavailable."""
-    import ctypes
-    import errno
-
-    library = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(library, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(
-            errno.ENOTSUP,
-            "secure no-replace directory publish requires renameat2",
-        )
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    result = renameat2(
-        source_directory,
-        os.fsencode(source_name),
-        destination_directory,
-        os.fsencode(destination_name),
-        1,  # RENAME_NOREPLACE
-    )
-    if result:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -631,11 +583,21 @@ def guard_state_root(
     create: bool = False,
     retained_dirs: Sequence[str | Path] = (),
     create_retained: bool = False,
+    exclusive_create_retained: Sequence[str | Path] = (),
 ) -> Iterator[StateRootLease]:
     """Retain direct root identities and bind requested subdirectories to them."""
     validated = validate_state_root(root)
     captured_lock_key = state_root_lock_key(validated)
     requested = tuple(_relative_directory_parts(value) for value in retained_dirs)
+    exclusive = frozenset(
+        _relative_directory_parts(value) for value in exclusive_create_retained
+    )
+    if not exclusive.issubset(set(requested)) or (
+        exclusive and not create_retained
+    ):
+        raise ValueError(
+            "exclusive retained directories must be created and retained"
+        )
     if os.name == "nt":
         with _guard_windows_state_root(
             validated,
@@ -643,6 +605,7 @@ def guard_state_root(
             create=create,
             retained_dirs=requested,
             create_retained=create_retained,
+            exclusive_create_retained=exclusive,
         ) as lease:
             yield lease
         return
@@ -652,6 +615,7 @@ def guard_state_root(
         create=create,
         retained_dirs=requested,
         create_retained=create_retained,
+        exclusive_create_retained=exclusive,
     ) as lease:
         yield lease
 
@@ -675,6 +639,7 @@ def _guard_windows_state_root(
     create: bool,
     retained_dirs: tuple[tuple[str, ...], ...],
     create_retained: bool,
+    exclusive_create_retained: frozenset[tuple[str, ...]],
 ) -> Iterator[StateRootLease]:
     missing: list[str] = []
     existing = root
@@ -732,7 +697,8 @@ def _guard_windows_state_root(
                     try:
                         os.mkdir(current)
                     except FileExistsError:
-                        pass
+                        if prefix in exclusive_create_retained:
+                            raise
                 try:
                     guards.enter_context(_windows_directory_guard(current))
                 except FileNotFoundError:
@@ -841,6 +807,7 @@ def _guard_posix_state_root(
     create: bool,
     retained_dirs: tuple[tuple[str, ...], ...],
     create_retained: bool,
+    exclusive_create_retained: frozenset[tuple[str, ...]],
 ) -> Iterator[StateRootLease]:
     _require_posix_dir_fd_support()
     flags = os.O_RDONLY
@@ -894,7 +861,8 @@ def _guard_posix_state_root(
                     try:
                         os.mkdir(component, 0o700, dir_fd=current)
                     except FileExistsError:
-                        pass
+                        if prefix in exclusive_create_retained:
+                            raise
                 try:
                     child = os.open(component, flags, dir_fd=current)
                 except FileNotFoundError:

@@ -25,6 +25,56 @@ from voice_intent_normalizer.models import (
 )
 
 
+def test_runtime_repository_ignores_ambient_parent_skill(monkeypatch, tmp_path: Path):
+    from voice_intent_normalizer import cli
+
+    ambient = tmp_path / "ambient"
+    (ambient / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
+    (ambient / "SKILL.md").write_text("ambient", encoding="utf-8")
+    fake_module = ambient / "site" / "voice_intent_normalizer" / "cli.py"
+    bundle_parent = tmp_path / "installed-package"
+    bundle = bundle_parent / "_skill_bundle"
+    required = (
+        "SKILL.md",
+        "LICENSE",
+        "pyproject.toml",
+        "agents/openai.yaml",
+        "assets/lexicons/base-zh.jsonl",
+        "assets/lexicons/hotwords-snapshot.jsonl",
+        "assets/lexicons/domains/ai.jsonl",
+        "assets/lexicons/domains/product-design.jsonl",
+        "assets/lexicons/domains/software-development.jsonl",
+        "references/correction-policy.md",
+        "references/domain-packs.md",
+        "references/lexicon-schema.md",
+        "scripts/voice_intent.py",
+        "src/voice_intent_normalizer/__init__.py",
+        "src/voice_intent_normalizer/cli.py",
+        "src/voice_intent_normalizer/hook.py",
+        "src/voice_intent_normalizer/installer.py",
+        "src/voice_intent_normalizer/learning.py",
+        "src/voice_intent_normalizer/lexicon.py",
+        "src/voice_intent_normalizer/matching.py",
+        "src/voice_intent_normalizer/models.py",
+        "src/voice_intent_normalizer/paths.py",
+        "src/voice_intent_normalizer/policy.py",
+        "src/voice_intent_normalizer/project_scan.py",
+        "src/voice_intent_normalizer/service.py",
+        "src/voice_intent_normalizer/updater.py",
+        "src/voice_intent_normalizer/adapters/__init__.py",
+        "src/voice_intent_normalizer/adapters/base.py",
+        "src/voice_intent_normalizer/adapters/generic.py",
+    )
+    for relative in required:
+        path = bundle / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative, encoding="utf-8")
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli.resources, "files", lambda package: bundle_parent)
+
+    assert cli._runtime_repository() == bundle.resolve()
+
+
 class FakeService:
     def __init__(self, decision: CorrectionDecision) -> None:
         self.decision = decision

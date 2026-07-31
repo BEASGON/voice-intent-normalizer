@@ -29,7 +29,14 @@ class _BuildPyWithSkillBundle(_build_py):
     def run(self) -> None:
         super().run()
         repository = Path(__file__).resolve().parent
-        bundle = Path(self.build_lib) / "voice_intent_normalizer" / "_skill_bundle"
+        package_root = (
+            Path(self.build_lib) / "voice_intent_normalizer"
+        ).resolve()
+        bundle = package_root / "_skill_bundle"
+        if bundle.resolve().parent != package_root:
+            raise RuntimeError("refusing to clear an unsafe generated bundle path")
+        if bundle.exists():
+            shutil.rmtree(bundle)
         for relative in _BUNDLE_FILES:
             source = repository / relative
             destination = bundle / relative

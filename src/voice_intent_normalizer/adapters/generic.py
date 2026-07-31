@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -13,9 +14,7 @@ import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-
-import tomllib
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from ..paths import (
     StatePaths,
@@ -41,6 +40,9 @@ _REQUIRED_FILES = (
 )
 _MANIFEST_LIMIT = 2 * 1024 * 1024
 _MANAGED_FILE_LIMIT = 64 * 1024 * 1024
+_MANIFEST_MAX_ENTRIES = 4096
+_MANIFEST_MAX_PATH_LENGTH = 512
+_MANIFEST_MAX_DEPTH = 32
 _WINDOWS_REPARSE_POINT = 0x400
 
 
@@ -66,12 +68,16 @@ class GenericAdapter:
         self._active_skill_root: Path | None = None
         self._active_moved: tuple[Path, ...] = ()
         self._recovery_changes: tuple[Path, ...] = ()
+        self._unanchored_recovery = False
+        self._recovered_uninstall = False
+        self._change_events: list[Path] = []
 
     def detect(self) -> AdapterResult:
         return self.doctor()
 
     def install(self, options: InstallOptions) -> AdapterResult:
         self._recovery_changes = ()
+        self._change_events = []
         try:
             with self._state_operation(create=True):
                 result = self._install_locked(options)
@@ -86,41 +92,39 @@ class GenericAdapter:
         self._configured_skill_root = root
         self._recover_pending(root)
         target = root / _NAME
-        staging = root / f".{_NAME}.staging-{secrets.token_hex(12)}"
+        staging = root / f".{_NAME}.staging-{secrets.token_hex(16)}"
         try:
-            self._copy_runtime(staging)
-            self._validate_staging(staging)
-            self._write_manifest(staging, root)
-            staged = self._inspect_package(root, staging, expected_name=staging.name)
-            if staged.state != "valid" or staged.manifest is None:
-                raise ValueError("staged package failed integrity validation")
+            manifest, root_identity, staging_identity = self._stage_runtime(
+                root, staging
+            )
             if not target.exists() and not target.is_symlink():
                 return self._commit_new_install(
                     root,
                     target,
                     staging,
-                    staged.manifest,
+                    manifest,
                     options,
-                    staged.root_identity,
-                    staged.target_identity,
+                    root_identity,
+                    staging_identity,
                 )
             return self._repair_or_reuse(
                 root,
                 target,
                 staging,
-                staged.manifest,
+                manifest,
                 options,
-                staged.target_identity,
+                staging_identity,
             )
         except Exception:
             return self._failed(
                 "generic installation was not completed; "
                 "a staging directory may remain for safe manual cleanup",
-                (staging,),
+                tuple(self._change_events),
             )
 
     def doctor(self) -> AdapterResult:
         self._recovery_changes = ()
+        self._change_events = []
         try:
             with self._state_operation(create=False, lock_missing=False):
                 result = self._doctor_locked()
@@ -129,9 +133,14 @@ class GenericAdapter:
         return self._with_recovery_changes(result)
 
     def _doctor_locked(self) -> AdapterResult:
-        self._recover_pending(self._configured_skill_root)
-        recovery = self._read_recovery()
-        status_error = False
+        recovery_error = False
+        try:
+            self._recover_pending(None)
+        except Exception:
+            recovery_error = True
+        recovery = None if recovery_error else self._read_recovery()
+        recovery_pending = recovery is not None or self._unanchored_recovery
+        status_error = recovery_error
         try:
             status = self._read_status()
         except Exception:
@@ -150,16 +159,34 @@ class GenericAdapter:
                 messages.append("adapter status: invalid")
             else:
                 messages.append("adapter status: missing")
-            if recovery is not None:
+            if recovery_pending:
                 messages.append(
                     "recovery required: installer transaction is incomplete"
                 )
             messages.append("manual action required")
             return AdapterResult(
                 self.platform,
-                "degraded" if status_error or recovery is not None else "not-installed",
+                "degraded" if status_error or recovery_pending else "not-installed",
                 CapabilityLevel.UNAVAILABLE,
                 tuple(messages),
+            )
+
+        if (
+            self._recovered_uninstall
+            and status is None
+            and not recovery_pending
+            and not status_error
+        ):
+            return AdapterResult(
+                self.platform,
+                "not-installed",
+                CapabilityLevel.UNAVAILABLE,
+                (
+                    "installed files: absent",
+                    "adapter status: missing",
+                    "shared personal and project data were preserved",
+                ),
+                self._recovery_changes,
             )
 
         try:
@@ -187,7 +214,7 @@ class GenericAdapter:
             messages.append("adapter status: missing")
         else:
             messages.append("adapter status: present")
-        if recovery is not None:
+        if recovery_pending:
             messages.append("recovery required: installer transaction is incomplete")
 
         capability = CapabilityLevel.MANUAL
@@ -201,7 +228,7 @@ class GenericAdapter:
             inspection.state == "valid"
             and status is not None
             and not status_error
-            and recovery is None
+            and not recovery_pending
             and self._status_matches(status, root, inspection.manifest)
         )
         return AdapterResult(
@@ -217,6 +244,7 @@ class GenericAdapter:
                 "shared-data removal is intentionally separate and was not performed"
             )
         self._recovery_changes = ()
+        self._change_events = []
         try:
             with self._state_operation(create=True):
                 result = self._uninstall_locked(options)
@@ -245,98 +273,41 @@ class GenericAdapter:
             return self._failed("shared status does not match selected skill root")
 
         paths = self._manifest_paths(target, manifest)
-        quarantine = root / f".{_NAME}.quarantine-{secrets.token_hex(12)}"
-        self._prepare_quarantine(quarantine, target, paths)
-        recovery_path = self._write_recovery(
-            "uninstall", root, target, quarantine, paths, manifest
+        transaction_id = secrets.token_hex(16)
+        quarantine = root / f".{_NAME}.quarantine-{transaction_id}"
+        quarantine_identity = self._prepare_transaction_directory(
+            root, quarantine, manifest
         )
-        moved: tuple[Path, ...] = ()
-        status_path: Path | None = None
-        status_failure: str | None = None
+        transaction = self._begin_transaction(
+            "uninstall",
+            root,
+            target,
+            quarantine,
+            quarantine,
+            old_manifest=manifest,
+            new_manifest=None,
+            options=None,
+            expected_root_identity=inspection.root_identity,
+            expected_target_identity=inspection.target_identity,
+            expected_staging_identity=quarantine_identity,
+            expected_quarantine_identity=quarantine_identity,
+        )
+        recovery_path = self._write_recovery(transaction)
         try:
-            with self._skill_transaction(
-                root,
-                target,
-                quarantine,
-                paths,
-                (),
-                expected_root_identity=inspection.root_identity,
-                expected_target_identity=inspection.target_identity,
-            ) as lease:
-                self._verify_manifest_under_lease(
-                    lease, target, manifest, require_hashes=True
-                )
-                moved = self._quarantine_managed_files(target, quarantine)
-                try:
-                    status_path = self._remove_status()
-                except Exception:
-                    self._restore_quarantine(quarantine, target, moved)
-                    status_failure = "adapter status could not be updated"
-                if status_failure is None:
-                    try:
-                        self._discard_quarantine(quarantine)
-                    except Exception:
-                        changed = self._changed_after_failed_restore(
-                            target, quarantine, moved
-                        )
-                        return AdapterResult(
-                            self.platform,
-                            "degraded",
-                            CapabilityLevel.UNAVAILABLE,
-                            (
-                                "uninstall cleanup is incomplete",
-                                "recovery is recorded; run doctor before retrying",
-                            ),
-                            self._dedupe_paths(
-                                changed, (status_path, recovery_path)
-                            ),
-                        )
-        except Exception:
-            changed = self._changed_after_failed_restore(target, quarantine, paths)
-            if changed:
-                return AdapterResult(
-                    self.platform,
-                    "degraded",
-                    CapabilityLevel.UNAVAILABLE,
-                    (
-                        "managed files could not be quarantined",
-                        "recovery is recorded; run doctor before retrying",
-                    ),
-                    self._dedupe_paths(changed, (recovery_path,)),
-                )
-            self._cleanup_quarantine_dirs(root, quarantine, paths)
-            self._remove_recovery(missing_ok=True)
-            return self._failed(
-                "managed files could not be quarantined; files restored"
+            changed = self._resume_transaction(
+                self._read_status(), transaction, expected_root=root
             )
-
-        if status_failure is not None:
-            return self._restoration_result(
-                root,
-                target,
-                quarantine,
-                moved,
-                status_failure,
-            )
-
-        try:
-            self._remove_recovery()
         except Exception:
             return AdapterResult(
                 self.platform,
                 "degraded",
                 CapabilityLevel.UNAVAILABLE,
                 (
-                    "skill files were removed but recovery metadata remains",
+                    "generic uninstall is incomplete",
                     "run doctor before retrying",
                 ),
-                self._dedupe_paths(
-                    paths,
-                    (status_path,) if status_path is not None else (),
-                    (recovery_path,),
-                ),
+                self._dedupe_paths((recovery_path,), self._recovery_changes),
             )
-        assert status_path is not None
         return AdapterResult(
             self.platform,
             "uninstalled",
@@ -345,7 +316,7 @@ class GenericAdapter:
                 "shared personal and project data were preserved",
                 "benign empty managed directories may remain",
             ),
-            self._dedupe_paths(paths, (status_path,)),
+            self._dedupe_paths(paths, changed),
         )
 
     @contextmanager
@@ -395,7 +366,12 @@ class GenericAdapter:
         expected_root_identity: tuple[int, int] | None,
         expected_staging_identity: tuple[int, int] | None,
     ) -> AdapterResult:
-        with guard_state_root(root) as lease:
+        with guard_state_root(
+            root,
+            retained_dirs=(_NAME,),
+            create_retained=True,
+            exclusive_create_retained=(_NAME,),
+        ) as lease:
             if (
                 expected_root_identity is not None
                 and self._directory_identity(lease.stat("."))
@@ -408,39 +384,17 @@ class GenericAdapter:
                 != expected_staging_identity
             ):
                 raise OSError("staging identity changed before commit")
-            if lease.exists(_NAME):
-                raise FileExistsError("skill destination appeared during installation")
-            lease.rename_no_replace(staging.name, _NAME)
-        inspection = self._inspect_package(root, target)
-        if (
-            inspection.state != "valid"
-            or inspection.manifest is None
-            or inspection.manifest["install_id"] != manifest["install_id"]
-        ):
-            raise ValueError("installed package identity changed during commit")
-        changed = self._package_changed_paths(target, manifest)
-        try:
-            status_path = self._write_status(target, options)
-        except Exception:
-            return AdapterResult(
-                self.platform,
-                "degraded",
-                self._capability(options),
-                (
-                    "skill files installed; shared status recording is pending",
-                    "run install again to repair adapter status",
-                ),
-                changed,
-            )
-        return AdapterResult(
-            self.platform,
-            "installed",
-            self._capability(options),
-            (
-                "skill discovery must be enabled by the selected host",
-                self._manual_message(options),
-            ),
-            self._dedupe_paths(changed, (status_path,)),
+            self._record_changes((target,))
+            target_identity = self._directory_identity(lease.stat(_NAME))
+        return self._commit_into_empty_target(
+            root,
+            target,
+            staging,
+            manifest,
+            options,
+            expected_root_identity,
+            target_identity,
+            expected_staging_identity,
         )
 
     def _repair_or_reuse(
@@ -472,6 +426,7 @@ class GenericAdapter:
                     options,
                     current.root_identity,
                     current.target_identity,
+                    expected_staging_identity,
                 )
             return self._failed("existing skill directory is not installer-managed")
         same_package = (
@@ -493,9 +448,6 @@ class GenericAdapter:
                 and self._status_matches(status, root, current.manifest)
                 and status.get("capability") == desired_capability
             ):
-                staging_dirs = self._discard_staging_package(
-                    root, staging, desired, expected_staging_identity
-                )
                 return AdapterResult(
                     self.platform,
                     "already-installed",
@@ -504,12 +456,9 @@ class GenericAdapter:
                         "managed skill files are already installed",
                         "benign empty staging directories may remain",
                     ),
-                    staging_dirs,
+                    self._staging_directories(staging, desired),
                 )
             status_path = self._write_status(target, options)
-            staging_dirs = self._discard_staging_package(
-                root, staging, desired, expected_staging_identity
-            )
             return AdapterResult(
                 self.platform,
                 "repaired",
@@ -518,7 +467,9 @@ class GenericAdapter:
                     "adapter status and capability were rebuilt",
                     "benign empty staging directories may remain",
                 ),
-                self._dedupe_paths((status_path,), staging_dirs),
+                self._dedupe_paths(
+                    (status_path,), self._staging_directories(staging, desired)
+                ),
             )
         return self._upgrade_package(
             root,
@@ -552,123 +503,50 @@ class GenericAdapter:
         created_dirs = self._ensure_target_directories(
             root, target, desired, current.target_identity
         )
-        quarantine = root / f".{_NAME}.quarantine-{secrets.token_hex(12)}"
-        self._prepare_quarantine(quarantine, target, old_paths)
-        recovery_path = self._write_recovery(
-            "upgrade", root, target, quarantine, old_paths, current.manifest
+        staging_prefix = f".{_NAME}.staging-"
+        if not staging.name.startswith(staging_prefix):
+            raise ValueError("invalid staging directory")
+        transaction_id = staging.name.removeprefix(staging_prefix)
+        quarantine = root / f".{_NAME}.quarantine-{transaction_id}"
+        quarantine_identity = self._prepare_transaction_directory(
+            root, quarantine, current.manifest
         )
-        staged_paths = self._manifest_paths(staging, desired)
-        moved_old: tuple[Path, ...] = ()
-        moved_new: list[Path] = []
-        move_failure: str | None = None
+        transaction = self._begin_transaction(
+            "upgrade",
+            root,
+            target,
+            staging,
+            quarantine,
+            old_manifest=current.manifest,
+            new_manifest=desired,
+            options=options,
+            expected_root_identity=current.root_identity,
+            expected_target_identity=current.target_identity,
+            expected_staging_identity=expected_staging_identity,
+            expected_quarantine_identity=quarantine_identity,
+        )
+        recovery_path = self._write_recovery(transaction)
         try:
-            with self._skill_transaction(
-                root,
-                target,
-                quarantine,
-                old_paths,
-                tuple(staged_paths),
-                staging=staging,
-                desired_paths=new_paths,
-                expected_root_identity=current.root_identity,
-                expected_target_identity=current.target_identity,
-            ) as lease:
-                self._verify_manifest_under_lease(
-                    lease, target, current.manifest, require_hashes=False
-                )
-                moved_old = self._quarantine_managed_files(
-                    target, quarantine, allow_missing=True
-                )
-                try:
-                    for source, destination in zip(
-                        staged_paths, new_paths, strict=True
-                    ):
-                        lease.publish_no_replace(
-                            source.relative_to(root), destination.relative_to(root)
-                        )
-                        moved_new.append(destination)
-                except Exception:
-                    for destination, source in reversed(
-                        list(zip(moved_new, staged_paths, strict=False))
-                    ):
-                        if lease.exists(destination.relative_to(root)):
-                            lease.publish_no_replace(
-                                destination.relative_to(root),
-                                source.relative_to(root),
-                            )
-                    self._restore_quarantine(quarantine, target, moved_old)
-                    move_failure = "managed upgrade was rolled back"
-                if move_failure is None:
-                    try:
-                        status_path = self._write_status(target, options)
-                    except Exception:
-                        return AdapterResult(
-                            self.platform,
-                            "degraded",
-                            self._capability(options),
-                            (
-                                "managed package was repaired; "
-                                "status recording is pending",
-                                "recovery is recorded; run install again",
-                                "benign empty staging directories may remain",
-                            ),
-                            self._dedupe_paths(
-                                tuple(new_paths),
-                                created_dirs,
-                                self._staging_directories(staging, desired),
-                                (recovery_path,),
-                            ),
-                        )
-                    try:
-                        self._discard_quarantine(quarantine)
-                    except Exception:
-                        return AdapterResult(
-                            self.platform,
-                            "degraded",
-                            self._capability(options),
-                            (
-                                "managed package was repaired but "
-                                "backup cleanup failed",
-                                "recovery is recorded; run doctor before retrying",
-                                "benign empty staging directories may remain",
-                            ),
-                            self._dedupe_paths(
-                                tuple(new_paths),
-                                created_dirs,
-                                self._staging_directories(staging, desired),
-                                self._quarantine_changed_paths(
-                                quarantine, target, moved_old
-                                ),
-                                (status_path, recovery_path),
-                            ),
-                        )
+            changed = self._resume_transaction(
+                self._read_status(), transaction, expected_root=root
+            )
         except Exception:
-            if moved_old:
-                return self._restoration_result(
-                    root,
-                    target,
-                    quarantine,
-                    moved_old,
-                    "managed upgrade could not be completed",
-                )
-            raise
-
-        if move_failure is not None:
-            staging_dirs = self._discard_staging_package(
-                root, staging, desired, expected_staging_identity
-            )
-            return self._restoration_result(
-                root,
-                target,
-                quarantine,
-                moved_old,
-                move_failure,
-                staging_dirs,
+            return AdapterResult(
+                self.platform,
+                "degraded",
+                self._capability(options),
+                (
+                    "managed upgrade is incomplete",
+                    "recovery is recorded; retry install",
+                    "transaction directories are retained for manual inspection",
+                ),
+                self._dedupe_paths(
+                    created_dirs,
+                    (recovery_path,),
+                    self._recovery_changes,
+                ),
             )
 
-        staging_dirs = self._staging_directories(staging, desired)
-        self._cleanup_quarantine_dirs(root, quarantine, old_paths)
-        self._remove_recovery(missing_ok=True)
         operation = (
             "upgraded"
             if current.state == "valid"
@@ -689,8 +567,8 @@ class GenericAdapter:
                 tuple(new_paths),
                 obsolete,
                 created_dirs,
-                (status_path,),
-                staging_dirs,
+                changed,
+                self._staging_directories(staging, desired),
             ),
         )
 
@@ -703,44 +581,30 @@ class GenericAdapter:
         options: InstallOptions,
         expected_root_identity: tuple[int, int] | None,
         expected_target_identity: tuple[int, int],
+        expected_staging_identity: tuple[int, int] | None,
     ) -> AdapterResult:
         created_dirs = self._ensure_target_directories(
             root, target, manifest, expected_target_identity
         )
-        staged_paths = self._manifest_paths(staging, manifest)
-        target_paths = self._manifest_paths(target, manifest)
-        recovery_path = self._write_recovery(
-            "install", root, target, staging, target_paths, manifest
+        transaction = self._begin_transaction(
+            "install",
+            root,
+            target,
+            staging,
+            staging,
+            old_manifest=None,
+            new_manifest=manifest,
+            options=options,
+            expected_root_identity=expected_root_identity,
+            expected_target_identity=expected_target_identity,
+            expected_staging_identity=expected_staging_identity,
+            expected_quarantine_identity=expected_staging_identity,
         )
-        retained = set(self._parent_directories(root, staged_paths))
-        retained.update(self._parent_directories(root, target_paths))
-        retained.discard(Path("."))
-        published: list[Path] = []
+        recovery_path = self._write_recovery(transaction)
         try:
-            with guard_state_root(
-                root,
-                retained_dirs=tuple(
-                    sorted(retained, key=lambda path: (len(path.parts), str(path)))
-                ),
-            ) as lease:
-                if (
-                    expected_root_identity is not None
-                    and self._directory_identity(lease.stat("."))
-                    != expected_root_identity
-                ):
-                    raise OSError("skill root identity changed before publish")
-                if (
-                    self._directory_identity(lease.stat(_NAME))
-                    != expected_target_identity
-                ):
-                    raise OSError("empty managed target identity changed")
-                for source, destination in zip(
-                    staged_paths, target_paths, strict=True
-                ):
-                    lease.publish_no_replace(
-                        source.relative_to(root), destination.relative_to(root)
-                    )
-                    published.append(destination)
+            changed = self._resume_transaction(
+                self._read_status(), transaction, expected_root=root
+            )
         except Exception:
             return AdapterResult(
                 self.platform,
@@ -751,13 +615,11 @@ class GenericAdapter:
                     "recovery is recorded; retry install",
                 ),
                 self._dedupe_paths(
-                    tuple(published),
                     created_dirs,
                     (staging, recovery_path),
+                    self._recovery_changes,
                 ),
             )
-        status_path = self._write_status(target, options)
-        self._remove_recovery()
         staging_dirs = self._staging_directories(staging, manifest)
         return AdapterResult(
             self.platform,
@@ -769,7 +631,7 @@ class GenericAdapter:
             ),
             self._dedupe_paths(
                 self._package_changed_paths(target, manifest),
-                (status_path,),
+                changed,
                 staging_dirs,
             ),
         )
@@ -841,6 +703,7 @@ class GenericAdapter:
                     continue
                 lease.mkdir(directory)
                 created.append(root / directory)
+                self._record_changes((root / directory,))
         return tuple(created)
 
     @contextmanager
@@ -896,26 +759,69 @@ class GenericAdapter:
                 self._active_skill_root = previous_root
                 self._active_moved = previous_moved
 
-    def _copy_runtime(self, staging: Path) -> None:
-        staging.mkdir(mode=0o700)
+    def _stage_runtime(
+        self, root: Path, staging: Path
+    ) -> tuple[dict[str, object], tuple[int, int], tuple[int, int]]:
+        runtime = self._runtime_source_files()
+        with tempfile.TemporaryDirectory(prefix="voice-intent-stage-") as sandbox:
+            validation = Path(sandbox) / "package"
+            for relative, data in runtime.items():
+                destination = validation / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            self._validate_staging(validation)
+        manifest = self._manifest_for_runtime(runtime, root)
+        manifest_bytes = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        directories = self._runtime_directories(staging.name, (*runtime, _MANIFEST))
+        with guard_state_root(
+            root,
+            retained_dirs=directories,
+            create_retained=True,
+            exclusive_create_retained=(staging.name,),
+        ) as lease:
+            root_identity = self._directory_identity(lease.stat("."))
+            staging_identity = self._directory_identity(lease.stat(staging.name))
+            self._record_changes(tuple(root / relative for relative in directories))
+            for relative, data in runtime.items():
+                lease.write_bytes_exclusive(
+                    Path(staging.name) / Path(relative), data
+                )
+                self._record_changes((staging / relative,))
+            lease.write_bytes_exclusive(
+                Path(staging.name) / _MANIFEST, manifest_bytes
+            )
+            self._record_changes((staging / _MANIFEST,))
+            self._verify_manifest_under_lease(
+                lease, staging, manifest, require_hashes=True
+            )
+        return manifest, root_identity, staging_identity
+
+    def _runtime_source_files(self) -> dict[str, bytes]:
+        files: dict[str, bytes] = {}
         for name in _PACKAGE_FILES:
-            self._copy_file(self.repository / name, staging / name)
+            files[name] = self._read_source_file(self.repository / name)
         for directory in _PACKAGE_DIRECTORIES:
-            self._copy_tree(self.repository / directory, staging / directory)
-        self._copy_file(
-            self.repository / "scripts" / "voice_intent.py",
-            staging / "scripts" / "voice_intent.py",
+            self._collect_source_tree(
+                self.repository / directory, Path(directory), files
+            )
+        files["scripts/voice_intent.py"] = self._read_source_file(
+            self.repository / "scripts" / "voice_intent.py"
         )
         python_source = self.repository / "src" / "voice_intent_normalizer"
         if not python_source.is_dir():
             python_source = Path(__file__).resolve().parents[1]
-        self._copy_python_tree(
+        self._collect_source_tree(
             python_source,
-            staging / "src" / "voice_intent_normalizer",
+            Path("src") / "voice_intent_normalizer",
+            files,
+            python_only=True,
         )
+        return dict(sorted(files.items()))
 
     @staticmethod
-    def _copy_file(source: Path, destination: Path) -> None:
+    def _read_source_file(source: Path) -> bytes:
         info = os.lstat(source)
         if (
             not stat.S_ISREG(info.st_mode)
@@ -923,7 +829,6 @@ class GenericAdapter:
             or getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
         ):
             raise ValueError("runtime source must be a direct regular file")
-        destination.parent.mkdir(parents=True, exist_ok=True)
         data = source.read_bytes()
         after = os.lstat(source)
         if (info.st_dev, info.st_ino, info.st_size) != (
@@ -932,34 +837,50 @@ class GenericAdapter:
             after.st_size,
         ):
             raise OSError("runtime source changed while it was copied")
-        destination.write_bytes(data)
+        return data
 
-    def _copy_tree(self, source: Path, destination: Path) -> None:
-        for current, directories, files in os.walk(source, followlinks=False):
+    def _collect_source_tree(
+        self,
+        source: Path,
+        destination: Path,
+        collected: dict[str, bytes],
+        *,
+        python_only: bool = False,
+    ) -> None:
+        for current, directories, filenames in os.walk(
+            source, followlinks=False
+        ):
             current_path = Path(current)
             current_info = os.lstat(current_path)
             self._require_direct_directory(current_info)
             for name in tuple(directories):
                 info = os.lstat(current_path / name)
                 self._require_direct_directory(info)
-                (destination / (current_path / name).relative_to(source)).mkdir(
-                    parents=True, exist_ok=True
-                )
-            for name in files:
-                path = current_path / name
-                self._copy_file(path, destination / path.relative_to(source))
-
-    def _copy_python_tree(self, source: Path, destination: Path) -> None:
-        for current, directories, files in os.walk(source, followlinks=False):
-            current_path = Path(current)
-            self._require_direct_directory(os.lstat(current_path))
-            for name in tuple(directories):
-                self._require_direct_directory(os.lstat(current_path / name))
-            for name in files:
-                if not name.endswith(".py"):
+            for name in filenames:
+                if python_only and not name.endswith(".py"):
                     continue
                 path = current_path / name
-                self._copy_file(path, destination / path.relative_to(source))
+                relative = destination / path.relative_to(source)
+                normalized = str(relative).replace("\\", "/")
+                if normalized in collected:
+                    raise ValueError("duplicate runtime source path")
+                collected[normalized] = self._read_source_file(path)
+
+    @staticmethod
+    def _runtime_directories(
+        staging_name: str, relatives: Sequence[str]
+    ) -> tuple[Path, ...]:
+        directories = {Path(staging_name)}
+        for relative in relatives:
+            parent = Path(staging_name) / Path(relative).parent
+            while parent != Path("."):
+                directories.add(parent)
+                if parent == Path(staging_name):
+                    break
+                parent = parent.parent
+        return tuple(
+            sorted(directories, key=lambda path: (len(path.parts), str(path)))
+        )
 
     @staticmethod
     def _require_direct_directory(info: os.stat_result) -> None:
@@ -1021,22 +942,22 @@ class GenericAdapter:
             raise ValueError("staged skill bootstrap validation failed")
 
     @staticmethod
-    def _write_manifest(target: Path, root: Path) -> None:
-        files = tuple(
-            sorted(
-                str(path.relative_to(target)).replace("\\", "/")
-                for path in target.rglob("*")
-                if path.is_file()
-            )
-        )
+    def _manifest_for_runtime(
+        runtime: dict[str, bytes], root: Path
+    ) -> dict[str, object]:
+        files = tuple(sorted(runtime))
         hashes = {
-            relative: hashlib.sha256((target / relative).read_bytes()).hexdigest()
+            relative: hashlib.sha256(runtime[relative]).hexdigest()
             for relative in files
         }
-        version_payload = tomllib.loads(
-            (target / "pyproject.toml").read_text(encoding="utf-8")
+        metadata = runtime["pyproject.toml"].decode("utf-8")
+        version_matches = re.findall(
+            r'(?m)^version\s*=\s*"([0-9A-Za-z][0-9A-Za-z.+-]*)"\s*$',
+            metadata,
         )
-        package_version = version_payload["project"]["version"]
+        if len(version_matches) != 1:
+            raise ValueError("runtime package version is invalid")
+        package_version = version_matches[0]
         package_hash = GenericAdapter._package_hash(
             str(package_version), hashes, _REQUIRED_FILES
         )
@@ -1052,10 +973,7 @@ class GenericAdapter:
             "skill_root": str(root),
             "skill_root_key": state_root_lock_key(root),
         }
-        (target / _MANIFEST).write_text(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        return payload
 
     def _inspect_package(
         self,
@@ -1248,25 +1166,66 @@ class GenericAdapter:
     def _manifest_files(payload: object) -> tuple[str, ...] | None:
         if not isinstance(payload, dict):
             return None
-        raw_files = payload.get("files")
-        if not isinstance(raw_files, list):
+        return GenericAdapter._safe_relative_files(
+            payload.get("files"), manifest_policy="forbid"
+        )
+
+    @staticmethod
+    def _safe_relative_files(
+        payload: object, *, manifest_policy: str
+    ) -> tuple[str, ...] | None:
+        if (
+            manifest_policy not in {"forbid", "require"}
+            or not isinstance(payload, list)
+            or not payload
+            or len(payload) > _MANIFEST_MAX_ENTRIES
+        ):
             return None
         files: list[str] = []
-        for value in raw_files:
-            if not isinstance(value, str):
-                return None
-            normalized = value.replace("\\", "/")
-            path = PurePosixPath(normalized)
+        seen: set[str] = set()
+        windows_reserved = {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+        for value in payload:
             if (
-                path.is_absolute()
-                or not path.parts
-                or any(part in {"", ".", ".."} for part in path.parts)
+                not isinstance(value, str)
+                or not value
+                or len(value) > _MANIFEST_MAX_PATH_LENGTH
+                or ":" in value
             ):
                 return None
-            normalized = str(path)
-            if normalized in files or normalized == _MANIFEST:
+            windows_path = PureWindowsPath(value)
+            normalized = value.replace("\\", "/")
+            posix_path = PurePosixPath(normalized)
+            raw_parts = normalized.split("/")
+            if (
+                windows_path.is_absolute()
+                or bool(windows_path.drive)
+                or bool(windows_path.root)
+                or posix_path.is_absolute()
+                or len(raw_parts) > _MANIFEST_MAX_DEPTH
+                or any(part in {"", ".", ".."} for part in raw_parts)
+                or any(part.endswith((" ", ".")) for part in raw_parts)
+                or any(
+                    part.split(".", 1)[0].upper() in windows_reserved
+                    for part in raw_parts
+                )
+            ):
                 return None
+            normalized = "/".join(raw_parts)
+            if normalized in seen:
+                return None
+            seen.add(normalized)
             files.append(normalized)
+        if manifest_policy == "forbid" and _MANIFEST in seen:
+            return None
+        if manifest_policy == "require" and _MANIFEST not in seen:
+            return None
         return tuple(files)
 
     @staticmethod
@@ -1290,9 +1249,24 @@ class GenericAdapter:
         if inspection.state != "valid" or inspection.manifest is None:
             raise ValueError("cannot record status for an invalid package")
         manifest = inspection.manifest
-        payload = {
-            "capability": self._capability(options).value,
-            "format": 3,
+        payload = self._status_payload(
+            target, manifest, self._capability(options).value
+        )
+        self._write_status_payload(payload)
+        return self.state_paths.adapter_status_file(self.platform)
+
+    def _status_payload(
+        self,
+        target: Path,
+        manifest: dict[str, object],
+        capability: str,
+        *,
+        transaction: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        root = target.parent
+        return {
+            "capability": capability,
+            "format": 4,
             "install_id": manifest["install_id"],
             "manifest_digest": self._manifest_digest(manifest),
             "managed_directory": str(target),
@@ -1301,7 +1275,10 @@ class GenericAdapter:
             "package_version": manifest["package_version"],
             "skill_root": str(root),
             "skill_root_key": state_root_lock_key(root),
+            "transaction": transaction,
         }
+
+    def _write_status_payload(self, payload: dict[str, object]) -> None:
         self._state_lease().write_bytes_atomic(
             _STATUS_RELATIVE,
             json.dumps(
@@ -1311,7 +1288,7 @@ class GenericAdapter:
                 separators=(",", ":"),
             ).encode("utf-8"),
         )
-        return self.state_paths.adapter_status_file(self.platform)
+        self._record_changes((self.state_paths.adapter_status_file(self.platform),))
 
     def _read_status(self) -> dict[str, object] | None:
         lease = self._state_lease()
@@ -1319,8 +1296,10 @@ class GenericAdapter:
             return None
         if not lease.exists(_STATUS_RELATIVE):
             return None
-        raw = lease.read_bytes(_STATUS_RELATIVE, 16 * 1024, "adapter status")
+        raw = lease.read_bytes(_STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status")
         payload = json.loads(raw.decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("format") == 3:
+            payload = {**payload, "format": 4, "transaction": None}
         expected = {
             "capability",
             "format",
@@ -1332,11 +1311,12 @@ class GenericAdapter:
             "package_version",
             "skill_root",
             "skill_root_key",
+            "transaction",
         }
         if (
             not isinstance(payload, dict)
             or set(payload) != expected
-            or payload.get("format") != 3
+            or payload.get("format") != 4
             or payload.get("owner") != _NAME
             or not all(
                 isinstance(payload.get(name), str)
@@ -1358,6 +1338,17 @@ class GenericAdapter:
             CapabilityLevel.IMPLICIT.value,
         }:
             raise ValueError("invalid generic adapter capability")
+        root = Path(str(payload["skill_root"]))
+        managed = Path(str(payload["managed_directory"]))
+        if (
+            state_root_lock_key(root) != payload["skill_root_key"]
+            or managed.name != _NAME
+            or state_root_lock_key(managed.parent) != payload["skill_root_key"]
+        ):
+            raise ValueError("invalid adapter status paths")
+        transaction = payload.get("transaction")
+        if transaction is not None:
+            self._validate_transaction(transaction, payload)
         return payload
 
     def _remove_status(self) -> Path:
@@ -1365,7 +1356,9 @@ class GenericAdapter:
         if not lease.exists(_STATUS_RELATIVE):
             raise FileNotFoundError("adapter status is missing")
         lease.unlink(_STATUS_RELATIVE)
-        return self.state_paths.adapter_status_file(self.platform)
+        path = self.state_paths.adapter_status_file(self.platform)
+        self._record_changes((path,))
+        return path
 
     def _status_matches(
         self,
@@ -1379,7 +1372,7 @@ class GenericAdapter:
         try:
             return (
                 status.get("owner") == _NAME
-                and status.get("format") == 3
+                and status.get("format") == 4
                 and status.get("install_id") == manifest.get("install_id")
                 and status.get("manifest_digest")
                 == self._manifest_digest(manifest)
@@ -1398,153 +1391,325 @@ class GenericAdapter:
         except (OSError, ValueError):
             return False
 
-    def _write_recovery(
+    def _begin_transaction(
         self,
         operation: str,
         root: Path,
         target: Path,
+        staging: Path,
         quarantine: Path,
-        paths: Sequence[Path],
-        manifest: dict[str, object],
-    ) -> Path:
-        relative_files = [
-            str(path.relative_to(target)).replace("\\", "/") for path in paths
-        ]
-        manifest_hashes = manifest["hashes"]
-        assert isinstance(manifest_hashes, dict)
-        file_hashes = {
-            relative: (
-                self._manifest_digest(manifest)
-                if relative == _MANIFEST
-                else str(manifest_hashes[relative])
-            )
-            for relative in relative_files
-        }
-        payload = {
-            "file_hashes": file_hashes,
-            "files": relative_files,
-            "format": 2,
-            "install_id": manifest["install_id"],
-            "managed_directory": str(target),
-            "manifest_digest": self._manifest_digest(manifest),
+        *,
+        old_manifest: dict[str, object] | None,
+        new_manifest: dict[str, object] | None,
+        options: InstallOptions | None,
+        expected_root_identity: tuple[int, int] | None,
+        expected_target_identity: tuple[int, int] | None,
+        expected_staging_identity: tuple[int, int] | None,
+        expected_quarantine_identity: tuple[int, int] | None,
+    ) -> dict[str, object]:
+        if operation not in {"install", "upgrade", "uninstall"}:
+            raise ValueError("unsupported installer transaction")
+        staging_prefix = f".{_NAME}.staging-"
+        quarantine_prefix = f".{_NAME}.quarantine-"
+        if staging.name.startswith(staging_prefix):
+            transaction_id = staging.name.removeprefix(staging_prefix)
+        elif staging.name.startswith(quarantine_prefix):
+            transaction_id = staging.name.removeprefix(quarantine_prefix)
+        else:
+            raise ValueError("transaction staging name is invalid")
+        if not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
+            raise ValueError("transaction id is invalid")
+        if quarantine.name not in {
+            f".{_NAME}.quarantine-{transaction_id}",
+            staging.name,
+        }:
+            raise ValueError("transaction directory is not derived from its id")
+        capability = (
+            self._capability(options).value
+            if options is not None
+            else str((self._read_status() or {}).get("capability", "manual"))
+        )
+        with guard_state_root(
+            root, retained_dirs=(target.name, staging.name, quarantine.name)
+        ) as lease:
+            identities = {
+                "root_identity": self._directory_identity(lease.stat(".")),
+                "target_identity": self._directory_identity(lease.stat(target.name)),
+                "staging_identity": self._directory_identity(lease.stat(staging.name)),
+                "quarantine_identity": self._directory_identity(
+                    lease.stat(quarantine.name)
+                ),
+            }
+            expected_identities = {
+                "root_identity": expected_root_identity,
+                "target_identity": expected_target_identity,
+                "staging_identity": expected_staging_identity,
+                "quarantine_identity": expected_quarantine_identity,
+            }
+            for name, expected in expected_identities.items():
+                if expected is not None and identities[name] != expected:
+                    raise OSError(f"{name.replace('_', ' ')} changed before journal")
+        transaction: dict[str, object] = {
+            "capability": capability,
+            "digest": "",
+            "format": 1,
+            "id": transaction_id,
+            "new": self._transaction_package(new_manifest),
+            "old": self._transaction_package(old_manifest),
             "operation": operation,
+            "phase": "publishing",
+            "quarantine_identity": list(identities["quarantine_identity"]),
+            "quarantine_name": quarantine.name,
+            "root_identity": list(identities["root_identity"]),
+            "root_key": state_root_lock_key(root),
+            "staging_identity": list(identities["staging_identity"]),
+            "staging_name": staging.name,
+            "target_identity": list(identities["target_identity"]),
+            "target_name": _NAME,
+        }
+        transaction["digest"] = self._transaction_digest(transaction)
+        base_manifest = old_manifest or new_manifest
+        if base_manifest is None:
+            raise ValueError("transaction has no package identity")
+        status = self._status_payload(
+            target,
+            base_manifest,
+            capability,
+            transaction=transaction,
+        )
+        self._write_status_payload(status)
+        return transaction
+
+    @staticmethod
+    def _transaction_package(
+        manifest: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        if manifest is None:
+            return None
+        files = GenericAdapter._manifest_files(manifest)
+        hashes = manifest.get("hashes")
+        if files is None or not isinstance(hashes, dict):
+            raise ValueError("invalid transaction manifest")
+        file_hashes = {relative: str(hashes[relative]) for relative in files}
+        file_hashes[_MANIFEST] = GenericAdapter._manifest_digest(manifest)
+        return {
+            "file_hashes": file_hashes,
+            "files": [*files, _MANIFEST],
+            "install_id": manifest["install_id"],
+            "manifest_digest": GenericAdapter._manifest_digest(manifest),
+            "package_hash": manifest["package_hash"],
+            "package_version": manifest["package_version"],
+        }
+
+    @staticmethod
+    def _transaction_digest(transaction: dict[str, object]) -> str:
+        unsigned = {**transaction, "digest": ""}
+        return hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+    def _validate_transaction(
+        self, transaction: object, status: dict[str, object]
+    ) -> None:
+        expected = {
+            "capability",
+            "digest",
+            "format",
+            "id",
+            "new",
+            "old",
+            "operation",
+            "phase",
+            "quarantine_identity",
+            "quarantine_name",
+            "root_identity",
+            "root_key",
+            "staging_identity",
+            "staging_name",
+            "target_identity",
+            "target_name",
+        }
+        if (
+            not isinstance(transaction, dict)
+            or set(transaction) != expected
+            or transaction.get("format") != 1
+            or transaction.get("operation")
+            not in {"install", "upgrade", "uninstall"}
+            or transaction.get("phase")
+            not in {"prepared", "quarantined", "publishing"}
+            or transaction.get("target_name") != _NAME
+            or transaction.get("root_key") != status.get("skill_root_key")
+            or transaction.get("capability")
+            not in {"manual", "implicit"}
+            or not isinstance(transaction.get("id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", str(transaction["id"]))
+            or transaction.get("digest") != self._transaction_digest(transaction)
+        ):
+            raise ValueError("invalid installer transaction")
+        transaction_id = str(transaction["id"])
+        allowed_names = {
+            f".{_NAME}.staging-{transaction_id}",
+            f".{_NAME}.quarantine-{transaction_id}",
+        }
+        if (
+            transaction.get("staging_name") not in allowed_names
+            or transaction.get("quarantine_name") not in allowed_names
+        ):
+            raise ValueError("invalid installer transaction directories")
+        operation = transaction["operation"]
+        staging_name = transaction["staging_name"]
+        quarantine_name = transaction["quarantine_name"]
+        expected_staging = f".{_NAME}.staging-{transaction_id}"
+        expected_quarantine = f".{_NAME}.quarantine-{transaction_id}"
+        if (
+            operation == "install"
+            and not (
+                staging_name == expected_staging
+                and quarantine_name == expected_staging
+                and transaction.get("old") is None
+                and transaction.get("new") is not None
+            )
+        ) or (
+            operation == "upgrade"
+            and not (
+                staging_name == expected_staging
+                and quarantine_name == expected_quarantine
+                and transaction.get("old") is not None
+                and transaction.get("new") is not None
+            )
+        ) or (
+            operation == "uninstall"
+            and not (
+                staging_name == expected_quarantine
+                and quarantine_name == expected_quarantine
+                and transaction.get("old") is not None
+                and transaction.get("new") is None
+            )
+        ):
+            raise ValueError("invalid installer transaction shape")
+        for name in (
+            "root_identity",
+            "staging_identity",
+            "target_identity",
+            "quarantine_identity",
+        ):
+            identity = transaction.get(name)
+            if (
+                not isinstance(identity, list)
+                or len(identity) != 2
+                or not all(isinstance(value, int) for value in identity)
+            ):
+                raise ValueError("invalid installer transaction identity")
+        for name in ("old", "new"):
+            package = transaction.get(name)
+            if package is None:
+                continue
+            if not isinstance(package, dict):
+                raise ValueError("invalid installer transaction package")
+            files = self._recovery_files(package.get("files"))
+            hashes = package.get("file_hashes")
+            if (
+                files is None
+                or not isinstance(hashes, dict)
+                or set(hashes) != set(files)
+                or not all(
+                    isinstance(hashes.get(path), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", str(hashes[path]))
+                    for path in files
+                )
+            ):
+                raise ValueError("invalid installer transaction package")
+
+    def _write_recovery(self, transaction: dict[str, object]) -> Path:
+        """Write a non-authoritative marker for one status-anchored transaction."""
+        payload = {
+            "format": 3,
             "owner": _NAME,
-            "package_hash": manifest.get("package_hash", ""),
-            "package_version": manifest.get("package_version", ""),
-            "quarantine": str(quarantine),
-            "quarantine_identity": list(
-                self._directory_identity(os.stat(quarantine, follow_symlinks=False))
-            ),
-            "root_identity": list(
-                self._directory_identity(os.stat(root, follow_symlinks=False))
-            ),
-            "skill_root": str(root),
-            "skill_root_key": state_root_lock_key(root),
-            "target_identity": list(
-                self._directory_identity(os.stat(target, follow_symlinks=False))
-            ),
+            "transaction_digest": transaction["digest"],
+            "transaction_id": transaction["id"],
         }
         self._state_lease().write_bytes_atomic(
             _RECOVERY_RELATIVE,
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         )
-        return self.state_paths.root / _RECOVERY_RELATIVE
+        path = self.state_paths.root / _RECOVERY_RELATIVE
+        self._record_changes((path,))
+        return path
 
     def _read_recovery(self) -> dict[str, object] | None:
+        """Return only a recovery transaction authenticated by protected status."""
+        self._unanchored_recovery = False
         lease = self._state_lease()
         if not lease.root_exists or not lease.available("adapters"):
             return None
-        if not lease.exists(_RECOVERY_RELATIVE):
+        status = self._read_status()
+        transaction = status.get("transaction") if status is not None else None
+        marker_exists = lease.exists(_RECOVERY_RELATIVE)
+        if transaction is None:
+            self._unanchored_recovery = marker_exists
             return None
-        raw = lease.read_bytes(_RECOVERY_RELATIVE, 64 * 1024, "adapter recovery")
-        payload = json.loads(raw.decode("utf-8"))
-        expected = {
-            "file_hashes",
-            "files",
-            "format",
-            "install_id",
-            "managed_directory",
-            "manifest_digest",
-            "operation",
-            "owner",
-            "package_hash",
-            "package_version",
-            "quarantine",
-            "quarantine_identity",
-            "root_identity",
-            "skill_root",
-            "skill_root_key",
-            "target_identity",
-        }
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != expected
-            or payload.get("format") != 2
-            or payload.get("owner") != _NAME
-            or payload.get("operation") not in {"install", "upgrade", "uninstall"}
-        ):
-            raise ValueError("invalid adapter recovery record")
-        string_fields = (
-            "install_id",
-            "managed_directory",
-            "manifest_digest",
-            "package_hash",
-            "package_version",
-            "quarantine",
-            "skill_root",
-            "skill_root_key",
-        )
-        identities = (
-            payload.get("root_identity"),
-            payload.get("target_identity"),
-            payload.get("quarantine_identity"),
-        )
-        files = self._recovery_files(payload.get("files"))
-        hashes = payload.get("file_hashes")
-        if (
-            not all(isinstance(payload.get(name), str) for name in string_fields)
-            or not all(
-                isinstance(identity, list)
-                and len(identity) == 2
-                and all(isinstance(value, int) for value in identity)
-                for identity in identities
+        assert isinstance(transaction, dict)
+        if not marker_exists:
+            return transaction
+        try:
+            raw = lease.read_bytes(
+                _RECOVERY_RELATIVE, 16 * 1024, "adapter recovery"
             )
-            or files is None
-            or not isinstance(hashes, dict)
-            or set(hashes) != set(files)
-            or not all(
-                isinstance(hashes.get(relative), str)
-                and len(str(hashes[relative])) == 64
-                for relative in files
-            )
-        ):
-            raise ValueError("invalid adapter recovery record")
-        root = Path(str(payload["skill_root"]))
-        target = Path(str(payload["managed_directory"]))
-        quarantine = Path(str(payload["quarantine"]))
+            marker = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._unanchored_recovery = True
+            return None
         if (
-            state_root_lock_key(root) != payload["skill_root_key"]
-            or state_root_lock_key(target.parent) != payload["skill_root_key"]
-            or target.name != _NAME
-            or state_root_lock_key(quarantine.parent) != payload["skill_root_key"]
-            or not quarantine.name.startswith(
-                (
-                    f".{_NAME}.quarantine-",
-                    f".{_NAME}.staging-",
-                )
-            )
+            not isinstance(marker, dict)
+            or set(marker)
+            != {"format", "owner", "transaction_digest", "transaction_id"}
+            or marker.get("format") != 3
+            or marker.get("owner") != _NAME
+            or marker.get("transaction_id") != transaction.get("id")
+            or marker.get("transaction_digest") != transaction.get("digest")
         ):
-            raise ValueError("invalid adapter recovery paths")
-        return payload
+            self._unanchored_recovery = True
+            return None
+        return transaction
 
     def _remove_recovery(self, *, missing_ok: bool = False) -> None:
-        self._state_lease().unlink(_RECOVERY_RELATIVE, missing_ok=missing_ok)
+        lease = self._state_lease()
+        existed = lease.exists(_RECOVERY_RELATIVE)
+        lease.unlink(_RECOVERY_RELATIVE, missing_ok=missing_ok)
+        if existed:
+            self._record_changes((self.state_paths.root / _RECOVERY_RELATIVE,))
 
     def _recover_pending(self, expected_root: Path | None) -> None:
-        recovery = self._read_recovery()
-        if recovery is None:
+        status = self._read_status()
+        transaction = self._read_recovery()
+        if self._unanchored_recovery:
+            if expected_root is None:
+                return
+            raise ValueError("unanchored recovery metadata requires manual review")
+        if transaction is None:
             return
-        root = self._safe_skill_root(Path(str(recovery["skill_root"])))
+        assert status is not None
+        changed = self._resume_transaction(
+            status, transaction, expected_root=expected_root
+        )
+        self._recovery_changes = self._dedupe_paths(
+            self._recovery_changes, changed
+        )
+
+    def _resume_transaction(
+        self,
+        status: dict[str, object] | None,
+        transaction: dict[str, object],
+        *,
+        expected_root: Path | None,
+    ) -> tuple[Path, ...]:
+        """Idempotently complete a transaction using status-bound identities."""
+        if status is None or status.get("transaction") != transaction:
+            raise ValueError("installer transaction is not anchored by status")
+        self._validate_transaction(transaction, status)
+        root = self._safe_skill_root(Path(str(status["skill_root"])))
         if (
             expected_root is not None
             and state_root_lock_key(expected_root) != state_root_lock_key(root)
@@ -1552,228 +1717,228 @@ class GenericAdapter:
             raise ValueError("recovery belongs to a different skill root")
         self._configured_skill_root = root
         target = root / _NAME
-        quarantine = Path(str(recovery["quarantine"]))
-        files = self._recovery_files(recovery["files"])
-        assert files is not None
-        target_paths = tuple(target / relative for relative in files)
-        quarantine_paths = tuple(quarantine / relative for relative in files)
-        retained = set(self._parent_directories(root, target_paths))
-        retained.update(self._parent_directories(root, quarantine_paths))
-        retained.discard(Path("."))
-        inspection = self._inspect_package(root, target, allow_hash_failure=True)
-        try:
-            status = self._read_status()
-        except Exception:
-            status = None
-        finalize = (
-            recovery["operation"] == "uninstall"
-            and status is None
-        ) or (
-            recovery["operation"] == "upgrade"
-            and inspection.state == "valid"
-            and inspection.manifest is not None
-            and inspection.manifest.get("install_id") != recovery["install_id"]
-        ) or (
-            recovery["operation"] == "install"
-            and inspection.state == "valid"
-            and inspection.manifest is not None
-            and inspection.manifest.get("install_id") == recovery["install_id"]
-        )
+        staging = root / str(transaction["staging_name"])
+        quarantine = root / str(transaction["quarantine_name"])
+        old = transaction.get("old")
+        new = transaction.get("new")
+        old_package = old if isinstance(old, dict) else None
+        new_package = new if isinstance(new, dict) else None
+        old_files = self._transaction_files(old_package)
+        new_files = self._transaction_files(new_package)
+        all_files = tuple(dict.fromkeys((*old_files, *new_files)))
+        retained = {Path(_NAME), Path(staging.name), Path(quarantine.name)}
+        for directory in (target, staging, quarantine):
+            for relative in all_files:
+                parent = Path(directory.name) / Path(relative).parent
+                while parent != Path("."):
+                    retained.add(parent)
+                    if parent == Path(directory.name):
+                        break
+                    parent = parent.parent
+        changed: list[Path] = []
         with guard_state_root(
             root,
             retained_dirs=tuple(
                 sorted(retained, key=lambda path: (len(path.parts), str(path)))
             ),
         ) as lease:
-            if list(self._directory_identity(lease.stat("."))) != recovery[
-                "root_identity"
-            ]:
-                raise OSError("recovery root identity changed")
-            if list(self._directory_identity(lease.stat(_NAME))) != recovery[
-                "target_identity"
-            ]:
-                raise OSError("recovery target identity changed")
-            quarantine_relative = quarantine.relative_to(root)
-            if list(
-                self._directory_identity(lease.stat(quarantine_relative))
-            ) != recovery["quarantine_identity"]:
-                raise OSError("recovery quarantine identity changed")
-            if finalize:
-                changed = self._discard_recovery_files(
-                    lease, root, quarantine_paths, recovery
-                )
-            elif recovery["operation"] == "install":
-                changed = self._complete_recovery_install(
-                    lease,
-                    root,
-                    target_paths,
-                    quarantine_paths,
-                    recovery,
-                )
-            else:
-                changed = self._restore_recovery_files(
-                    lease,
-                    root,
-                    target_paths,
-                    quarantine_paths,
-                    recovery,
-                )
-        self._remove_recovery()
-        self._recovery_changes = self._dedupe_paths(
-            changed, (self.state_paths.root / _RECOVERY_RELATIVE,)
-        )
+            for relative, expected in (
+                (Path("."), transaction["root_identity"]),
+                (Path(_NAME), transaction["target_identity"]),
+                (Path(staging.name), transaction["staging_identity"]),
+                (Path(quarantine.name), transaction["quarantine_identity"]),
+            ):
+                if list(self._directory_identity(lease.stat(relative))) != expected:
+                    raise OSError("transaction directory identity changed")
 
-    def _complete_recovery_install(
-        self,
-        lease: StateRootLease,
-        root: Path,
-        target_paths: Sequence[Path],
-        staging_paths: Sequence[Path],
-        recovery: dict[str, object],
-    ) -> tuple[Path, ...]:
-        actions: list[tuple[str, Path, Path]] = []
-        for target_path, staging_path in zip(
-            target_paths, staging_paths, strict=True
-        ):
-            target_relative = target_path.relative_to(root)
-            staging_relative = staging_path.relative_to(root)
-            expected = self._recovery_expected_hash(
-                staging_path, staging_paths, recovery
-            )
-            target_exists = lease.exists(target_relative)
-            staging_exists = lease.exists(staging_relative)
-            if target_exists and self._lease_file_hash(
-                lease, target_relative
-            ) != expected:
-                raise ValueError("install recovery found an unknown destination")
-            if staging_exists and self._lease_file_hash(
-                lease, staging_relative
-            ) != expected:
-                raise ValueError("install recovery staging was modified")
-            if target_exists and staging_exists:
-                actions.append(("unlink", staging_path, target_path))
-            elif staging_exists:
-                actions.append(("publish", staging_path, target_path))
-            elif not target_exists:
-                raise ValueError("install recovery file is missing")
-        changed: list[Path] = []
-        for action, staging_path, target_path in actions:
-            target_relative = target_path.relative_to(root)
-            staging_relative = staging_path.relative_to(root)
-            if action == "unlink":
-                lease.unlink(staging_relative)
-                changed.append(staging_path)
-            else:
-                lease.publish_no_replace(staging_relative, target_relative)
-                changed.extend((staging_path, target_path))
-        return tuple(changed)
+            states: dict[str, tuple[str | None, str | None, str | None]] = {}
+            for relative in all_files:
+                target_hash = self._lease_hash_or_none(
+                    lease, Path(_NAME) / relative
+                )
+                staging_hash = self._lease_hash_or_none(
+                    lease, Path(staging.name) / relative
+                )
+                quarantine_hash = self._lease_hash_or_none(
+                    lease, Path(quarantine.name) / relative
+                )
+                old_hash = self._transaction_expected_hash(old_package, relative)
+                new_hash = self._transaction_expected_hash(new_package, relative)
+                if target_hash is not None and target_hash not in {
+                    value for value in (old_hash, new_hash) if value is not None
+                }:
+                    raise ValueError(
+                        f"transaction found an unknown managed destination: {relative}"
+                    )
+                if staging_hash is not None and new_hash is not None:
+                    if staging_hash != new_hash:
+                        raise ValueError("transaction staging was modified")
+                if (
+                    quarantine.name != staging.name
+                    and quarantine_hash is not None
+                ):
+                    if old_hash is None or quarantine_hash != old_hash:
+                        raise ValueError("transaction quarantine was modified")
+                if old_hash is not None:
+                    if target_hash == old_hash:
+                        pass
+                    elif quarantine_hash == old_hash:
+                        pass
+                    elif target_hash == new_hash and new_hash is not None:
+                        raise ValueError("transaction backup is missing")
+                    elif transaction["operation"] == "upgrade":
+                        # A repair upgrade may start with missing managed files.
+                        # The desired staged package remains authoritative.
+                        pass
+                    else:
+                        raise ValueError("transaction source is missing")
+                if (
+                    new_hash is not None
+                    and target_hash != new_hash
+                    and staging_hash != new_hash
+                ):
+                    raise ValueError("transaction publish source is missing")
+                states[relative] = (
+                    target_hash,
+                    staging_hash,
+                    quarantine_hash,
+                )
+
+            for relative in old_files:
+                target_relative = Path(_NAME) / relative
+                quarantine_relative = Path(quarantine.name) / relative
+                old_hash = self._transaction_expected_hash(old_package, relative)
+                target_hash, _, quarantine_hash = states[relative]
+                if target_hash == old_hash:
+                    if quarantine_hash is None:
+                        lease.publish_no_replace(
+                            target_relative, quarantine_relative
+                        )
+                        changed.append(quarantine / relative)
+                        self._record_changes((quarantine / relative,))
+                    lease.unlink(target_relative)
+                    changed.append(target / relative)
+                    self._record_changes((target / relative,))
+
+            for relative in new_files:
+                target_relative = Path(_NAME) / relative
+                staging_relative = Path(staging.name) / relative
+                expected_hash = self._transaction_expected_hash(
+                    new_package, relative
+                )
+                current_hash = self._lease_hash_or_none(lease, target_relative)
+                if current_hash is None:
+                    lease.publish_no_replace(staging_relative, target_relative)
+                    changed.append(target / relative)
+                    self._record_changes((target / relative,))
+                elif current_hash != expected_hash:
+                    raise ValueError(
+                        "transaction would overwrite an unknown destination"
+                    )
+
+            for relative in new_files:
+                if self._lease_hash_or_none(
+                    lease, Path(_NAME) / relative
+                ) != self._transaction_expected_hash(new_package, relative):
+                    raise ValueError("transaction final package is incomplete")
+            if new_package is None:
+                for relative in old_files:
+                    if lease.exists(Path(_NAME) / relative):
+                        raise ValueError("transaction uninstall is incomplete")
+
+        # Remove the optional marker before clearing the authoritative journal.
+        # A crash between these writes still leaves a resumable protected status.
+        marker_existed = self._state_lease().exists(_RECOVERY_RELATIVE)
+        self._remove_recovery(missing_ok=True)
+        if marker_existed:
+            changed.append(self.state_paths.root / _RECOVERY_RELATIVE)
+        if new_package is None:
+            changed.append(self._remove_status())
+            self._recovered_uninstall = True
+        else:
+            final_status = {
+                **status,
+                "capability": transaction["capability"],
+                "install_id": new_package["install_id"],
+                "manifest_digest": new_package["manifest_digest"],
+                "package_hash": new_package["package_hash"],
+                "package_version": new_package["package_version"],
+                "transaction": None,
+            }
+            self._write_status_payload(final_status)
+            changed.append(self.state_paths.adapter_status_file(self.platform))
+        result = self._dedupe_paths(changed)
+        self._recovery_changes = self._dedupe_paths(
+            self._recovery_changes, result
+        )
+        return result
+
+    @staticmethod
+    def _transaction_files(
+        package: dict[str, object] | None,
+    ) -> tuple[str, ...]:
+        if package is None:
+            return ()
+        files = GenericAdapter._recovery_files(package.get("files"))
+        if files is None:
+            raise ValueError("invalid transaction file list")
+        return files
+
+    @staticmethod
+    def _transaction_expected_hash(
+        package: dict[str, object] | None, relative: str
+    ) -> str | None:
+        if package is None:
+            return None
+        hashes = package.get("file_hashes")
+        if not isinstance(hashes, dict):
+            raise ValueError("invalid transaction hashes")
+        value = hashes.get(relative)
+        return str(value) if isinstance(value, str) else None
+
+    @staticmethod
+    def _lease_hash_or_none(
+        lease: StateRootLease, relative: Path
+    ) -> str | None:
+        if not lease.exists(relative):
+            return None
+        if relative.name == _MANIFEST:
+            raw = lease.read_bytes(relative, _MANIFEST_LIMIT, "installer manifest")
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid installer manifest")
+            return GenericAdapter._manifest_digest(payload)
+        return GenericAdapter._lease_file_hash(lease, relative)
 
     @staticmethod
     def _recovery_files(payload: object) -> tuple[str, ...] | None:
-        if not isinstance(payload, list) or not payload:
-            return None
-        files: list[str] = []
-        for value in payload:
-            if not isinstance(value, str):
-                return None
-            normalized = value.replace("\\", "/")
-            path = PurePosixPath(normalized)
-            if (
-                path.is_absolute()
-                or not path.parts
-                or any(part in {"", ".", ".."} for part in path.parts)
-                or normalized in files
-            ):
-                return None
-            files.append(normalized)
-        if _MANIFEST not in files:
-            return None
-        return tuple(files)
-
-    def _discard_recovery_files(
-        self,
-        lease: StateRootLease,
-        root: Path,
-        quarantine_paths: Sequence[Path],
-        recovery: dict[str, object],
-    ) -> tuple[Path, ...]:
-        present: list[tuple[Path, Path]] = []
-        for path in quarantine_paths:
-            relative = path.relative_to(root)
-            if not lease.exists(relative):
-                continue
-            expected = self._recovery_expected_hash(path, quarantine_paths, recovery)
-            if self._lease_file_hash(lease, relative) != expected:
-                raise ValueError("recovery quarantine contains an unknown file")
-            present.append((path, relative))
-        changed: list[Path] = []
-        for path, relative in present:
-            lease.unlink(relative)
-            changed.append(path)
-        return tuple(changed)
-
-    def _restore_recovery_files(
-        self,
-        lease: StateRootLease,
-        root: Path,
-        target_paths: Sequence[Path],
-        quarantine_paths: Sequence[Path],
-        recovery: dict[str, object],
-    ) -> tuple[Path, ...]:
-        actions: list[tuple[str, Path, Path]] = []
-        for target_path, quarantine_path in zip(
-            target_paths, quarantine_paths, strict=True
-        ):
-            target_relative = target_path.relative_to(root)
-            quarantine_relative = quarantine_path.relative_to(root)
-            expected = self._recovery_expected_hash(
-                quarantine_path, quarantine_paths, recovery
-            )
-            target_exists = lease.exists(target_relative)
-            quarantine_exists = lease.exists(quarantine_relative)
-            if target_exists and self._lease_file_hash(
-                lease, target_relative
-            ) != expected:
-                raise ValueError("recovery would overwrite an unknown file")
-            if quarantine_exists and self._lease_file_hash(
-                lease, quarantine_relative
-            ) != expected:
-                raise ValueError("recovery quarantine contains an unknown file")
-            if target_exists and quarantine_exists:
-                actions.append(("unlink", quarantine_path, target_path))
-            elif quarantine_exists:
-                actions.append(("publish", quarantine_path, target_path))
-            elif not target_exists:
-                raise ValueError("recovery file is missing from both locations")
-        changed: list[Path] = []
-        for action, quarantine_path, target_path in actions:
-            target_relative = target_path.relative_to(root)
-            quarantine_relative = quarantine_path.relative_to(root)
-            if action == "unlink":
-                lease.unlink(quarantine_relative)
-                changed.append(quarantine_path)
-            else:
-                lease.publish_no_replace(quarantine_relative, target_relative)
-                changed.extend((quarantine_path, target_path))
-        return tuple(changed)
-
-    @staticmethod
-    def _recovery_expected_hash(
-        path: Path,
-        quarantine_paths: Sequence[Path],
-        recovery: dict[str, object],
-    ) -> str:
-        quarantine_root = Path(str(recovery["quarantine"]))
-        relative = str(path.relative_to(quarantine_root)).replace("\\", "/")
-        hashes = recovery["file_hashes"]
-        assert isinstance(hashes, dict)
-        return str(hashes[relative])
+        return GenericAdapter._safe_relative_files(
+            payload, manifest_policy="require"
+        )
 
     @staticmethod
     def _lease_file_hash(lease: StateRootLease, relative: Path) -> str:
         return hashlib.sha256(
             lease.read_bytes(relative, _MANAGED_FILE_LIMIT, "recovery file")
         ).hexdigest()
+
+    def _prepare_transaction_directory(
+        self,
+        root: Path,
+        directory: Path,
+        manifest: dict[str, object],
+    ) -> tuple[int, int]:
+        files = (*(self._manifest_files(manifest) or ()), _MANIFEST)
+        retained = self._runtime_directories(directory.name, files)
+        with guard_state_root(
+            root,
+            retained_dirs=retained,
+            create_retained=True,
+            exclusive_create_retained=(directory.name,),
+        ) as lease:
+            identity = self._directory_identity(lease.stat(directory.name))
+        self._record_changes(tuple(root / relative for relative in retained))
+        return identity
 
     def _prepare_quarantine(
         self, quarantine: Path, target: Path, paths: Sequence[Path]
@@ -2039,15 +2204,24 @@ class GenericAdapter:
         return tuple(result)
 
     def _with_recovery_changes(self, result: AdapterResult) -> AdapterResult:
-        if not self._recovery_changes:
+        if not self._recovery_changes and not self._change_events:
             return result
         return AdapterResult(
             result.platform,
             result.status,
             result.capability,
             result.messages,
-            self._dedupe_paths(self._recovery_changes, result.changed_paths),
+            self._dedupe_paths(
+                tuple(self._change_events),
+                self._recovery_changes,
+                result.changed_paths,
+            ),
         )
+
+    def _record_changes(self, paths: Sequence[Path]) -> None:
+        for path in paths:
+            if path not in self._change_events:
+                self._change_events.append(path)
 
     @staticmethod
     def _inspection_message(state: str) -> str:

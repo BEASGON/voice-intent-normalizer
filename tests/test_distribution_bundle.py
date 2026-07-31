@@ -51,6 +51,10 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
 
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        expected_bundle = {
+            f"voice_intent_normalizer/_skill_bundle/{relative}"
+            for relative in BUNDLE_FILES
+        }
         for relative in BUNDLE_FILES:
             bundled = f"voice_intent_normalizer/_skill_bundle/{relative}"
             assert bundled in names
@@ -58,8 +62,16 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
         for source in (ROOT / "src" / "voice_intent_normalizer").rglob("*.py"):
             relative = source.relative_to(ROOT)
             bundled = f"voice_intent_normalizer/_skill_bundle/{relative.as_posix()}"
+            expected_bundle.add(bundled)
             assert bundled in names
             assert archive.read(bundled) == source.read_bytes()
+        actual_bundle = {
+            name
+            for name in names
+            if name.startswith("voice_intent_normalizer/_skill_bundle/")
+            and not name.endswith("/")
+        }
+        assert actual_bundle == expected_bundle
         assert not any(
             "/_skill_bundle/tests/" in name
             or "/_skill_bundle/.git/" in name
@@ -70,6 +82,27 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
         names = archive.getnames()
         for relative in BUNDLE_FILES:
             assert any(name.endswith(f"/{relative}") for name in names)
+
+
+def test_rebuild_clears_stale_generated_bundle_files(tmp_path: Path):
+    stale = (
+        ROOT
+        / "build"
+        / "lib"
+        / "voice_intent_normalizer"
+        / "_skill_bundle"
+        / "stale.txt"
+    )
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("must not ship", encoding="utf-8")
+
+    _, wheel = _build_distributions(tmp_path)
+
+    with zipfile.ZipFile(wheel) as archive:
+        assert (
+            "voice_intent_normalizer/_skill_bundle/stale.txt"
+            not in archive.namelist()
+        )
 
 
 def test_installed_wheel_default_installer_and_bootstrap_are_runnable(
