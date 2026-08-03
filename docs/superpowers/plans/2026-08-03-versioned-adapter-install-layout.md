@@ -25,6 +25,7 @@
 ### Task 1: Versioned Layout, Manifest, and Status Contracts
 
 **Files:**
+- Create: `src/voice_intent_normalizer/adapters/generic_contract.py`
 - Create: `src/voice_intent_normalizer/adapters/generic_layout.py`
 - Modify: `src/voice_intent_normalizer/paths.py`
 - Create: `tests/test_generic_layout.py`
@@ -32,7 +33,7 @@
 
 **Interfaces:**
 - Consumes: `StatePaths`, `StateRootLease`, canonical JSON helpers, direct-local state-root contract.
-- Produces: `GenericLayoutPaths`, `GenerationRef`, `CapsuleRef`, `generic_layout_paths()`, `build_manifest()`, `validate_manifest()`, `validate_status_v5()`, `canonical_json_bytes()`.
+- Produces: dependency-free `generic_contract.py` with `GenerationRef`, `CapsuleRef`, `build_manifest()`, `validate_manifest()`, `validate_status_v5()`, and `canonical_json_bytes()`; `generic_layout.py` with `GenericLayoutPaths` and `generic_layout_paths()`.
 
 - [ ] **Step 1: Write failing pure-contract tests**
 
@@ -72,7 +73,7 @@ Expected: collection/import failures for the missing `generic_layout` module and
 
 - [ ] **Step 3: Implement the immutable value contracts**
 
-Create frozen slot dataclasses and exact constants:
+Create dependency-free frozen slot dataclasses and exact constants in `generic_contract.py`:
 
 ```python
 CAPSULE_PROTOCOL = 1
@@ -103,7 +104,9 @@ class CapsuleRef:
     package_hash: str
 ```
 
-Implement bounded validation without quadratic duplicate checks. Return immutable tuples/mappings or fresh ordinary objects; never retain caller-owned mutable dictionaries. Add `StatePaths.generic_adapter_root()` and make `adapter_status_file("generic")` resolve to `adapters/generic/status.json` while leaving other fixed adapter identifiers on their existing contract until their own tasks adopt private layouts.
+The contract module may import only Python 3.10 standard-library modules and must use no package-relative imports, filesystem mutation, or host state. This exact source file will be copied into the installed capsule in Task 2. Implement bounded validation without quadratic duplicate checks. Return immutable tuples/mappings or fresh ordinary objects; never retain caller-owned mutable dictionaries.
+
+In `generic_layout.py`, add `StatePaths.generic_adapter_root()` integration and make `adapter_status_file("generic")` resolve to `adapters/generic/status.json` while leaving other fixed adapter identifiers on their existing contract until their own tasks adopt private layouts.
 
 - [ ] **Step 4: Verify GREEN and compatibility**
 
@@ -111,7 +114,7 @@ Run:
 
 ```powershell
 python -m pytest tests/test_generic_layout.py tests/test_paths.py tests/test_installer.py -q -k "layout or manifest or status_v5 or adapter_status"
-python -m ruff check src/voice_intent_normalizer/adapters/generic_layout.py src/voice_intent_normalizer/paths.py tests/test_generic_layout.py tests/test_installer.py
+python -m ruff check src/voice_intent_normalizer/adapters/generic_contract.py src/voice_intent_normalizer/adapters/generic_layout.py src/voice_intent_normalizer/paths.py tests/test_generic_layout.py tests/test_installer.py
 ```
 
 Expected: all selected tests pass and Ruff reports no findings.
@@ -119,7 +122,7 @@ Expected: all selected tests pass and Ruff reports no findings.
 - [ ] **Step 5: Commit Task 1**
 
 ```powershell
-git add src/voice_intent_normalizer/adapters/generic_layout.py src/voice_intent_normalizer/paths.py tests/test_generic_layout.py tests/test_installer.py
+git add src/voice_intent_normalizer/adapters/generic_contract.py src/voice_intent_normalizer/adapters/generic_layout.py src/voice_intent_normalizer/paths.py tests/test_generic_layout.py tests/test_installer.py
 git commit -m "refactor: define versioned adapter layout"
 ```
 
@@ -127,6 +130,7 @@ git commit -m "refactor: define versioned adapter layout"
 
 **Files:**
 - Modify: `scripts/voice_intent.py`
+- Modify: `src/voice_intent_normalizer/adapters/generic_contract.py`
 - Modify: `src/voice_intent_normalizer/adapters/generic_layout.py`
 - Create: `tests/test_capsule_bootstrap.py`
 - Modify: `tests/test_cli.py`
@@ -183,7 +187,7 @@ Expected: installed-capsule cases fail because the current bootstrap requires a 
 
 - [ ] **Step 3: Implement dual-mode bootstrap**
 
-Keep the bootstrap self-contained. Select checkout mode only when a direct sibling `src/voice_intent_normalizer` passes the existing preflight. Otherwise require a direct capsule with canonical `capsule.json`, resolve the canonical local state root, parse `adapters/generic/status.json` with recursive duplicate-key rejection, reconstruct `generations/<validated-id>`, validate the generation manifest and package tree, isolate bytecode, clear preloaded modules, and import the exact generation `cli.py`.
+Keep the bootstrap self-contained. Select checkout mode only when a direct sibling `src/voice_intent_normalizer` passes the existing preflight. Otherwise require a direct capsule with canonical `capsule.json`, verify `scripts/_voice_intent_contract.py` against the protected capsule digest, load that exact helper by physical path, resolve the canonical local state root, parse `adapters/generic/status.json` with the shared recursive duplicate-key rejection, reconstruct `generations/<validated-id>`, validate the generation manifest and package tree, isolate bytecode, clear preloaded modules, and import the exact generation `cli.py`.
 
 Use this decision boundary:
 
@@ -200,7 +204,7 @@ The installed branch must derive paths from validated fixed names and IDs only. 
 
 - [ ] **Step 4: Implement capsule and generation allowlists**
 
-In `generic_layout.py`, define explicit POSIX-relative allowlists for agent-visible capsule files and runtime repository roots. Read every source through direct-file/no-alias checks, enforce byte/file/depth limits, and build canonical manifests from immutable bytes. Ensure the generated capsule manifest hashes the bootstrap and all agent-visible files but never hashes itself recursively.
+In `generic_layout.py`, define explicit POSIX-relative allowlists for agent-visible capsule files and runtime repository roots. Include `generic_contract.py` byte-for-byte as capsule `scripts/_voice_intent_contract.py`. Read every source through direct-file/no-alias checks, enforce byte/file/depth limits, and build canonical manifests from immutable bytes. Ensure the generated capsule manifest hashes the bootstrap, shared validator, and all agent-visible files but never hashes itself recursively.
 
 - [ ] **Step 5: Verify GREEN**
 
@@ -208,7 +212,7 @@ Run:
 
 ```powershell
 python -m pytest tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_distribution_bundle.py -q
-python -m ruff check scripts/voice_intent.py src/voice_intent_normalizer/adapters/generic_layout.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_distribution_bundle.py
+python -m ruff check scripts/voice_intent.py src/voice_intent_normalizer/adapters/generic_contract.py src/voice_intent_normalizer/adapters/generic_layout.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_distribution_bundle.py
 ```
 
 Expected: checkout and installed-capsule modes pass; malicious/ambient sources never create marker files.
@@ -216,7 +220,7 @@ Expected: checkout and installed-capsule modes pass; malicious/ambient sources n
 - [ ] **Step 6: Commit Task 2**
 
 ```powershell
-git add scripts/voice_intent.py src/voice_intent_normalizer/adapters/generic_layout.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_distribution_bundle.py
+git add scripts/voice_intent.py src/voice_intent_normalizer/adapters/generic_contract.py src/voice_intent_normalizer/adapters/generic_layout.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_distribution_bundle.py
 git commit -m "feat: add stable capsule bootstrap"
 ```
 
@@ -347,7 +351,7 @@ Cover:
 - doctor validates capsule, active and previous manifests, direct identities, bootstrap reachability, capability, and shared-state access;
 - missing/malformed/duplicate-key/future/unanchored/tampered status or manifest returns degraded and never re-anchors;
 - uninstall deactivates first, quarantines/removes the whole verified capsule, removes only status-anchored private generations, preserves shared lexicons by default, and returns success only after doctor reports not-installed;
-- capsule identity replacement or an unknown file in the capsule makes uninstall fail without deleting the replacement;
+- capsule identity replacement or an unknown file in the capsule makes uninstall fail without deleting the replacement; on POSIX a provisional no-replace move to a unique tombstone must verify the retained directory identity and restore the moved replacement no-replace before returning failure;
 - one adapter uninstall does not affect any other adapter state;
 - private staging/retired cleanup is bounded, identity-checked, and may be reported as deferred without changing the active result.
 
@@ -377,7 +381,9 @@ TRANSACTION_PHASES = (
 )
 ```
 
-Each recovery transition validates root, capsule, generation IDs, manifest digests, and directory identities from the trusted status anchor before mutation. Upgrade publishes a new generation and changes only status. Rollback changes only status. Uninstall first writes inactive transaction state, then removes the single verified capsule unit, then removes/retains only anchored private generations, and finally removes adapter state. Unknown or replaced objects survive and produce a failed/degraded result.
+Each recovery transition validates root, capsule, generation IDs, manifest digests, and directory identities from the trusted status anchor before mutation. Upgrade publishes a new generation and changes only status. Rollback changes only status. Uninstall first writes inactive transaction state, then removes the single verified capsule unit, then removes/retains only anchored private generations, and finally removes adapter state.
+
+For POSIX capsule removal, atomically rename the capsule no-replace to a unique tombstone, compare the tombstone directory identity with the retained expected identity, and rename the tombstone back no-replace before failure when they differ. Recursively remove only an identity-confirmed tombstone under retained authority. Windows uses the exact retained handle. Unknown or replaced objects survive and produce a failed/degraded result.
 
 - [ ] **Step 4: Remove obsolete per-file transaction machinery**
 

@@ -58,6 +58,7 @@ For a selected host skill root `<skill-root>` and shared state root `<state-root
     │   ├── domain-packs.md
     │   └── lexicon-schema.md
     ├── scripts/voice_intent.py           # stable V1 bootstrap
+    ├── scripts/_voice_intent_contract.py # shared dependency-free validators
     └── capsule.json                      # canonical capsule manifest
 
 <state-root>/
@@ -75,7 +76,7 @@ For a selected host skill root `<skill-root>` and shared state root `<state-root
 
 `generation-id` is derived from the validated package digest plus an installer nonce. Directory names accept only the documented bounded ASCII grammar. Every generation contains a canonical manifest binding its format version, package version, file list, file digests, and generation ID.
 
-The capsule contains every file an agent reads directly: `SKILL.md`, UI metadata, and the three referenced V1 contracts. These files are versioned together as the stable capsule protocol. A runtime generation contains the complete allowlisted repository subset required to run the CLI and build adapters: Python source, built-in lexicon assets, license/package metadata, and protocol files. Some immutable protocol files therefore appear in both the capsule and the self-contained generation, but only the capsule is host-visible. A generation never contains personal, project, preference, negative, or downloaded hotword state.
+The capsule contains every file an agent reads directly: `SKILL.md`, UI metadata, and the three referenced V1 contracts. These files are versioned together as the stable capsule protocol. It also contains one dependency-free validator module copied byte-for-byte from the installer's pure contract module; the bootstrap verifies that file against the protected capsule digest before loading it. This avoids two implementations of the security-critical status/manifest grammar. A runtime generation contains the complete allowlisted repository subset required to run the CLI and build adapters: Python source, built-in lexicon assets, license/package metadata, and protocol files. Some immutable protocol files therefore appear in both the capsule and the self-contained generation, but only the capsule is host-visible. A generation never contains personal, project, preference, negative, or downloaded hotword state.
 
 The capsule bootstrap resolves `VOICE_INTENT_HOME`, validates protected generic-adapter status, opens the selected generation inside the retained state-root authority, verifies its manifest anchor, and launches the runtime through the existing source-only bootstrap boundary. It never trusts `PYTHONPATH`, ambient checkout files, symlinks, junctions, or a generation path supplied by user text.
 
@@ -129,7 +130,7 @@ Uninstall is logically ordered as follows:
 
 1. Validate protected status, capsule manifest, active generation, and selected root.
 2. Mark the adapter inactive in a status-anchored transaction so the bootstrap cannot launch a half-removed runtime.
-3. Remove or quarantine the single immutable capsule directory as one installer-owned unit; do not remove its files one by one.
+3. Remove or quarantine the single immutable capsule directory as one installer-owned unit; do not remove its files one by one. Windows uses the retained exact directory handle. POSIX first moves the capsule no-replace to a unique tombstone, verifies that the tombstone is the retained capsule identity, and restores it no-replace if identity verification fails. Nothing in the tombstone is deleted until identity verification succeeds.
 4. Retire/remove only generation directories whose IDs and manifest digests are anchored in protected status.
 5. Remove adapter status and transaction records only after the discoverable capsule is gone.
 6. Preserve shared lexicons and project data unless explicitly requested.
