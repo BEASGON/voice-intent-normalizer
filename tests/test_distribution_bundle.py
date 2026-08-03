@@ -9,6 +9,8 @@ import venv
 import zipfile
 from pathlib import Path
 
+from voice_intent_normalizer.adapters import generic_layout
+
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_FILES = (
     "SKILL.md",
@@ -25,6 +27,17 @@ BUNDLE_FILES = (
     "references/lexicon-schema.md",
     "scripts/voice_intent.py",
 )
+
+CAPSULE_FILES = {
+    "SKILL.md",
+    "agents/openai.yaml",
+    "references/correction-policy.md",
+    "references/domain-packs.md",
+    "references/lexicon-schema.md",
+    "scripts/_voice_intent_contract.py",
+    "scripts/voice_intent.py",
+    "capsule.json",
+}
 
 
 def _build_distributions(tmp_path: Path) -> tuple[Path, Path]:
@@ -44,6 +57,44 @@ def _build_distributions(tmp_path: Path) -> tuple[Path, Path]:
         text=True,
     )
     return next(output.glob("*.tar.gz")), next(output.glob("*.whl"))
+
+
+def test_capsule_and_generation_builders_use_exact_bounded_allowlists():
+    capsule_builder = getattr(generic_layout, "capsule_source_files", None)
+    generation_builder = getattr(generic_layout, "generation_source_files", None)
+
+    assert callable(capsule_builder), "capsule_source_files() is not implemented"
+    assert callable(generation_builder), "generation_source_files() is not implemented"
+    capsule = capsule_builder(ROOT)
+    generation = generation_builder(ROOT)
+
+    assert set(capsule) == CAPSULE_FILES
+    assert capsule["scripts/_voice_intent_contract.py"] == (
+        ROOT
+        / "src"
+        / "voice_intent_normalizer"
+        / "adapters"
+        / "generic_contract.py"
+    ).read_bytes()
+    assert set(generation) == {
+        *BUNDLE_FILES,
+        *(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "src" / "voice_intent_normalizer").rglob("*.py")
+        ),
+    }
+    forbidden = (
+        "tests/",
+        ".git/",
+        ".superpowers/",
+        "personal.jsonl",
+        "preferences.json",
+        "projects/",
+        "hotwords/",
+    )
+    assert not any(
+        any(part in relative for part in forbidden) for relative in generation
+    )
 
 
 def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):

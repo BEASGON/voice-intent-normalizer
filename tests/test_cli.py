@@ -195,6 +195,28 @@ def test_bootstrap_imports_the_repository_src_without_package_install(tmp_path):
     assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
 
 
+def test_checkout_bootstrap_does_not_require_capsule_state(tmp_path):
+    repository = Path(__file__).resolve().parents[1]
+    script = repository / "scripts" / "voice_intent.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "doctor", "--json"],
+        cwd=tmp_path,
+        env={
+            "PYTHONPATH": "",
+            "PATH": str(Path(sys.executable).parent),
+            "VOICE_INTENT_HOME": str(tmp_path / "absent-state"),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
+
+
 def test_bootstrap_prefers_its_own_src_over_an_earlier_pythonpath_package(tmp_path):
     repository = Path(__file__).resolve().parents[1]
     script = repository / "scripts" / "voice_intent.py"
