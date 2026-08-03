@@ -83,13 +83,15 @@ def test_generic_layout_paths_are_private_and_read_only(tmp_path: Path):
     assert not state.root.exists()
 
 
-def test_generic_status_path_stays_legacy_until_installer_migration(tmp_path: Path):
-    """Catch Task 1 moving the public path before generic's writer migrates."""
+def test_generic_status_path_uses_private_v1_layout_after_installer_migration(
+    tmp_path: Path,
+):
+    """Catch the migrated installer writing anywhere but its fixed V1 path."""
     state = StatePaths(tmp_path / "state")
 
     assert state.generic_adapter_root() == state.root / "adapters" / "generic"
     assert state.adapter_status_file("generic") == (
-        state.root / "adapters" / "generic.json"
+        state.root / "adapters" / "generic" / "status.json"
     )
     assert state.adapter_status_file("codex") == state.root / "adapters" / "codex.json"
     assert not state.root.exists()

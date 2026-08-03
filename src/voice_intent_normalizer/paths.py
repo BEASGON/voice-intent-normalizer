@@ -6,6 +6,7 @@ import hashlib
 import os
 import secrets
 import stat
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -347,10 +348,142 @@ class StateRootLease:
         self.write_bytes_exclusive(destination, data)
         return False
 
+    def publish_directory_no_replace(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        """Atomically publish one exact direct directory without replacement.
+
+        The source and destination must be direct children of retained directory
+        bindings.  Only native exclusive directory-renames are accepted; there
+        is deliberately no check-then-``os.rename`` fallback.
+        """
+        if (
+            not isinstance(expected_identity, tuple)
+            or len(expected_identity) != 2
+            or any(type(value) is not int or value < 0 for value in expected_identity)
+        ):
+            raise ValueError("invalid directory publication identity")
+        source_parts = _relative_path_parts(source)
+        destination_parts = _relative_path_parts(destination)
+        source_binding, source_name = self._entry_binding(source_parts)
+        destination_binding, destination_name = self._entry_binding(
+            destination_parts
+        )
+        if source_binding.path is not None and destination_binding.path is not None:
+            source_path = source_binding.path / source_name
+            destination_path = destination_binding.path / destination_name
+            with _open_windows_directory_for_move(source_path) as descriptor:
+                if _stat_identity(os.fstat(descriptor)) != expected_identity:
+                    raise ValueError("directory publication source identity changed")
+                try:
+                    _move_windows_handle_no_replace(descriptor, destination_path)
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) in {80, 183}:
+                        raise FileExistsError(
+                            getattr(exc, "winerror", 183),
+                            "directory publication destination exists",
+                            destination_path,
+                        ) from exc
+                    raise
+                if _stat_identity(os.fstat(descriptor)) != expected_identity:
+                    raise OSError("published directory identity changed")
+            published = os.stat(destination_path, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(published.st_mode)
+                or stat.S_ISLNK(published.st_mode)
+                or getattr(published, "st_file_attributes", 0)
+                & _WINDOWS_REPARSE_POINT
+                or _stat_identity(published) != expected_identity
+            ):
+                raise OSError("published directory identity does not match")
+            return
+        if (
+            source_binding.descriptor is None
+            or destination_binding.descriptor is None
+        ):
+            raise OSError("retained directories have incompatible identities")
+        if sys.platform.startswith("linux"):
+            native_rename = _rename_linux_directory_no_replace
+        elif sys.platform == "darwin":
+            native_rename = _rename_darwin_directory_no_replace
+        else:
+            raise OSError(
+                "secure directory publication is unsupported on this platform"
+            )
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        source_descriptor = os.open(
+            source_name, flags, dir_fd=source_binding.descriptor
+        )
+        try:
+            _verify_posix_directory(source_descriptor)
+            if _stat_identity(os.fstat(source_descriptor)) != expected_identity:
+                raise ValueError("directory publication source identity changed")
+            native_rename(
+                source_binding.descriptor,
+                source_name,
+                destination_binding.descriptor,
+                destination_name,
+            )
+            try:
+                published_descriptor = os.open(
+                    destination_name,
+                    flags,
+                    dir_fd=destination_binding.descriptor,
+                )
+                try:
+                    _verify_posix_directory(published_descriptor)
+                    published_identity = _stat_identity(
+                        os.fstat(published_descriptor)
+                    )
+                finally:
+                    os.close(published_descriptor)
+            except BaseException:
+                _restore_posix_directory_publication(
+                    native_rename,
+                    source_binding.descriptor,
+                    source_name,
+                    destination_binding.descriptor,
+                    destination_name,
+                    expected_identity,
+                )
+                raise
+            if published_identity != expected_identity:
+                _restore_posix_directory_publication(
+                    native_rename,
+                    source_binding.descriptor,
+                    source_name,
+                    destination_binding.descriptor,
+                    destination_name,
+                    expected_identity,
+                )
+                raise OSError("published directory identity does not match")
+        finally:
+            os.close(source_descriptor)
+
+    def fsync_directory(self, relative: str | Path = ".") -> None:
+        """Flush one exactly retained directory after entry changes."""
+        parts = _relative_path_parts(relative)
+        if not self.available(relative):
+            raise FileNotFoundError(
+                f"state path was unavailable when lease was acquired: {relative}"
+            )
+        binding = self._directories.get(parts)
+        if binding is None:
+            raise ValueError("state directory was not retained")
+        if binding.path is not None:
+            _flush_windows_directory(binding.path)
+            return
+        if binding.descriptor is None:
+            raise OSError("retained state directory has no usable identity")
+        os.fsync(binding.descriptor)
+
     def rmdir(self, relative: str | Path, *, missing_ok: bool = False) -> None:
         """Remove one empty retained directory entry without following it."""
         parts = _relative_path_parts(relative)
-        binding, name = self._file_binding(parts)
+        binding, name = self._entry_binding(parts)
         try:
             if binding.path is not None:
                 os.rmdir(binding.path / name)
@@ -401,6 +534,17 @@ class StateRootLease:
                 "state file parent must be an explicitly retained directory"
             )
         return binding, remainder[0]
+
+    def _entry_binding(
+        self, parts: tuple[str, ...]
+    ) -> tuple[_DirectoryBinding, str]:
+        """Return the explicitly retained parent of one direct entry."""
+        if not parts:
+            raise ValueError("state entry path must not be empty")
+        binding = self._directories.get(parts[:-1])
+        if binding is None:
+            raise ValueError("state entry parent must be explicitly retained")
+        return binding, parts[-1]
 
     @staticmethod
     def _open_regular_file(
@@ -475,6 +619,107 @@ def _read_descriptor_bytes(descriptor: int, limit: int) -> bytes:
         if total > limit:
             raise ValueError("identity-bound move source exceeds size limit")
         chunks.append(chunk)
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _rename_linux_directory_no_replace(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    """Call Linux renameat2(RENAME_NOREPLACE) with a verified signature."""
+    import ctypes
+    import errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError("Linux renameat2 is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if renameat2(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination_name)
+        raise OSError(error, os.strerror(error), destination_name)
+
+
+def _rename_darwin_directory_no_replace(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    """Call Darwin's dir-fd renamex family with RENAME_EXCL."""
+    import ctypes
+    import errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx_np = getattr(libc, "renameatx_np", None)
+    if renameatx_np is None:
+        raise OSError("Darwin renameatx_np is unavailable")
+    renameatx_np.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameatx_np.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if renameatx_np(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        0x00000004,  # RENAME_EXCL
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination_name)
+        raise OSError(error, os.strerror(error), destination_name)
+
+
+def _restore_posix_directory_publication(
+    native_rename,
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Restore a provisional wrong-identity publication without replacement."""
+    native_rename(
+        destination_parent,
+        destination_name,
+        source_parent,
+        source_name,
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(source_name, flags, dir_fd=source_parent)
+    try:
+        _verify_posix_directory(descriptor)
+        if _stat_identity(os.fstat(descriptor)) != expected_identity:
+            raise OSError("restored directory identity does not match")
+    finally:
+        os.close(descriptor)
 
 
 def _identity_bound_content_hash(data: bytes, canonical_json: bool) -> str:
@@ -696,6 +941,128 @@ def _open_windows_regular_file_for_move(path: Path) -> Iterator[int]:
             os.close(descriptor)
         elif handle is not None:
             kernel32.CloseHandle(handle)
+
+
+@contextmanager
+def _open_windows_directory_for_move(path: Path) -> Iterator[int]:
+    """Open one direct directory identity with exact-handle rename authority."""
+    if os.name != "nt":
+        raise OSError("Windows handle-bound moves are unavailable")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x10080,  # DELETE | FILE_READ_ATTRIBUTES
+        0x5,  # FILE_SHARE_READ | FILE_SHARE_DELETE; deny writers
+        None,
+        3,  # OPEN_EXISTING
+        0x02200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            raise FileNotFoundError(error, os.strerror(error), path)
+        raise ctypes.WinError(error)
+    descriptor = -1
+    try:
+        attributes = _FileAttributeTagInfo()
+        ctypes.set_last_error(0)
+        if not kernel32.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not attributes.file_attributes & 0x10 or (
+            attributes.file_attributes & _WINDOWS_REPARSE_POINT
+        ):
+            raise ValueError("publication source must be a direct directory")
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        handle = None
+        yield descriptor
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        elif handle is not None:
+            kernel32.CloseHandle(handle)
+
+
+def _flush_windows_directory(path: Path) -> None:
+    """Flush directory entry changes through a native directory handle."""
+    if os.name != "nt":
+        raise OSError("Windows directory flushing is unavailable")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.FlushFileBuffers.argtypes = (wintypes.HANDLE,)
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x40000000,  # GENERIC_WRITE
+        0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    active_exception = False
+    try:
+        ctypes.set_last_error(0)
+        if not kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except BaseException:
+        active_exception = True
+        raise
+    finally:
+        ctypes.set_last_error(0)
+        if not kernel32.CloseHandle(handle) and not active_exception:
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _move_windows_handle_no_replace(descriptor: int, destination: Path) -> None:
@@ -1759,6 +2126,8 @@ class StatePaths:
 
     def adapter_status_file(self, adapter: str) -> Path:
         """Return one adapter's status document location without creating it."""
+        if adapter == "generic":
+            return self.generic_adapter_root() / "status.json"
         return self.root / "adapters" / f"{adapter}.json"
 
     def generic_adapter_root(self) -> Path:

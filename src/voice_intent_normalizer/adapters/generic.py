@@ -7,11 +7,12 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -25,10 +26,30 @@ from ..paths import (
 )
 from ..updater import _retained_lease_update_lock
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
+from .generic_contract import (
+    LAYOUT_NAME,
+    STATUS_FORMAT,
+    StatusV5,
+    canonical_json_bytes,
+    manifest_digest,
+    validate_manifest,
+    validate_status_v5,
+)
+from .generic_layout import (
+    VersionedArtifact,
+    VersionedArtifacts,
+    generic_layout_paths,
+    prepare_versioned_artifacts,
+)
 
 _MANIFEST = ".voice-intent-normalizer-install.json"
 _NAME = "voice-intent-normalizer"
-_STATUS_RELATIVE = Path("adapters") / "generic.json"
+_GENERIC_RELATIVE = Path("adapters") / "generic"
+_STATUS_RELATIVE = _GENERIC_RELATIVE / "status.json"
+_TRANSACTION_RELATIVE = _GENERIC_RELATIVE / "transaction.json"
+_GENERATIONS_RELATIVE = _GENERIC_RELATIVE / "generations"
+_STAGING_RELATIVE = _GENERIC_RELATIVE / "staging"
+_RETIRED_RELATIVE = _GENERIC_RELATIVE / "retired"
 _RECOVERY_RELATIVE = Path("adapters") / "generic-recovery.json"
 _PACKAGE_FILES = ("SKILL.md", "pyproject.toml", "LICENSE")
 _PACKAGE_DIRECTORIES = ("agents", "assets", "references")
@@ -75,6 +96,10 @@ class GenericAdapter:
     def install(self, options: InstallOptions) -> AdapterResult:
         self._recovery_changes = ()
         self._change_events = []
+        if options.strict:
+            return self._failed(
+                "strict installation is unavailable for the generic adapter"
+            )
         try:
             with self._state_operation(create=True):
                 result = self._install_locked(options)
@@ -83,55 +108,647 @@ class GenericAdapter:
         return self._with_recovery_changes(result)
 
     def _install_locked(self, options: InstallOptions) -> AdapterResult:
-        if options.strict:
-            return self._failed(
-                "strict installation is unavailable for the generic adapter"
-            )
         if options.output_dir is None:
             return self._failed("a skill root is required")
         root = self._safe_skill_root(options.output_dir)
         self._configured_skill_root = root
-        self._recover_pending(root)
-        target = root / _NAME
-        runtime, desired = self._prepare_runtime(root)
-        if target.exists() or target.is_symlink():
-            reusable = self._reuse_current_package(
-                root, target, desired, options
+        status = self._read_versioned_status(root)
+        transaction = self._read_first_install_transaction(root)
+        if status is not None:
+            return self._reuse_versioned_install(
+                root, status, transaction, options
             )
-            if reusable is not None:
-                return reusable
-        staging = root / f".{_NAME}.staging-{secrets.token_hex(16)}"
-        try:
-            manifest, root_identity, staging_identity = self._stage_runtime(
-                root,
-                staging,
-                runtime=runtime,
-                manifest=desired,
-            )
-            if not target.exists() and not target.is_symlink():
-                return self._commit_new_install(
-                    root,
-                    target,
-                    staging,
-                    manifest,
-                    options,
-                    root_identity,
-                    staging_identity,
-                )
-            return self._repair_or_reuse(
-                root,
-                target,
-                staging,
-                manifest,
-                options,
-                staging_identity,
-            )
-        except Exception:
+
+        recovering = transaction is not None
+        if not recovering and self._direct_entry_exists(root / _NAME):
             return self._failed(
-                "generic installation was not completed; "
-                "a staging directory may remain for safe manual cleanup",
+                "existing skill capsule is not anchored by a first-install transaction"
+            )
+        if recovering:
+            generation_id = str(transaction["status"]["active"]["generation_id"])
+            generation_nonce = generation_id[-32:]
+            transaction_id = str(transaction["transaction_id"])
+        else:
+            generation_nonce = secrets.token_hex(16)
+            transaction_id = f"t-{secrets.token_hex(16)}"
+        artifacts = self._prepare_versioned_artifacts(generation_nonce)
+        status_payload = self._versioned_status_payload(artifacts, options)
+        if recovering:
+            self._validate_first_install_transaction(
+                transaction, root, status_payload
+            )
+        else:
+            transaction = self._begin_first_install_transaction(
+                root, transaction_id, status_payload
+            )
+
+        published = False
+
+        def mark_generation_published() -> None:
+            nonlocal published
+            published = True
+
+        try:
+            generation = self._stage_and_publish_generation(
+                artifacts.generation,
+                recovering=recovering,
+                on_published=mark_generation_published,
+            )
+            published = True
+            capsule = self._ensure_capsule(
+                root,
+                artifacts.capsule,
+                transaction_id,
+                recovering=recovering,
+            )
+            self._validate_generation_directory(
+                self.state_paths.root,
+                generation.relative_to(self.state_paths.root),
+                artifacts.generation,
+            )
+            self._validate_capsule_directory(
+                root, capsule.relative_to(root), artifacts.capsule
+            )
+            self._smoke_generation(capsule, generation)
+            self._activate_generation(status_payload)
+            self._remove_first_install_transaction()
+            return self._verified_result("installed", root, artifacts, options)
+        except Exception:
+            if not published:
+                self._remove_first_install_transaction(missing_ok=True)
+            return self._failed(
+                "generic installation was not completed",
                 tuple(self._change_events),
             )
+
+    def _prepare_versioned_artifacts(
+        self, generation_nonce: str
+    ) -> VersionedArtifacts:
+        return prepare_versioned_artifacts(self.repository, generation_nonce)
+
+    def _versioned_status_payload(
+        self, artifacts: VersionedArtifacts, options: InstallOptions
+    ) -> dict[str, object]:
+        return {
+            "format": STATUS_FORMAT,
+            "layout": LAYOUT_NAME,
+            "capability": self._capability(options).value,
+            "capsule": {
+                "protocol": 1,
+                "manifest_digest": artifacts.capsule.manifest_digest,
+                "package_hash": artifacts.capsule.package_hash,
+            },
+            "active": {
+                "generation_id": artifacts.generation.identifier,
+                "manifest_digest": artifacts.generation.manifest_digest,
+                "package_hash": artifacts.generation.package_hash,
+                "package_version": artifacts.generation.package_version,
+            },
+            "previous": None,
+            "transaction": None,
+        }
+
+    def _begin_first_install_transaction(
+        self,
+        root: Path,
+        transaction_id: str,
+        status_payload: dict[str, object],
+    ) -> dict[str, object]:
+        payload = {
+            "format": 1,
+            "transaction_id": transaction_id,
+            "skill_root_key": state_root_lock_key(root),
+            "status": status_payload,
+        }
+        self._state_lease().write_bytes_atomic(
+            _TRANSACTION_RELATIVE, canonical_json_bytes(payload)
+        )
+        self._state_lease().fsync_directory(_GENERIC_RELATIVE)
+        self._record_changes((generic_layout_paths(self.state_paths).transaction,))
+        return payload
+
+    def _read_first_install_transaction(
+        self, root: Path
+    ) -> dict[str, object] | None:
+        lease = self._state_lease()
+        if not lease.exists(_TRANSACTION_RELATIVE):
+            return None
+        raw = lease.read_bytes(
+            _TRANSACTION_RELATIVE, _MANIFEST_LIMIT, "adapter transaction"
+        )
+        try:
+            payload = json.loads(
+                raw,
+                object_pairs_hook=self._unique_json_object,
+                parse_constant=self._reject_json_constant,
+            )
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("invalid first-install transaction") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("invalid first-install transaction")
+        status_payload = payload.get("status")
+        self._validate_first_install_transaction(payload, root, status_payload)
+        return payload
+
+    def _validate_first_install_transaction(
+        self,
+        payload: object,
+        root: Path,
+        expected_status: object,
+    ) -> None:
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != {"format", "transaction_id", "skill_root_key", "status"}
+            or payload.get("format") != 1
+            or type(payload.get("format")) is not int
+            or not isinstance(payload.get("transaction_id"), str)
+            or re.fullmatch(r"t-[0-9a-f]{32}", str(payload["transaction_id"]))
+            is None
+            or payload.get("skill_root_key") != state_root_lock_key(root)
+            or payload.get("status") != expected_status
+        ):
+            raise ValueError("invalid first-install transaction")
+        validate_status_v5(
+            expected_status,
+            skill_root=root,
+            generations_root=generic_layout_paths(self.state_paths).generations,
+        )
+
+    @staticmethod
+    def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _reject_json_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    def _read_versioned_status(self, root: Path) -> StatusV5 | None:
+        lease = self._state_lease()
+        if not lease.exists(_STATUS_RELATIVE):
+            return None
+        raw = lease.read_bytes(_STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status")
+        return validate_status_v5(
+            raw,
+            skill_root=root,
+            generations_root=generic_layout_paths(self.state_paths).generations,
+        )
+
+    def _reuse_versioned_install(
+        self,
+        root: Path,
+        status: StatusV5,
+        transaction: dict[str, object] | None,
+        options: InstallOptions,
+    ) -> AdapterResult:
+        artifacts = self._prepare_versioned_artifacts(
+            status.active.generation_id[-32:]
+        )
+        if (
+            status.capability != self._capability(options).value
+            or status.capsule.manifest_digest
+            != artifacts.capsule.manifest_digest
+            or status.capsule.package_hash != artifacts.capsule.package_hash
+            or status.active.generation_id != artifacts.generation.identifier
+            or status.active.manifest_digest
+            != artifacts.generation.manifest_digest
+            or status.active.package_hash != artifacts.generation.package_hash
+            or status.active.package_version != artifacts.generation.package_version
+            or status.previous is not None
+            or status.transaction_id is not None
+        ):
+            return self._failed(
+                "the installed generic package requires lifecycle recovery or upgrade"
+            )
+        self._validate_capsule_directory(
+            root, Path(_NAME), artifacts.capsule
+        )
+        generation_relative = _GENERATIONS_RELATIVE / status.active.generation_id
+        self._validate_generation_directory(
+            self.state_paths.root,
+            generation_relative,
+            artifacts.generation,
+        )
+        if transaction is not None:
+            expected = self._versioned_status_payload(artifacts, options)
+            self._validate_first_install_transaction(transaction, root, expected)
+            self._remove_first_install_transaction()
+            return self._verified_result("installed", root, artifacts, options)
+        return AdapterResult(
+            self.platform,
+            "already-installed",
+            self._capability(options),
+            ("managed immutable generation is already active",),
+        )
+
+    def _stage_and_publish_generation(
+        self,
+        artifact: VersionedArtifact,
+        *,
+        recovering: bool,
+        on_published: Callable[[], None] | None = None,
+    ) -> Path:
+        final_relative = _GENERATIONS_RELATIVE / artifact.identifier
+        final = self.state_paths.root / final_relative
+        if self._state_lease().exists(final_relative):
+            if not recovering:
+                raise FileExistsError("generation destination already exists")
+            self._validate_generation_directory(
+                self.state_paths.root, final_relative, artifact
+            )
+            return final
+        stage_relative = _STAGING_RELATIVE / f".{artifact.identifier}.staging"
+        self._stage_and_publish_artifact(
+            self.state_paths.root,
+            stage_relative,
+            final_relative,
+            artifact,
+            on_published=on_published,
+        )
+        self._validate_generation_directory(
+            self.state_paths.root, final_relative, artifact
+        )
+        self._record_changes(self._artifact_changed_paths(final, artifact))
+        return final
+
+    def _ensure_capsule(
+        self,
+        root: Path,
+        artifact: VersionedArtifact,
+        transaction_id: str,
+        *,
+        recovering: bool,
+    ) -> Path:
+        target = root / _NAME
+        if self._direct_entry_exists(target):
+            if not recovering:
+                raise FileExistsError("skill capsule destination already exists")
+            self._validate_capsule_directory(root, Path(_NAME), artifact)
+            return target
+        stage_relative = Path(f".{_NAME}.staging-{transaction_id[2:]}")
+        self._stage_and_publish_artifact(
+            root, stage_relative, Path(_NAME), artifact
+        )
+        self._validate_capsule_directory(root, Path(_NAME), artifact)
+        self._record_changes(self._artifact_changed_paths(target, artifact))
+        return target
+
+    @staticmethod
+    def _direct_entry_exists(path: Path) -> bool:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _stage_and_publish_artifact(
+        self,
+        root: Path,
+        stage_relative: Path,
+        final_relative: Path,
+        artifact: VersionedArtifact,
+        *,
+        on_published: Callable[[], None] | None = None,
+    ) -> None:
+        directories = set(self._artifact_directories(stage_relative, artifact))
+        if final_relative.parent != Path("."):
+            directories.add(final_relative.parent)
+        retained = tuple(
+            sorted(directories, key=lambda path: (len(path.parts), str(path)))
+        )
+        expected_identity: tuple[int, int] | None = None
+        try:
+            with guard_state_root(
+                root,
+                retained_dirs=retained,
+                create_retained=True,
+                exclusive_create_retained=(stage_relative,),
+            ) as lease:
+                expected_identity = self._directory_identity(
+                    lease.stat(stage_relative)
+                )
+                for relative, data in artifact.files.items():
+                    if relative == artifact.manifest_name:
+                        continue
+                    self._write_staged_file(
+                        lease, stage_relative / Path(relative), data
+                    )
+                self._write_staged_file(
+                    lease,
+                    stage_relative / artifact.manifest_name,
+                    artifact.files[artifact.manifest_name],
+                )
+                for directory in sorted(
+                    self._artifact_directories(stage_relative, artifact),
+                    key=lambda path: (len(path.parts), str(path)),
+                    reverse=True,
+                ):
+                    lease.fsync_directory(directory)
+                if artifact.kind == "generation":
+                    self._validate_generation_directory(
+                        root, stage_relative, artifact
+                    )
+                else:
+                    self._validate_capsule_directory(
+                        root, stage_relative, artifact
+                    )
+            publication_parents = {
+                parent
+                for parent in (stage_relative.parent, final_relative.parent)
+                if parent != Path(".")
+            }
+            with guard_state_root(
+                root,
+                retained_dirs=tuple(
+                    sorted(
+                        publication_parents,
+                        key=lambda path: (len(path.parts), str(path)),
+                    )
+                ),
+            ) as lease:
+                lease.publish_directory_no_replace(
+                    stage_relative, final_relative, expected_identity
+                )
+                if on_published is not None:
+                    on_published()
+                lease.fsync_directory(stage_relative.parent)
+                if final_relative.parent != stage_relative.parent:
+                    lease.fsync_directory(final_relative.parent)
+        except BaseException:
+            if expected_identity is not None:
+                self._cleanup_staged_artifact(
+                    root, stage_relative, artifact, expected_identity
+                )
+            raise
+
+    def _write_staged_file(
+        self, lease: StateRootLease, relative: Path, data: bytes
+    ) -> None:
+        temporary = relative.parent / f".{relative.name}.tmp"
+        lease.write_bytes_exclusive(temporary, data)
+        lease.replace(temporary, relative)
+        lease.fsync_directory(relative.parent)
+
+    def _cleanup_staged_artifact(
+        self,
+        root: Path,
+        stage_relative: Path,
+        artifact: VersionedArtifact,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        directories = self._artifact_directories(stage_relative, artifact)
+        try:
+            with guard_state_root(root, retained_dirs=directories) as lease:
+                if (
+                    self._directory_identity(lease.stat(stage_relative))
+                    != expected_identity
+                ):
+                    return
+                for relative in artifact.files:
+                    path = stage_relative / Path(relative)
+                    temporary = path.parent / f".{path.name}.tmp"
+                    lease.unlink(temporary, missing_ok=True)
+                    lease.unlink(path, missing_ok=True)
+        except (FileNotFoundError, OSError, ValueError):
+            return
+        for directory in sorted(
+            directories,
+            key=lambda path: (len(path.parts), str(path)),
+            reverse=True,
+        ):
+            parent = directory.parent
+            retained = () if parent == Path(".") else (parent,)
+            try:
+                with guard_state_root(root, retained_dirs=retained) as lease:
+                    info = lease.stat(directory)
+                    self._require_direct_directory(info)
+                    if directory == stage_relative and (
+                        self._directory_identity(info) != expected_identity
+                    ):
+                        return
+                    lease.rmdir(directory)
+                    lease.fsync_directory(parent)
+            except (FileNotFoundError, OSError, ValueError):
+                return
+
+    def _validate_generation_directory(
+        self, root: Path, relative: Path, artifact: VersionedArtifact
+    ) -> None:
+        if artifact.kind != "generation":
+            raise ValueError("invalid generation artifact")
+        self._validate_artifact_directory(root, relative, artifact)
+
+    def _validate_capsule_directory(
+        self, root: Path, relative: Path, artifact: VersionedArtifact
+    ) -> None:
+        if artifact.kind != "capsule":
+            raise ValueError("invalid capsule artifact")
+        self._validate_artifact_directory(root, relative, artifact)
+
+    def _validate_artifact_directory(
+        self, root: Path, relative: Path, artifact: VersionedArtifact
+    ) -> None:
+        directories = self._artifact_directories(relative, artifact)
+        children: dict[Path, set[str]] = {
+            directory: set() for directory in directories
+        }
+        for directory in directories:
+            if directory != relative:
+                children[directory.parent].add(directory.name)
+        for name in artifact.files:
+            path = relative / Path(name)
+            children[path.parent].add(path.name)
+        with guard_state_root(root, retained_dirs=directories) as lease:
+            for directory in directories:
+                if set(lease.listdir(directory)) != children[directory]:
+                    raise ValueError("published artifact tree is not exact")
+            for name, expected in artifact.files.items():
+                path = relative / Path(name)
+                info = lease.stat(path)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0)
+                    & _WINDOWS_REPARSE_POINT
+                ):
+                    raise ValueError("published artifact contains an unsafe file")
+                actual = lease.read_bytes(
+                    path, _MANAGED_FILE_LIMIT, "published artifact file"
+                )
+                if actual != expected:
+                    raise ValueError("published artifact file hash changed")
+        manifest_bytes = artifact.files[artifact.manifest_name]
+        manifest = validate_manifest(manifest_bytes)
+        if (
+            canonical_json_bytes(manifest) != manifest_bytes
+            or manifest["kind"] != artifact.kind
+            or manifest["identifier"] != artifact.identifier
+            or manifest["package_hash"] != artifact.package_hash
+            or manifest["package_version"] != artifact.package_version
+        ):
+            raise ValueError("published artifact manifest is invalid")
+
+    @staticmethod
+    def _artifact_directories(
+        root: Path, artifact: VersionedArtifact
+    ) -> tuple[Path, ...]:
+        directories = {root}
+        for name in artifact.files:
+            parent = root / Path(name).parent
+            while parent != root:
+                directories.add(parent)
+                parent = parent.parent
+        return tuple(
+            sorted(directories, key=lambda path: (len(path.parts), str(path)))
+        )
+
+    @staticmethod
+    def _artifact_changed_paths(
+        root: Path, artifact: VersionedArtifact
+    ) -> tuple[Path, ...]:
+        directories = {root}
+        files: list[Path] = []
+        for name in artifact.files:
+            path = root / Path(name)
+            files.append(path)
+            parent = path.parent
+            while parent != root:
+                directories.add(parent)
+                parent = parent.parent
+        return tuple(
+            sorted(directories, key=lambda path: (len(path.parts), str(path)))
+        ) + tuple(sorted(files, key=str))
+
+    def _smoke_generation(self, capsule: Path, generation: Path) -> None:
+        if not (capsule / "capsule.json").is_file() or not (
+            generation / "generation.json"
+        ).is_file():
+            raise ValueError("published runtime is incomplete")
+        skill_metadata = (capsule / "SKILL.md").read_text(encoding="utf-8")
+        if "name: voice-intent-normalizer" not in skill_metadata:
+            raise ValueError("published capsule metadata is invalid")
+        with tempfile.TemporaryDirectory(prefix="voice-intent-smoke-") as sandbox:
+            sandbox_root = Path(sandbox)
+            state = sandbox_root / "state"
+            skill_root = sandbox_root / "skills"
+            smoke_capsule = skill_root / _NAME
+            generation_manifest = validate_manifest(
+                (generation / "generation.json").read_bytes()
+            )
+            capsule_manifest = validate_manifest(
+                (capsule / "capsule.json").read_bytes()
+            )
+            smoke_generation = (
+                state
+                / _GENERATIONS_RELATIVE
+                / str(generation_manifest["identifier"])
+            )
+            shutil.copytree(capsule, smoke_capsule)
+            shutil.copytree(generation, smoke_generation)
+            smoke_status = {
+                "format": STATUS_FORMAT,
+                "layout": LAYOUT_NAME,
+                "capability": CapabilityLevel.MANUAL.value,
+                "capsule": {
+                    "protocol": 1,
+                    "manifest_digest": manifest_digest(capsule_manifest),
+                    "package_hash": capsule_manifest["package_hash"],
+                },
+                "active": {
+                    "generation_id": generation_manifest["identifier"],
+                    "manifest_digest": manifest_digest(generation_manifest),
+                    "package_hash": generation_manifest["package_hash"],
+                    "package_version": generation_manifest["package_version"],
+                },
+                "previous": None,
+                "transaction": None,
+            }
+            status = state / _STATUS_RELATIVE
+            status.parent.mkdir(parents=True, exist_ok=True)
+            status.write_bytes(canonical_json_bytes(smoke_status))
+            working = sandbox_root / "cwd"
+            working.mkdir()
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": "",
+                "VOICE_INTENT_HOME": str(state),
+                "PYTHONUTF8": "1",
+            }
+            if os.name == "nt":
+                environment["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(smoke_capsule / "scripts" / "voice_intent.py"),
+                    "doctor",
+                    "--json",
+                ],
+                cwd=working,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+        if result.returncode != 0:
+            raise ValueError("published generation smoke test failed")
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "ok",
+            "degraded",
+        }:
+            raise ValueError("published generation smoke test failed")
+
+    def _activate_generation(self, status_payload: dict[str, object]) -> Path:
+        self._write_status_payload(status_payload)
+        return generic_layout_paths(self.state_paths).status
+
+    def _remove_first_install_transaction(self, *, missing_ok: bool = False) -> None:
+        lease = self._state_lease()
+        if not lease.exists(_TRANSACTION_RELATIVE):
+            if missing_ok:
+                return
+            raise FileNotFoundError("first-install transaction is missing")
+        lease.unlink(_TRANSACTION_RELATIVE)
+        lease.fsync_directory(_GENERIC_RELATIVE)
+        self._record_changes((generic_layout_paths(self.state_paths).transaction,))
+
+    def _verified_result(
+        self,
+        operation: str,
+        root: Path,
+        artifacts: VersionedArtifacts,
+        options: InstallOptions,
+    ) -> AdapterResult:
+        status = self._read_versioned_status(root)
+        if (
+            status is None
+            or status.active.generation_id != artifacts.generation.identifier
+        ):
+            raise ValueError("activated generation status is unavailable")
+        self._validate_capsule_directory(root, Path(_NAME), artifacts.capsule)
+        self._validate_generation_directory(
+            self.state_paths.root,
+            _GENERATIONS_RELATIVE / artifacts.generation.identifier,
+            artifacts.generation,
+        )
+        return AdapterResult(
+            self.platform,
+            operation,
+            self._capability(options),
+            (
+                "skill discovery must be enabled by the selected host",
+                self._manual_message(options),
+            ),
+        )
 
     def doctor(self) -> AdapterResult:
         self._recovery_changes = ()
@@ -334,20 +951,33 @@ class GenericAdapter:
     def _state_operation(
         self, *, create: bool, lock_missing: bool = True
     ) -> Iterator[StateRootLease | None]:
-        root_existed = self._direct_directory_exists(self.state_paths.root)
-        adapters = self.state_paths.root / "adapters"
-        adapters_existed = self._direct_directory_exists(adapters)
+        tracked = (
+            self.state_paths.root,
+            self.state_paths.root / "adapters",
+            self.state_paths.root / _GENERIC_RELATIVE,
+            self.state_paths.root / _GENERATIONS_RELATIVE,
+            self.state_paths.root / _STAGING_RELATIVE,
+            self.state_paths.root / _RETIRED_RELATIVE,
+        )
+        existed = {
+            path: self._direct_directory_exists(path) for path in tracked
+        }
+        retained = (
+            Path("adapters"),
+            _GENERIC_RELATIVE,
+            _GENERATIONS_RELATIVE,
+            _STAGING_RELATIVE,
+            _RETIRED_RELATIVE,
+        )
         try:
             with guard_state_root(
                 self.state_paths.root,
                 create=create,
-                retained_dirs=("adapters",),
+                retained_dirs=retained,
                 create_retained=create,
             ) as lease:
                 if create:
-                    self._record_created_state_directories(
-                        root_existed, adapters_existed
-                    )
+                    self._record_created_state_directories(existed)
                 if not lease.root_exists and not lock_missing:
                     previous = self._active_state_lease
                     self._active_state_lease = lease
@@ -365,19 +995,19 @@ class GenericAdapter:
                         self._active_state_lease = previous
         except BaseException:
             if create:
-                self._record_created_state_directories(
-                    root_existed, adapters_existed
-                )
+                self._record_created_state_directories(existed)
             raise
 
     def _record_created_state_directories(
-        self, root_existed: bool, adapters_existed: bool
+        self, existed: dict[Path, bool]
     ) -> None:
-        adapters = self.state_paths.root / "adapters"
-        if not root_existed and self._direct_directory_exists(self.state_paths.root):
-            self._record_changes((self.state_paths.root,))
-        if not adapters_existed and self._direct_directory_exists(adapters):
-            self._record_changes((adapters,))
+        self._record_changes(
+            tuple(
+                path
+                for path, was_present in existed.items()
+                if not was_present and self._direct_directory_exists(path)
+            )
+        )
 
     @staticmethod
     def _direct_directory_exists(path: Path) -> bool:
@@ -1308,15 +1938,27 @@ class GenericAdapter:
         }
 
     def _write_status_payload(self, payload: dict[str, object]) -> None:
-        self._state_lease().write_bytes_atomic(
-            _STATUS_RELATIVE,
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8"),
-        )
+        data = canonical_json_bytes(payload)
+        lease = self._state_lease()
+        try:
+            lease.write_bytes_atomic(_STATUS_RELATIVE, data)
+            lease.fsync_directory(_GENERIC_RELATIVE)
+        except OSError:
+            # Atomic replacement is the activation commit point.  A directory
+            # flush can report failure after that point (and POSIX's atomic
+            # writer performs its own parent flush).  Never report a failed,
+            # inert install when the exact active status is already visible.
+            try:
+                committed = (
+                    lease.read_bytes(
+                        _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
+                    )
+                    == data
+                )
+            except (OSError, ValueError):
+                committed = False
+            if not committed:
+                raise
         self._record_changes((self.state_paths.adapter_status_file(self.platform),))
 
     def _read_status(self) -> dict[str, object] | None:

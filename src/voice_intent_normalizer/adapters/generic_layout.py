@@ -5,12 +5,16 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from voice_intent_normalizer.adapters.generic_contract import (
     build_manifest,
     canonical_json_bytes,
+    manifest_digest,
+    validate_manifest,
 )
 from voice_intent_normalizer.paths import StatePaths
 
@@ -80,6 +84,27 @@ class GenericLayoutPaths:
     retired: Path
 
 
+@dataclass(frozen=True, slots=True)
+class VersionedArtifact:
+    """One complete immutable directory prepared for private publication."""
+
+    kind: str
+    identifier: str
+    package_version: str
+    package_hash: str
+    manifest_digest: str
+    manifest_name: str
+    files: Mapping[str, bytes]
+
+
+@dataclass(frozen=True, slots=True)
+class VersionedArtifacts:
+    """The stable capsule and one identifier-independent runtime generation."""
+
+    capsule: VersionedArtifact
+    generation: VersionedArtifact
+
+
 def generic_layout_paths(state_paths: StatePaths) -> GenericLayoutPaths:
     """Return the immutable V1 generic-adapter layout under shared state."""
     root = state_paths.generic_adapter_root()
@@ -118,6 +143,63 @@ def generation_source_files(repository: str | Path) -> dict[str, bytes]:
     }
     _enforce_source_limits(files)
     return dict(sorted(files.items()))
+
+
+def prepare_versioned_artifacts(
+    repository: str | Path, generation_nonce: str
+) -> VersionedArtifacts:
+    """Build the complete immutable byte sets for one first activation."""
+    if re.fullmatch(r"[0-9a-f]{32}", generation_nonce) is None:
+        raise ValueError("invalid generation nonce")
+
+    capsule_files = capsule_source_files(repository)
+    capsule_manifest_bytes = capsule_files["capsule.json"]
+    capsule_manifest = validate_manifest(capsule_manifest_bytes)
+    if (
+        capsule_manifest["kind"] != "capsule"
+        or capsule_manifest["identifier"] != "voice-intent-normalizer"
+        or canonical_json_bytes(capsule_manifest) != capsule_manifest_bytes
+    ):
+        raise ValueError("invalid prepared capsule")
+    capsule = VersionedArtifact(
+        kind="capsule",
+        identifier="voice-intent-normalizer",
+        package_version=str(capsule_manifest["package_version"]),
+        package_hash=str(capsule_manifest["package_hash"]),
+        manifest_digest=manifest_digest(capsule_manifest),
+        manifest_name="capsule.json",
+        files=MappingProxyType(dict(capsule_files)),
+    )
+
+    generation_runtime = generation_source_files(repository)
+    package_version = _package_version(generation_runtime["pyproject.toml"])
+    provisional = build_manifest(
+        "generation",
+        f"g-{'0' * 64}-{generation_nonce}",
+        package_version,
+        generation_runtime,
+    )
+    generation_id = f"g-{provisional['package_hash']}-{generation_nonce}"
+    generation_manifest = build_manifest(
+        "generation",
+        generation_id,
+        package_version,
+        generation_runtime,
+    )
+    generation_files = {
+        **generation_runtime,
+        "generation.json": canonical_json_bytes(generation_manifest),
+    }
+    generation = VersionedArtifact(
+        kind="generation",
+        identifier=generation_id,
+        package_version=package_version,
+        package_hash=str(generation_manifest["package_hash"]),
+        manifest_digest=manifest_digest(generation_manifest),
+        manifest_name="generation.json",
+        files=MappingProxyType(dict(sorted(generation_files.items()))),
+    )
+    return VersionedArtifacts(capsule=capsule, generation=generation)
 
 
 def _direct_repository(repository: str | Path) -> Path:
