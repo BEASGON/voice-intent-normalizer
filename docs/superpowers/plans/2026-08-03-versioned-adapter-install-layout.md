@@ -106,7 +106,7 @@ class CapsuleRef:
 
 The contract module may import only Python 3.10 standard-library modules and must use no package-relative imports, filesystem mutation, or host state. This exact source file will be copied into the installed capsule in Task 2. Implement bounded validation without quadratic duplicate checks. Return immutable tuples/mappings or fresh ordinary objects; never retain caller-owned mutable dictionaries.
 
-In `generic_layout.py`, add `StatePaths.generic_adapter_root()` integration and make `adapter_status_file("generic")` resolve to `adapters/generic/status.json` while leaving other fixed adapter identifiers on their existing contract until their own tasks adopt private layouts.
+In `generic_layout.py`, add `StatePaths.generic_adapter_root()` integration and expose the future `adapters/generic/status.json` path through `generic_layout_paths()`. Keep the public `adapter_status_file("generic")` accessor on its existing legacy path during Tasks 1 and 2 so the unchanged installer and its `changed_paths` contract remain internally consistent. Task 3 switches that accessor atomically with the versioned installer migration. Other fixed adapter identifiers remain on their existing contract until their own tasks adopt private layouts.
 
 - [ ] **Step 4: Verify GREEN and compatibility**
 
@@ -260,6 +260,7 @@ Cover:
 - first capsule publication is complete-or-absent and rejects a concurrently appearing target;
 - status activation occurs only after capsule, generation, manifest validation, and smoke test;
 - a failed status write leaves an inert complete capsule and generation that recovery can safely adopt or retire, never a reported successful install;
+- the installer migration and public `adapter_status_file("generic")` switch to `adapters/generic/status.json` land together, so no intermediate commit reports a status path the active installer does not write;
 - first-use `changed_paths` includes state root, adapter directories, generation, capsule, status, and transaction paths exactly once;
 - repeated install returns `already-installed`, creates no staging/generation residue, and changes no files;
 - strict generic mode remains fail-closed before mutation.
@@ -291,7 +292,7 @@ status_path = self._activate_generation(capsule, generation, options)
 return self._verified_result("installed", options, changed_paths)
 ```
 
-Write all runtime bytes only inside the private staging directory. Write each file via a sibling temporary name, fsync, rename inside staging, then fsync the parent. Write the generation manifest last. Publish the complete generation directory to its unique ID, publish a complete capsule directory no-replace on first install, and atomically write status v5 last. Remove the obsolete status-v4/per-file install path; clean V1 does not branch on old formats.
+Write all runtime bytes only inside the private staging directory. Write each file via a sibling temporary name, fsync, rename inside staging, then fsync the parent. Write the generation manifest last. Publish the complete generation directory to its unique ID, publish a complete capsule directory no-replace on first install, and atomically write status v5 last. In this same integration step, switch `adapter_status_file("generic")` to `adapters/generic/status.json` and update installer result accounting/tests together. Remove the obsolete status-v4/per-file install path; clean V1 does not branch on old formats.
 
 - [ ] **Step 5: Verify first-install GREEN**
 
