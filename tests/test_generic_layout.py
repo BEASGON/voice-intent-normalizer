@@ -234,6 +234,32 @@ def test_build_manifest_rejects_an_oversized_mapping_before_iteration():
         build_manifest("generation", _GENERATION_ID, "1.2.3", OversizedFiles())
 
 
+def test_validate_manifest_bounds_a_deceptive_nested_file_sequence():
+    """Catch trusting a nested sequence's false length before iteration."""
+    class DeceptiveFiles(list[str]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.iterations = 0
+
+        def __len__(self) -> int:
+            return 0
+
+        def __iter__(self):
+            for index in range(4097):
+                self.iterations += 1
+                yield f"file-{index:04d}"
+
+    files = DeceptiveFiles()
+    manifest = _manifest()
+    manifest["files"] = files
+    manifest["file_hashes"] = {}
+
+    with pytest.raises(ValueError):
+        validate_manifest(manifest)
+
+    assert files.iterations <= 4097
+
+
 def test_validate_manifest_rejects_oversized_raw_json_before_parsing():
     """Catch feeding an unbounded manifest buffer into the JSON parser."""
     class OversizedBytes(bytes):

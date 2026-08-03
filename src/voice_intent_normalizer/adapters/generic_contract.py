@@ -96,7 +96,7 @@ def build_manifest(
     if not isinstance(files, Mapping):
         raise ValueError("manifest files must be a mapping")
     entries = _bounded_mapping_keys(files, _MAX_FILES, "manifest file list")
-    entries = _validate_files(entries)
+    entries = tuple(sorted(_validate_files(entries)))
     hashes: dict[str, str] = {}
     for path in entries:
         data = files[path]
@@ -132,7 +132,7 @@ def validate_manifest(payload: object) -> Mapping[str, object]:
     if not isinstance(value["files"], (list, tuple)):
         raise ValueError("manifest files must be a sequence")
     files = _validate_files(value["files"])
-    if tuple(value["files"]) != files:
+    if files != tuple(sorted(files)):
         raise ValueError("manifest files must be sorted and unique")
     hashes = _validate_hashes(value["file_hashes"], files)
     manifest = _manifest_mapping(kind, identifier, package_version, files, hashes)
@@ -294,7 +294,12 @@ def _validate_files(values: object) -> tuple[str, ...]:
         raise ValueError("invalid manifest file list")
     files: list[str] = []
     seen: set[str] = set()
-    for value in values:
+    iterator = iter(values)
+    for _ in range(_MAX_FILES + 1):
+        try:
+            value = next(iterator)
+        except StopIteration:
+            return tuple(files)
         if not isinstance(value, str):
             raise ValueError("manifest file path must be a string")
         _validate_relative_path(value)
@@ -302,7 +307,7 @@ def _validate_files(values: object) -> tuple[str, ...]:
             raise ValueError("manifest file paths must be unique")
         seen.add(value)
         files.append(value)
-    return tuple(sorted(files))
+    raise ValueError("invalid manifest file list")
 
 
 def _bounded_mapping_keys(
