@@ -192,6 +192,51 @@ def test_capsule_bootstrap_rejects_untrusted_status(
 
 
 @pytest.mark.parametrize(
+    ("selector", "unsupported"),
+    [
+        ("format", 6),
+        ("format", True),
+        ("layout", "versioned-v2"),
+        ("protocol", 2),
+        ("protocol", True),
+    ],
+)
+def test_capsule_bootstrap_rejects_future_selector_before_loading_helper(
+    built_runtime: BuiltRuntime, selector: str, unsupported: object
+):
+    helper_path = (
+        built_runtime.capsule / "scripts" / "_voice_intent_contract.py"
+    )
+    helper_path.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['VOICE_INTENT_UNTRUSTED_MARKER']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    capsule_manifest = _manifest_dict(built_runtime.capsule / "capsule.json")
+    capsule_files = {
+        relative: (built_runtime.capsule / relative).read_bytes()
+        for relative in capsule_manifest["files"]
+    }
+    substituted_manifest = build_manifest(
+        "capsule", "voice-intent-normalizer", "0.1.0", capsule_files
+    )
+    (built_runtime.capsule / "capsule.json").write_bytes(
+        canonical_json_bytes(substituted_manifest)
+    )
+    status = _manifest_dict(built_runtime.status)
+    status["capsule"]["manifest_digest"] = manifest_digest(substituted_manifest)
+    status["capsule"]["package_hash"] = substituted_manifest["package_hash"]
+    if selector == "protocol":
+        status["capsule"]["protocol"] = unsupported
+    else:
+        status[selector] = unsupported
+    built_runtime.status.write_bytes(canonical_json_bytes(status))
+
+    _assert_rejected_without_marker(built_runtime)
+
+
+@pytest.mark.parametrize(
     "generation_id",
     ["C:/outside", "/outside", "../outside", "g-../outside"],
 )

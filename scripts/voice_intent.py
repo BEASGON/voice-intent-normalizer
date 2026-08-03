@@ -320,6 +320,12 @@ def _protected_capsule_digest(payload) -> str:
         "transaction",
     }:
         raise RuntimeError("adapter status is invalid")
+    if (
+        type(payload.get("format")) is not int
+        or payload.get("format") != 5
+        or payload.get("layout") != "versioned-v1"
+    ):
+        raise RuntimeError("adapter status selector is unsupported")
     capsule = payload.get("capsule")
     if not isinstance(capsule, dict) or set(capsule) != {
         "protocol",
@@ -327,6 +333,11 @@ def _protected_capsule_digest(payload) -> str:
         "package_hash",
     }:
         raise RuntimeError("adapter status capsule reference is invalid")
+    if (
+        type(capsule.get("protocol")) is not int
+        or capsule.get("protocol") != 1
+    ):
+        raise RuntimeError("adapter status capsule protocol is unsupported")
     digest = capsule.get("manifest_digest")
     if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
         raise RuntimeError("adapter status capsule reference is invalid")
