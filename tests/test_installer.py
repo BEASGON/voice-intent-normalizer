@@ -23,6 +23,11 @@ from voice_intent_normalizer.installer import Installer
 from voice_intent_normalizer.paths import StatePaths, StateRootLease
 
 
+def _legacy_generic_status_file(state: StatePaths) -> Path:
+    """Keep legacy installer tests independent of the new V1 path accessor."""
+    return state.root / "adapters" / "generic.json"
+
+
 class _Adapter:
     def __init__(self, platform: str, result: AdapterResult | Exception) -> None:
         self.platform = platform
@@ -104,7 +109,7 @@ def test_generic_install_copies_runnable_allowlisted_package_and_preserves_files
     assert not target.joinpath("tests").exists()
     assert not target.joinpath(".git").exists()
     assert unrelated.read_text(encoding="utf-8") == "keep"
-    status = json.loads(state.adapter_status_file("generic").read_text("utf-8"))
+    status = json.loads(_legacy_generic_status_file(state).read_text("utf-8"))
     assert status["managed_directory"] == str(target)
 
 
@@ -169,7 +174,7 @@ def test_uninstall_uses_explicit_skill_root_not_tampered_status(tmp_path: Path):
     victim = tmp_path / "victim"
     shutil.copytree(root / "voice-intent-normalizer", victim)
     (victim / "keep.txt").write_text("keep", encoding="utf-8")
-    status = state.adapter_status_file("generic")
+    status = _legacy_generic_status_file(state)
     payload = json.loads(status.read_text(encoding="utf-8"))
     payload["managed_directory"] = str(victim)
     status.write_text(json.dumps(payload), encoding="utf-8")
@@ -245,7 +250,7 @@ def test_generic_keeps_identity_bound_package_when_status_recording_fails(
     assert result.status == "degraded"
     assert (root / "voice-intent-normalizer").is_dir()
     assert json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
+        _legacy_generic_status_file(state).read_text(encoding="utf-8")
     )["transaction"]
     assert GenericAdapter(repository, state).doctor().status == "installed"
 
@@ -412,7 +417,7 @@ def test_generic_reinstall_rebuilds_missing_status_and_capability(tmp_path: Path
     state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
     adapter = GenericAdapter(repository, state)
     adapter.install(InstallOptions(output_dir=root))
-    status = state.adapter_status_file("generic")
+    status = _legacy_generic_status_file(state)
     status.unlink()
 
     repaired = adapter.install(
@@ -422,7 +427,7 @@ def test_generic_reinstall_rebuilds_missing_status_and_capability(tmp_path: Path
     assert repaired.status == "repaired"
     payload = json.loads(status.read_text(encoding="utf-8"))
     assert payload["capability"] == "implicit"
-    assert status in repaired.changed_paths
+    assert state.adapter_status_file("generic") in repaired.changed_paths
     assert not any(".staging-" in path.name for path in repaired.changed_paths)
     assert len(repaired.changed_paths) == len(set(repaired.changed_paths))
 
@@ -434,7 +439,7 @@ def test_generic_doctor_reports_missing_status_for_known_managed_target(tmp_path
     state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
     adapter = GenericAdapter(repository, state)
     adapter.install(InstallOptions(output_dir=root))
-    state.adapter_status_file("generic").unlink()
+    _legacy_generic_status_file(state).unlink()
 
     result = adapter.doctor()
 
@@ -677,7 +682,7 @@ def test_generic_same_package_install_id_mismatch_never_reanchors_status(
     assert adapter.install(InstallOptions(output_dir=root)).status == "installed"
     target = root / "voice-intent-normalizer"
     manifest_path = target / ".voice-intent-normalizer-install.json"
-    status_path = state.adapter_status_file("generic")
+    status_path = _legacy_generic_status_file(state)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["install_id"] = "0" * 32
     manifest_path.write_text(
@@ -749,7 +754,7 @@ def test_generic_upgrade_rejects_manifest_that_disagrees_with_status_anchor(
     assert result.status == "failed"
     assert before == after
     status = json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
+        _legacy_generic_status_file(state).read_text(encoding="utf-8")
     )
     assert status["transaction"] is None
 
@@ -987,7 +992,7 @@ def test_generic_missing_manifest_preflight_has_no_mutation(tmp_path: Path):
         for path in root.rglob("*")
         if path.is_file()
     }
-    status_before = state.adapter_status_file("generic").read_bytes()
+    status_before = _legacy_generic_status_file(state).read_bytes()
 
     result = adapter.uninstall(UninstallOptions(output_dir=root))
 
@@ -999,7 +1004,7 @@ def test_generic_missing_manifest_preflight_has_no_mutation(tmp_path: Path):
     assert result.status == "failed"
     assert result.changed_paths == ()
     assert after == before
-    assert state.adapter_status_file("generic").read_bytes() == status_before
+    assert _legacy_generic_status_file(state).read_bytes() == status_before
     assert not tuple(root.glob(".voice-intent-normalizer.quarantine-*"))
 
 
@@ -1108,7 +1113,7 @@ def test_generic_rejects_invalid_staged_package_before_target_mutation(
 
     assert result.status == "failed"
     assert not (root / "voice-intent-normalizer").exists()
-    assert not state.adapter_status_file("generic").exists()
+    assert not _legacy_generic_status_file(state).exists()
     assert not tuple(root.glob(".voice-intent-normalizer.staging-*"))
 
 
@@ -1250,7 +1255,7 @@ def test_real_process_install_and_uninstall_are_serialized(tmp_path: Path):
         for result in results
     )
     target = root / "voice-intent-normalizer"
-    status = state.adapter_status_file("generic")
+    status = _legacy_generic_status_file(state)
     assert target.is_dir()
     if status.exists():
         assert GenericAdapter(repository, state).doctor().status == "installed"
@@ -1292,7 +1297,7 @@ def test_generic_version_upgrade_preserves_unknown_and_refreshes_manifest(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
-    status_path = state.adapter_status_file("generic")
+    status_path = _legacy_generic_status_file(state)
     status = json.loads(status_path.read_text(encoding="utf-8"))
     status["manifest_digest"] = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
@@ -1342,7 +1347,7 @@ def test_generic_upgrade_move_failure_is_resumable(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
-    status_path = state.adapter_status_file("generic")
+    status_path = _legacy_generic_status_file(state)
     status = json.loads(status_path.read_text(encoding="utf-8"))
     status["manifest_digest"] = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
@@ -1695,7 +1700,7 @@ def test_generic_upgrade_never_overwrites_new_unknown_file(
     ).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     (target / "LICENSE").unlink()
-    status_path = state.adapter_status_file("generic")
+    status_path = _legacy_generic_status_file(state)
     status = json.loads(status_path.read_text(encoding="utf-8"))
     status["manifest_digest"] = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
@@ -1809,7 +1814,7 @@ def test_generic_status_rejects_non_generic_capabilities(
     state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
     adapter = GenericAdapter(repository, state)
     adapter.install(InstallOptions(output_dir=root))
-    status_path = state.adapter_status_file("generic")
+    status_path = _legacy_generic_status_file(state)
     status = json.loads(status_path.read_text(encoding="utf-8"))
     status["capability"] = capability
     status_path.write_text(json.dumps(status), encoding="utf-8")
@@ -1979,7 +1984,7 @@ def test_generic_resumes_mid_upgrade_without_overwriting_unknown(
     with pytest.raises(KeyboardInterrupt):
         interrupted.install(InstallOptions(output_dir=root))
     interrupted_status = json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
+        _legacy_generic_status_file(state).read_text(encoding="utf-8")
     )
     assert interrupted_status["transaction"]["phase"] in {
         "quarantined",
@@ -2042,7 +2047,7 @@ def test_generic_retry_finalizes_upgrade_after_status_failure(
     recovery = state.root / "adapters" / "generic-recovery.json"
     assert not recovery.exists()
     assert json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
+        _legacy_generic_status_file(state).read_text(encoding="utf-8")
     )["transaction"]
     repaired = GenericAdapter(upgraded_repository, state).install(
         InstallOptions(output_dir=root)

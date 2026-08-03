@@ -1759,7 +1759,13 @@ class StatePaths:
 
     def adapter_status_file(self, adapter: str) -> Path:
         """Return one adapter's status document location without creating it."""
+        if adapter == "generic":
+            return self.generic_adapter_root() / "status.json"
         return self.root / "adapters" / f"{adapter}.json"
+
+    def generic_adapter_root(self) -> Path:
+        """Return the generic adapter's private V1 state root without creating it."""
+        return self.root / "adapters" / "generic"
 
     def for_project(
         self,
