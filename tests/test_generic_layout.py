@@ -14,6 +14,7 @@ from voice_intent_normalizer.adapters.generic_contract import (
     STATUS_FORMAT,
     build_manifest,
     canonical_json_bytes,
+    manifest_digest,
     validate_manifest,
     validate_status_v5,
 )
@@ -82,13 +83,13 @@ def test_generic_layout_paths_are_private_and_read_only(tmp_path: Path):
     assert not state.root.exists()
 
 
-def test_generic_status_path_uses_private_layout_only_for_generic(tmp_path: Path):
-    """Catch moving unrelated adapter status records while migrating generic."""
+def test_generic_status_path_stays_legacy_until_installer_migration(tmp_path: Path):
+    """Catch Task 1 moving the public path before generic's writer migrates."""
     state = StatePaths(tmp_path / "state")
 
     assert state.generic_adapter_root() == state.root / "adapters" / "generic"
     assert state.adapter_status_file("generic") == (
-        state.root / "adapters" / "generic" / "status.json"
+        state.root / "adapters" / "generic.json"
     )
     assert state.adapter_status_file("codex") == state.root / "adapters" / "codex.json"
     assert not state.root.exists()
@@ -112,9 +113,8 @@ def test_build_manifest_canonicalizes_a_literal_file_mapping():
         + expected_hashes["SKILL.md"].encode("ascii")
         + b'","z.txt":"'
         + expected_hashes["z.txt"].encode("ascii")
-        + b'"},"files":["SKILL.md","z.txt"],"identifier":"'
-        + _GENERATION_ID.encode("ascii")
-        + b'","kind":"generation","package_version":"1.2.3"}'
+        + b'"},"files":["SKILL.md","z.txt"],"kind":"generation",'
+        + b'"package_version":"1.2.3"}'
     ).hexdigest()
 
     assert manifest == {
@@ -137,6 +137,111 @@ def test_build_manifest_canonicalizes_a_literal_file_mapping():
         + expected_package_hash.encode("ascii")
         + b'","package_version":"1.2.3"}'
     )
+
+
+def test_manifest_round_trip_anchors_status_without_a_hash_fixed_point(
+    tmp_path: Path,
+):
+    """Catch package hashes that include the generation ID they must generate."""
+    nonce = "c" * 32
+    provisional = build_manifest(
+        "generation",
+        f"g-{'0' * 64}-{nonce}",
+        "1.2.3",
+        {"SKILL.md": b"skill"},
+    )
+    generation_id = f"g-{provisional['package_hash']}-{nonce}"
+    manifest = build_manifest(
+        "generation", generation_id, "1.2.3", {"SKILL.md": b"skill"}
+    )
+    status = _status()
+    status["active"] = {
+        "generation_id": generation_id,
+        "manifest_digest": manifest_digest(manifest),
+        "package_hash": manifest["package_hash"],
+        "package_version": "1.2.3",
+    }
+    status["previous"] = None
+
+    assert manifest["package_hash"] == provisional["package_hash"]
+    assert validate_manifest(manifest) == manifest
+    assert validate_status_v5(
+        status,
+        skill_root=tmp_path / "skills",
+        generations_root=tmp_path / "state" / "generations",
+    ).active.generation_id == generation_id
+
+
+@pytest.mark.parametrize(
+    "path", ("CON", "dir/NUL.txt", "aux.md", "COM1.py", "x. ", "x ")
+)
+def test_validate_manifest_rejects_windows_component_aliases(path: str):
+    """Catch a POSIX-looking path that Windows aliases to a device or sibling."""
+    manifest = _manifest()
+    manifest["files"] = [path]
+    manifest["file_hashes"] = {path: "1" * 64}
+
+    with pytest.raises(ValueError):
+        validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed"),
+    (
+        ("a" * 512, True),
+        ("a" * 513, False),
+        ("/".join("a" for _ in range(32)), True),
+        ("/".join("a" for _ in range(33)), False),
+    ),
+)
+def test_build_manifest_enforces_literal_path_boundaries(path: str, allowed: bool):
+    """Catch off-by-one path-length or depth checks in manifest construction."""
+    files = {path: b"x"}
+
+    if allowed:
+        assert build_manifest(
+            "generation", _GENERATION_ID, "1.2.3", files
+        )["files"] == (
+            path,
+        )
+    else:
+        with pytest.raises(ValueError):
+            build_manifest("generation", _GENERATION_ID, "1.2.3", files)
+
+
+def test_build_manifest_enforces_literal_file_count_boundaries():
+    """Catch accepting a generation that exceeds the bounded file table."""
+    maximum = {f"file-{index:04d}": b"x" for index in range(4096)}
+    oversized = {**maximum, "file-4096": b"x"}
+
+    assert len(
+        build_manifest("generation", _GENERATION_ID, "1.2.3", maximum)["files"]
+    ) == 4096
+    with pytest.raises(ValueError):
+        build_manifest("generation", _GENERATION_ID, "1.2.3", oversized)
+
+
+def test_build_manifest_rejects_an_oversized_mapping_before_iteration():
+    """Catch materializing unbounded mapping keys before applying the file limit."""
+    class OversizedFiles(dict[str, bytes]):
+        def __len__(self) -> int:
+            return 4097
+
+        def __iter__(self):
+            raise AssertionError("oversized mapping was iterated")
+
+    with pytest.raises(ValueError):
+        build_manifest("generation", _GENERATION_ID, "1.2.3", OversizedFiles())
+
+
+def test_validate_manifest_rejects_oversized_raw_json_before_parsing():
+    """Catch feeding an unbounded manifest buffer into the JSON parser."""
+    class OversizedBytes(bytes):
+        def decode(self, *args, **kwargs):
+            raise AssertionError("oversized JSON was parsed")
+
+    with pytest.raises(ValueError):
+        validate_manifest(OversizedBytes(b" " * (9 * 1024 * 1024)))
 
 
 @pytest.mark.parametrize(

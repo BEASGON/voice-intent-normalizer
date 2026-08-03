@@ -1759,8 +1759,6 @@ class StatePaths:
 
     def adapter_status_file(self, adapter: str) -> Path:
         """Return one adapter's status document location without creating it."""
-        if adapter == "generic":
-            return self.generic_adapter_root() / "status.json"
         return self.root / "adapters" / f"{adapter}.json"
 
     def generic_adapter_root(self) -> Path:

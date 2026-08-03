@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sized
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -21,6 +21,7 @@ _MAX_FILES = 4096
 _MAX_PATH_LENGTH = 512
 _MAX_PATH_DEPTH = 32
 _MAX_VERSION_LENGTH = 256
+_MAX_JSON_BYTES = 8 * 1024 * 1024
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _GENERATION_ID_RE = re.compile(r"\Ag-[0-9a-f]{64}-[0-9a-f]{32}\Z")
 _TRANSACTION_ID_RE = re.compile(r"\At-[0-9a-f]{32}\Z")
@@ -94,7 +95,8 @@ def build_manifest(
     """Build a canonical immutable manifest from exact file bytes."""
     if not isinstance(files, Mapping):
         raise ValueError("manifest files must be a mapping")
-    entries = _validate_files(tuple(files))
+    entries = _bounded_mapping_keys(files, _MAX_FILES, "manifest file list")
+    entries = _validate_files(entries)
     hashes: dict[str, str] = {}
     for path in entries:
         data = files[path]
@@ -107,7 +109,7 @@ def build_manifest(
 def validate_manifest(payload: object) -> Mapping[str, object]:
     """Validate and detach a V1 manifest from untrusted JSON or mappings."""
     value = _json_value(payload, "manifest")
-    if not isinstance(value, dict) or set(value) != {
+    value = _mapping_with_fields(value, {
         "format",
         "kind",
         "identifier",
@@ -115,8 +117,7 @@ def validate_manifest(payload: object) -> Mapping[str, object]:
         "package_hash",
         "files",
         "file_hashes",
-    }:
-        raise ValueError("invalid generation manifest fields")
+    }, "invalid generation manifest fields")
     if value["format"] != GENERATION_FORMAT or type(value["format"]) is not int:
         raise ValueError("unsupported generation manifest format")
     kind = value["kind"]
@@ -128,8 +129,8 @@ def validate_manifest(payload: object) -> Mapping[str, object]:
     _validate_identifier(kind, identifier)
     _validate_version(package_version)
     _validate_sha256(package_hash, "package hash")
-    if not isinstance(value["files"], list):
-        raise ValueError("manifest files must be a list")
+    if not isinstance(value["files"], (list, tuple)):
+        raise ValueError("manifest files must be a sequence")
     files = _validate_files(value["files"])
     if tuple(value["files"]) != files:
         raise ValueError("manifest files must be sorted and unique")
@@ -140,12 +141,17 @@ def validate_manifest(payload: object) -> Mapping[str, object]:
     return manifest
 
 
+def manifest_digest(payload: object) -> str:
+    """Return the canonical manifest identity, including its generation ID."""
+    return hashlib.sha256(canonical_json_bytes(validate_manifest(payload))).hexdigest()
+
+
 def validate_status_v5(
     payload: object, *, skill_root: Path, generations_root: Path
 ) -> StatusV5:
     """Validate V5 status and derive paths without accepting JSON path strings."""
     value = _json_value(payload, "adapter status")
-    if not isinstance(value, dict) or set(value) != {
+    value = _mapping_with_fields(value, {
         "format",
         "layout",
         "capability",
@@ -153,8 +159,7 @@ def validate_status_v5(
         "active",
         "previous",
         "transaction",
-    }:
-        raise ValueError("invalid adapter status fields")
+    }, "invalid adapter status fields")
     if value["format"] != STATUS_FORMAT or type(value["format"]) is not int:
         raise ValueError("unsupported adapter status format")
     if value["layout"] != LAYOUT_NAME:
@@ -201,7 +206,7 @@ def _manifest_mapping(
 ) -> Mapping[str, object]:
     _validate_identifier(kind, identifier)
     _validate_version(package_version)
-    package_hash = _aggregate_hash(kind, identifier, package_version, files, hashes)
+    package_hash = _aggregate_hash(kind, package_version, files, hashes)
     return MappingProxyType(
         {
             "format": GENERATION_FORMAT,
@@ -217,14 +222,12 @@ def _manifest_mapping(
 
 def _aggregate_hash(
     kind: str,
-    identifier: str,
     package_version: str,
     files: tuple[str, ...],
     hashes: Mapping[str, str],
 ) -> str:
     aggregate = {
         "kind": kind,
-        "identifier": identifier,
         "package_version": package_version,
         "files": files,
         "file_hashes": dict(hashes),
@@ -234,6 +237,7 @@ def _aggregate_hash(
 
 def _json_value(payload: object, label: str) -> object:
     if isinstance(payload, (bytes, str)):
+        _validate_raw_json_size(payload, label)
         try:
             return json.loads(
                 payload,
@@ -243,15 +247,23 @@ def _json_value(payload: object, label: str) -> object:
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"invalid {label} JSON") from exc
     if isinstance(payload, Mapping):
-        try:
-            return json.loads(
-                canonical_json_bytes(payload),
-                object_pairs_hook=_unique_object,
-                parse_constant=_reject_json_constant,
-            )
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise ValueError(f"invalid {label}") from exc
+        return payload
     raise ValueError(f"invalid {label}")
+
+
+def _validate_raw_json_size(payload: bytes | str, label: str) -> None:
+    if isinstance(payload, bytes):
+        if len(payload) > _MAX_JSON_BYTES:
+            raise ValueError(f"{label} exceeds size limit")
+        return
+    if len(payload) > _MAX_JSON_BYTES:
+        raise ValueError(f"{label} exceeds size limit")
+    try:
+        encoded = payload.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"invalid {label} JSON") from exc
+    if len(encoded) > _MAX_JSON_BYTES:
+        raise ValueError(f"{label} exceeds size limit")
 
 
 def _json_ready(value: object) -> object:
@@ -293,8 +305,40 @@ def _validate_files(values: object) -> tuple[str, ...]:
     return tuple(sorted(files))
 
 
+def _bounded_mapping_keys(
+    value: Mapping[str, object], maximum: int, label: str
+) -> tuple[str, ...]:
+    if isinstance(value, Sized) and len(value) > maximum:
+        raise ValueError(f"invalid {label}")
+    keys: list[str] = []
+    iterator = iter(value)
+    for _ in range(maximum + 1):
+        try:
+            key = next(iterator)
+        except StopIteration:
+            return tuple(keys)
+        if not isinstance(key, str):
+            raise ValueError(f"invalid {label}")
+        keys.append(key)
+    raise ValueError(f"invalid {label}")
+
+
+def _mapping_with_fields(
+    value: object, fields: set[str], label: str
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(label)
+    keys = _bounded_mapping_keys(value, len(fields), label)
+    if len(keys) != len(fields) or set(keys) != fields:
+        raise ValueError(label)
+    return {key: value[key] for key in fields}
+
+
 def _validate_hashes(value: object, files: tuple[str, ...]) -> Mapping[str, str]:
-    if not isinstance(value, dict) or set(value) != set(files):
+    if not isinstance(value, Mapping):
+        raise ValueError("manifest file hashes do not match files")
+    keys = _bounded_mapping_keys(value, len(files), "manifest file hashes")
+    if len(keys) != len(files) or set(keys) != set(files):
         raise ValueError("manifest file hashes do not match files")
     hashes: dict[str, str] = {}
     for path in files:
@@ -329,20 +373,39 @@ def _validate_version(value: object) -> None:
 def _validate_relative_path(value: str) -> None:
     if (
         not value
-        or len(value) > _MAX_PATH_LENGTH
         or value.startswith(("/", "\\"))
         or "\\" in value
         or ":" in value
         or "\x00" in value
     ):
         raise ValueError("invalid manifest file path")
+    try:
+        path_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("invalid manifest file path") from exc
+    if path_length > _MAX_PATH_LENGTH:
+        raise ValueError("invalid manifest file path")
     parts = value.split("/")
     if (
         len(parts) > _MAX_PATH_DEPTH
         or any(part in {"", ".", ".."} for part in parts)
+        or any(part.endswith((".", " ")) for part in parts)
+        or any(_is_windows_device_name(part) for part in parts)
         or any(any(ord(character) < 0x20 for character in part) for part in parts)
     ):
         raise ValueError("invalid manifest file path")
+
+
+def _is_windows_device_name(component: str) -> bool:
+    base = component.split(".", 1)[0].upper()
+    return base in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
 
 
 def _validate_sha256(value: object, label: str) -> None:
@@ -351,12 +414,11 @@ def _validate_sha256(value: object, label: str) -> None:
 
 
 def _validate_capsule(value: object) -> CapsuleRef:
-    if not isinstance(value, dict) or set(value) != {
+    value = _mapping_with_fields(value, {
         "protocol",
         "manifest_digest",
         "package_hash",
-    }:
-        raise ValueError("invalid capsule reference")
+    }, "invalid capsule reference")
     if value["protocol"] != CAPSULE_PROTOCOL or type(value["protocol"]) is not int:
         raise ValueError("unsupported capsule protocol")
     _validate_sha256(value["manifest_digest"], "capsule manifest digest")
@@ -369,13 +431,12 @@ def _validate_capsule(value: object) -> CapsuleRef:
 
 
 def _validate_generation_ref(value: object, label: str) -> GenerationRef:
-    if not isinstance(value, dict) or set(value) != {
+    value = _mapping_with_fields(value, {
         "generation_id",
         "manifest_digest",
         "package_hash",
         "package_version",
-    }:
-        raise ValueError(f"invalid {label}")
+    }, f"invalid {label}")
     generation_id = value["generation_id"]
     _validate_identifier("generation", generation_id)
     _validate_sha256(value["manifest_digest"], f"{label} manifest digest")
@@ -394,8 +455,7 @@ def _validate_generation_ref(value: object, label: str) -> GenerationRef:
 def _validate_transaction(value: object) -> tuple[str | None, str | None]:
     if value is None:
         return None, None
-    if not isinstance(value, dict) or set(value) != {"id", "phase"}:
-        raise ValueError("invalid adapter transaction")
+    value = _mapping_with_fields(value, {"id", "phase"}, "invalid adapter transaction")
     transaction_id = value["id"]
     phase = value["phase"]
     if (
