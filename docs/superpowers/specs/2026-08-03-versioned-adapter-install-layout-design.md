@@ -1,6 +1,6 @@
 # Versioned Adapter Install Layout Design
 
-**Status:** Pending written-spec review
+**Status:** Approved on 2026-08-03
 
 **Scope:** Task 11 scope revision for the approved clean V1
 
@@ -65,7 +65,7 @@ For a selected host skill root `<skill-root>` and shared state root `<state-root
     ├── status.json                       # protected adapter status + active generation
     ├── transaction.json                  # status-anchored recovery marker
     ├── generations/
-    │   ├── <generation-id>/              # Python core + built-in lexicon assets
+    │   ├── <generation-id>/              # complete allowlisted runtime repository
     │   └── <previous-generation-id>/
     ├── staging/
     │   └── <transaction-id>/             # incomplete, never host-visible
@@ -75,7 +75,7 @@ For a selected host skill root `<skill-root>` and shared state root `<state-root
 
 `generation-id` is derived from the validated package digest plus an installer nonce. Directory names accept only the documented bounded ASCII grammar. Every generation contains a canonical manifest binding its format version, package version, file list, file digests, and generation ID.
 
-The capsule contains every file an agent reads directly: `SKILL.md`, UI metadata, and the three referenced V1 contracts. These files are versioned together as the stable capsule protocol. A runtime generation contains the Python package and built-in lexicon assets; it does not duplicate personal, project, preference, negative, or downloaded hotword state.
+The capsule contains every file an agent reads directly: `SKILL.md`, UI metadata, and the three referenced V1 contracts. These files are versioned together as the stable capsule protocol. A runtime generation contains the complete allowlisted repository subset required to run the CLI and build adapters: Python source, built-in lexicon assets, license/package metadata, and protocol files. Some immutable protocol files therefore appear in both the capsule and the self-contained generation, but only the capsule is host-visible. A generation never contains personal, project, preference, negative, or downloaded hotword state.
 
 The capsule bootstrap resolves `VOICE_INTENT_HOME`, validates protected generic-adapter status, opens the selected generation inside the retained state-root authority, verifies its manifest anchor, and launches the runtime through the existing source-only bootstrap boundary. It never trusts `PYTHONPATH`, ambient checkout files, symlinks, junctions, or a generation path supplied by user text.
 
