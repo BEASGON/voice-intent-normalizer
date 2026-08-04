@@ -4,6 +4,7 @@ import ast
 import io
 import json
 import os
+import posixpath
 import runpy
 import shutil
 import subprocess
@@ -65,6 +66,15 @@ CAPSULE_FILES = {
     "scripts/_voice_intent_contract.py",
     "scripts/voice_intent.py",
     "capsule.json",
+}
+
+_WINDOWS_DEVICE_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
 }
 
 
@@ -138,14 +148,9 @@ def _assert_sdist_runtime_inventory(sdist: Path) -> None:
         names = [member.name for member in members]
         assert names
         assert len(names) == len(set(names))
-        parts = [name.split("/") for name in names]
-        assert all(
-            components
-            and components[0]
-            and "\\" not in name
-            and all(component not in {"", ".", ".."} for component in components)
-            for name, components in zip(names, parts, strict=True)
-        )
+        parts = [_portable_sdist_member_parts(name) for name in names]
+        collision_keys = [name.casefold() for name in names]
+        assert len(collision_keys) == len(set(collision_keys))
         roots = {components[0] for components in parts}
         assert len(roots) == 1
         root = roots.pop()
@@ -162,6 +167,24 @@ def _assert_sdist_runtime_inventory(sdist: Path) -> None:
             assert len(matches) == 1
             assert matches[0].name == anchored
             assert matches[0].isfile()
+
+
+def _portable_sdist_member_parts(name: str) -> tuple[str, ...]:
+    assert name
+    assert not name.startswith(('/', '\\'))
+    assert "\\" not in name
+    assert posixpath.normpath(name) == name
+    components = tuple(name.split("/"))
+    assert all(
+        component not in {"", ".", ".."}
+        and ":" not in component
+        and "\x00" not in component
+        and not component.endswith((".", " "))
+        and component.split(".", 1)[0].upper() not in _WINDOWS_DEVICE_NAMES
+        and all(ord(character) >= 0x20 for character in component)
+        for component in components
+    )
+    return components
 
 
 def _write_synthetic_sdist(path: Path, entries: list[tuple[str, bytes]]) -> None:
@@ -366,42 +389,94 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    "invalid_member",
+    ("archive_root", "invalid_member"),
     [
-        pytest.param("second-root/PKG-INFO", id="second-top-level-root"),
         pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "second-root/PKG-INFO",
+            id="second-top-level-root",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
             "voice_intent_normalizer-0.1.0/SKILL.md",
             id="duplicate-required-member",
         ),
         pytest.param(
+            "voice_intent_normalizer-0.1.0",
             "voice_intent_normalizer-0.1.0/misplaced/SKILL.md",
             id="misplaced-required-member",
         ),
         pytest.param(
+            "voice_intent_normalizer-0.1.0",
             "voice_intent_normalizer-0.1.0/"
             "src/voice_intent_normalizer/_skill_bundle/SKILL.md",
             id="generated-package-bundle",
         ),
         pytest.param(
+            "voice_intent_normalizer-0.1.0",
             "voice_intent_normalizer-0.1.0/_skill_bundle/stale.txt",
             id="stale-root-bundle",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/skill.md",
+            id="casefold-collision",
+        ),
+        pytest.param("C:", "C:/README.md", id="drive-style-root"),
+        pytest.param(
+            "/absolute-root", "/absolute-root/README.md", id="absolute-root"
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs/./README.md",
+            id="dot-component",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs/../README.md",
+            id="dotdot-component",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs\\README.md",
+            id="backslash-component",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs/README.md:stream",
+            id="ads-colon-component",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs/NUL.txt",
+            id="device-component",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs./README.md",
+            id="trailing-dot-component",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0",
+            "voice_intent_normalizer-0.1.0/docs /README.md",
+            id="trailing-space-component",
         ),
     ],
 )
 def test_sdist_runtime_inventory_rejects_misplaced_duplicate_and_stale_members(
-    tmp_path: Path, invalid_member: str
+    tmp_path: Path, archive_root: str, invalid_member: str
 ):
-    root = "voice_intent_normalizer-0.1.0"
     entries = [
-        (f"{root}/{relative}", f"runtime:{relative}".encode())
+        (f"{archive_root}/{relative}", f"runtime:{relative}".encode())
         for relative in RUNTIME_FILES
     ]
     entries.extend(
         [
-            (f"{root}/PKG-INFO", b"metadata"),
-            (f"{root}/setup.cfg", b"standard sdist metadata"),
+            (f"{archive_root}/PKG-INFO", b"metadata"),
+            (f"{archive_root}/setup.cfg", b"standard sdist metadata"),
             (
-                f"{root}/src/voice_intent_normalizer.egg-info/SOURCES.txt",
+                f"{archive_root}/"
+                "src/voice_intent_normalizer.egg-info/SOURCES.txt",
                 b"standard egg metadata",
             ),
             (invalid_member, b"invalid duplicate or misplaced member"),
