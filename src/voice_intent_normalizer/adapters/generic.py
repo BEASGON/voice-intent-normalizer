@@ -7,7 +7,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -149,6 +148,7 @@ class GenericAdapter:
             published = True
 
         try:
+            self._smoke_generation(artifacts.capsule, artifacts.generation)
             generation = self._stage_and_publish_generation(
                 artifacts.generation,
                 recovering=recovering,
@@ -169,10 +169,24 @@ class GenericAdapter:
             self._validate_capsule_directory(
                 root, capsule.relative_to(root), artifacts.capsule
             )
-            self._smoke_generation(capsule, generation)
-            self._activate_generation(status_payload)
-            self._remove_first_install_transaction()
-            return self._verified_result("installed", root, artifacts, options)
+            validate_status_v5(
+                status_payload,
+                skill_root=root,
+                generations_root=generic_layout_paths(
+                    self.state_paths
+                ).generations,
+            )
+            committed_result = self._committed_result("installed", options)
+            try:
+                self._activate_generation(status_payload)
+            except Exception:
+                if not self._status_payload_is_active(status_payload):
+                    raise
+            try:
+                self._remove_first_install_transaction()
+            except Exception:
+                pass
+            return committed_result
         except Exception:
             if not published:
                 self._remove_first_install_transaction(missing_ok=True)
@@ -220,11 +234,26 @@ class GenericAdapter:
             "skill_root_key": state_root_lock_key(root),
             "status": status_payload,
         }
-        self._state_lease().write_bytes_atomic(
-            _TRANSACTION_RELATIVE, canonical_json_bytes(payload)
-        )
-        self._state_lease().fsync_directory(_GENERIC_RELATIVE)
+        data = canonical_json_bytes(payload)
+        lease = self._state_lease()
+        try:
+            lease.write_bytes_atomic(_TRANSACTION_RELATIVE, data)
+        except OSError:
+            try:
+                committed = (
+                    lease.read_bytes(
+                        _TRANSACTION_RELATIVE,
+                        _MANIFEST_LIMIT,
+                        "adapter transaction",
+                    )
+                    == data
+                )
+            except (OSError, ValueError):
+                committed = False
+            if not committed:
+                raise
         self._record_changes((generic_layout_paths(self.state_paths).transaction,))
+        lease.fsync_directory(_GENERIC_RELATIVE)
         return payload
 
     def _read_first_install_transaction(
@@ -337,8 +366,12 @@ class GenericAdapter:
         if transaction is not None:
             expected = self._versioned_status_payload(artifacts, options)
             self._validate_first_install_transaction(transaction, root, expected)
-            self._remove_first_install_transaction()
-            return self._verified_result("installed", root, artifacts, options)
+            committed_result = self._committed_result("installed", options)
+            try:
+                self._remove_first_install_transaction()
+            except Exception:
+                pass
+            return committed_result
         return AdapterResult(
             self.platform,
             "already-installed",
@@ -363,17 +396,22 @@ class GenericAdapter:
             )
             return final
         stage_relative = _STAGING_RELATIVE / f".{artifact.identifier}.staging"
+
+        def record_publication() -> None:
+            self._record_changes(self._artifact_changed_paths(final, artifact))
+            if on_published is not None:
+                on_published()
+
         self._stage_and_publish_artifact(
             self.state_paths.root,
             stage_relative,
             final_relative,
             artifact,
-            on_published=on_published,
+            on_published=record_publication,
         )
         self._validate_generation_directory(
             self.state_paths.root, final_relative, artifact
         )
-        self._record_changes(self._artifact_changed_paths(final, artifact))
         return final
 
     def _ensure_capsule(
@@ -392,10 +430,15 @@ class GenericAdapter:
             return target
         stage_relative = Path(f".{_NAME}.staging-{transaction_id[2:]}")
         self._stage_and_publish_artifact(
-            root, stage_relative, Path(_NAME), artifact
+            root,
+            stage_relative,
+            Path(_NAME),
+            artifact,
+            on_published=lambda: self._record_changes(
+                self._artifact_changed_paths(target, artifact)
+            ),
         )
         self._validate_capsule_directory(root, Path(_NAME), artifact)
-        self._record_changes(self._artifact_changed_paths(target, artifact))
         return target
 
     @staticmethod
@@ -624,32 +667,56 @@ class GenericAdapter:
             sorted(directories, key=lambda path: (len(path.parts), str(path)))
         ) + tuple(sorted(files, key=str))
 
-    def _smoke_generation(self, capsule: Path, generation: Path) -> None:
-        if not (capsule / "capsule.json").is_file() or not (
-            generation / "generation.json"
-        ).is_file():
-            raise ValueError("published runtime is incomplete")
-        skill_metadata = (capsule / "SKILL.md").read_text(encoding="utf-8")
+    def _smoke_generation(
+        self, capsule: VersionedArtifact, generation: VersionedArtifact
+    ) -> None:
+        capsule_manifest_bytes = capsule.files.get("capsule.json")
+        generation_manifest_bytes = generation.files.get("generation.json")
+        if capsule_manifest_bytes is None or generation_manifest_bytes is None:
+            raise ValueError("prepared runtime is incomplete")
+        capsule_manifest = validate_manifest(capsule_manifest_bytes)
+        generation_manifest = validate_manifest(generation_manifest_bytes)
+        if (
+            canonical_json_bytes(capsule_manifest) != capsule_manifest_bytes
+            or capsule_manifest["kind"] != capsule.kind
+            or capsule_manifest["identifier"] != capsule.identifier
+            or capsule_manifest["package_hash"] != capsule.package_hash
+            or capsule_manifest["package_version"] != capsule.package_version
+            or manifest_digest(capsule_manifest) != capsule.manifest_digest
+            or canonical_json_bytes(generation_manifest)
+            != generation_manifest_bytes
+            or generation_manifest["kind"] != generation.kind
+            or generation_manifest["identifier"] != generation.identifier
+            or generation_manifest["package_hash"] != generation.package_hash
+            or generation_manifest["package_version"]
+            != generation.package_version
+            or manifest_digest(generation_manifest) != generation.manifest_digest
+        ):
+            raise ValueError("prepared runtime manifest is invalid")
+        skill_metadata_bytes = capsule.files.get("SKILL.md")
+        if skill_metadata_bytes is None:
+            raise ValueError("prepared capsule metadata is unavailable")
+        skill_metadata = skill_metadata_bytes.decode("utf-8")
         if "name: voice-intent-normalizer" not in skill_metadata:
-            raise ValueError("published capsule metadata is invalid")
+            raise ValueError("prepared capsule metadata is invalid")
         with tempfile.TemporaryDirectory(prefix="voice-intent-smoke-") as sandbox:
             sandbox_root = Path(sandbox)
             state = sandbox_root / "state"
             skill_root = sandbox_root / "skills"
             smoke_capsule = skill_root / _NAME
-            generation_manifest = validate_manifest(
-                (generation / "generation.json").read_bytes()
-            )
-            capsule_manifest = validate_manifest(
-                (capsule / "capsule.json").read_bytes()
-            )
             smoke_generation = (
                 state
                 / _GENERATIONS_RELATIVE
                 / str(generation_manifest["identifier"])
             )
-            shutil.copytree(capsule, smoke_capsule)
-            shutil.copytree(generation, smoke_generation)
+            for artifact, destination in (
+                (capsule, smoke_capsule),
+                (generation, smoke_generation),
+            ):
+                for relative, data in artifact.files.items():
+                    target = destination / Path(relative)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
             smoke_status = {
                 "format": STATUS_FORMAT,
                 "layout": LAYOUT_NAME,
@@ -718,28 +785,14 @@ class GenericAdapter:
                 return
             raise FileNotFoundError("first-install transaction is missing")
         lease.unlink(_TRANSACTION_RELATIVE)
-        lease.fsync_directory(_GENERIC_RELATIVE)
         self._record_changes((generic_layout_paths(self.state_paths).transaction,))
+        lease.fsync_directory(_GENERIC_RELATIVE)
 
-    def _verified_result(
+    def _committed_result(
         self,
         operation: str,
-        root: Path,
-        artifacts: VersionedArtifacts,
         options: InstallOptions,
     ) -> AdapterResult:
-        status = self._read_versioned_status(root)
-        if (
-            status is None
-            or status.active.generation_id != artifacts.generation.identifier
-        ):
-            raise ValueError("activated generation status is unavailable")
-        self._validate_capsule_directory(root, Path(_NAME), artifacts.capsule)
-        self._validate_generation_directory(
-            self.state_paths.root,
-            _GENERATIONS_RELATIVE / artifacts.generation.identifier,
-            artifacts.generation,
-        )
         return AdapterResult(
             self.platform,
             operation,
@@ -1948,18 +2001,23 @@ class GenericAdapter:
             # flush can report failure after that point (and POSIX's atomic
             # writer performs its own parent flush).  Never report a failed,
             # inert install when the exact active status is already visible.
-            try:
-                committed = (
-                    lease.read_bytes(
-                        _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
-                    )
-                    == data
-                )
-            except (OSError, ValueError):
-                committed = False
-            if not committed:
+            if not self._status_bytes_are_active(data):
                 raise
         self._record_changes((self.state_paths.adapter_status_file(self.platform),))
+
+    def _status_payload_is_active(self, payload: dict[str, object]) -> bool:
+        return self._status_bytes_are_active(canonical_json_bytes(payload))
+
+    def _status_bytes_are_active(self, expected: bytes) -> bool:
+        try:
+            return (
+                self._state_lease().read_bytes(
+                    _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
+                )
+                == expected
+            )
+        except (OSError, ValueError):
+            return False
 
     def _read_status(self) -> dict[str, object] | None:
         lease = self._state_lease()

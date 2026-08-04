@@ -329,12 +329,24 @@ def test_first_install_smoke_failure_never_activates_status(
     skill_root = tmp_path / "skills"
     skill_root.mkdir()
     observed_complete = False
+    observed_no_final_names = False
 
     def fail_smoke(capsule, generation):
-        nonlocal observed_complete
-        observed_complete = (
-            Path(capsule, "capsule.json").is_file()
-            and Path(generation, "generation.json").is_file()
+        nonlocal observed_complete, observed_no_final_names
+        if isinstance(capsule, Path):
+            observed_complete = (
+                (capsule / "capsule.json").is_file()
+                and (Path(generation) / "generation.json").is_file()
+            )
+        else:
+            observed_complete = (
+                "capsule.json" in capsule.files
+                and "generation.json" in generation.files
+            )
+        layout = generic_layout_paths(generic_adapter.state_paths)
+        observed_no_final_names = (
+            not (skill_root / "voice-intent-normalizer").exists()
+            and not tuple(layout.generations.glob("g-*"))
         )
         assert not generic_adapter.state_paths.adapter_status_file("generic").exists()
         raise ValueError("injected smoke failure")
@@ -346,8 +358,37 @@ def test_first_install_smoke_failure_never_activates_status(
     result = generic_adapter.install(InstallOptions(output_dir=skill_root))
 
     assert observed_complete
+    assert observed_no_final_names
     assert result.status == "failed"
     assert not generic_adapter.state_paths.adapter_status_file("generic").exists()
+
+
+def test_real_smoke_runs_before_any_final_runtime_name(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = generic_adapter._smoke_generation
+    observed_no_final_names = False
+
+    def observe_smoke(capsule, generation):
+        nonlocal observed_no_final_names
+        observed_no_final_names = (
+            not (skill_root / "voice-intent-normalizer").exists()
+            and not tuple(layout.generations.glob("g-*"))
+        )
+        return original(capsule, generation)
+
+    monkeypatch.setattr(generic_adapter, "_smoke_generation", observe_smoke)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "installed"
+    assert observed_no_final_names
+    _validated_installed_layout(generic_adapter, skill_root)
 
 
 def test_first_install_status_failure_leaves_complete_inert_artifacts(
@@ -374,6 +415,42 @@ def test_first_install_status_failure_leaves_complete_inert_artifacts(
     assert (skill_root / "voice-intent-normalizer" / "capsule.json").is_file()
     assert len(generations) == 1
     validate_manifest((generations[0] / "generation.json").read_bytes())
+
+
+def test_transaction_parent_fsync_failure_reports_committed_marker(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = StateRootLease.fsync_directory
+    injected = False
+
+    def fail_after_transaction_write(lease, relative=Path(".")):
+        nonlocal injected
+        if (
+            not injected
+            and Path(relative) == Path("adapters/generic")
+            and layout.transaction.is_file()
+        ):
+            injected = True
+            raise OSError("injected transaction-parent fsync failure")
+        return original(lease, relative)
+
+    monkeypatch.setattr(
+        StateRootLease, "fsync_directory", fail_after_transaction_write
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert injected
+    assert result.status == "failed"
+    assert layout.transaction.is_file()
+    assert result.changed_paths.count(layout.transaction) == 1
+    assert not tuple(layout.generations.glob("g-*"))
+    assert not (skill_root / "voice-intent-normalizer").exists()
 
 
 def test_generation_parent_fsync_failure_preserves_recovery_anchor(
@@ -410,12 +487,59 @@ def test_generation_parent_fsync_failure_preserves_recovery_anchor(
     assert len(published) == 1
     assert layout.transaction.is_file()
     assert not layout.status.exists()
+    published_paths = {published[0], *published[0].rglob("*")}
+    assert published_paths <= set(failed.changed_paths)
+    assert all(failed.changed_paths.count(path) == 1 for path in published_paths)
 
     recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
 
     assert recovered.status == "installed"
     assert tuple(layout.generations.glob("g-*")) == published
     assert not layout.transaction.exists()
+
+
+def test_capsule_parent_fsync_failure_reports_complete_publication(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    capsule = skill_root / "voice-intent-normalizer"
+    original = StateRootLease.fsync_directory
+    injected = False
+
+    def fail_after_capsule_publish(lease, relative=Path(".")):
+        nonlocal injected
+        if (
+            not injected
+            and Path(relative) == Path(".")
+            and (capsule / "capsule.json").is_file()
+            and not layout.status.exists()
+        ):
+            injected = True
+            raise OSError("injected capsule-parent fsync failure")
+        return original(lease, relative)
+
+    monkeypatch.setattr(StateRootLease, "fsync_directory", fail_after_capsule_publish)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    generations = tuple(layout.generations.glob("g-*"))
+
+    assert injected
+    assert result.status == "failed"
+    assert len(generations) == 1
+    assert layout.transaction.is_file()
+    assert not layout.status.exists()
+    published_paths = {
+        capsule,
+        *capsule.rglob("*"),
+        generations[0],
+        *generations[0].rglob("*"),
+    }
+    assert published_paths <= set(result.changed_paths)
+    assert all(result.changed_paths.count(path) == 1 for path in published_paths)
 
 
 def test_status_parent_fsync_failure_after_replace_is_an_activation_commit(
@@ -451,6 +575,110 @@ def test_status_parent_fsync_failure_after_replace_is_an_activation_commit(
     assert generic_adapter.install(
         InstallOptions(output_dir=skill_root)
     ).status == "already-installed"
+
+
+def test_transaction_parent_fsync_failure_after_activation_is_committed(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = StateRootLease.fsync_directory
+    injected = False
+
+    def fail_after_transaction_unlink(lease, relative=Path(".")):
+        nonlocal injected
+        if (
+            not injected
+            and Path(relative) == Path("adapters/generic")
+            and layout.status.is_file()
+            and not layout.transaction.exists()
+        ):
+            injected = True
+            raise OSError("injected transaction-parent fsync failure")
+        return original(lease, relative)
+
+    monkeypatch.setattr(
+        StateRootLease, "fsync_directory", fail_after_transaction_unlink
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    _validated_installed_layout(generic_adapter, skill_root)
+
+    assert injected
+    assert result.status == "installed"
+    assert not layout.transaction.exists()
+    assert generic_adapter.install(
+        InstallOptions(output_dir=skill_root)
+    ).status == "already-installed"
+
+
+def test_post_activation_cleanup_failure_leaves_recoverable_transaction(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = generic_adapter._remove_first_install_transaction
+    injected = False
+
+    def fail_cleanup(*, missing_ok=False):
+        nonlocal injected
+        assert not missing_ok
+        assert layout.status.is_file()
+        assert layout.transaction.is_file()
+        injected = True
+        raise OSError("injected post-activation cleanup failure")
+
+    monkeypatch.setattr(
+        generic_adapter, "_remove_first_install_transaction", fail_cleanup
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    _validated_installed_layout(generic_adapter, skill_root)
+
+    assert injected
+    assert result.status == "installed"
+    assert layout.transaction.is_file()
+
+    monkeypatch.setattr(
+        generic_adapter, "_remove_first_install_transaction", original
+    )
+    recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert recovered.status == "installed"
+    assert not layout.transaction.exists()
+
+
+def test_no_fallible_artifact_validation_runs_after_status_activation(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = generic_adapter._validate_generation_directory
+
+    def reject_post_activation_validation(root, relative, artifact):
+        if layout.status.exists():
+            raise OSError("injected post-activation validation failure")
+        return original(root, relative, artifact)
+
+    monkeypatch.setattr(
+        generic_adapter,
+        "_validate_generation_directory",
+        reject_post_activation_validation,
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    _validated_installed_layout(generic_adapter, skill_root)
+
+    assert result.status == "installed"
 
 
 def test_first_install_retry_adopts_only_transaction_anchored_artifacts(
@@ -1045,7 +1273,7 @@ def _copy_runtime_repository(source: Path, destination: Path) -> None:
 
 
 @pytest.mark.parametrize("corruption", ["skill", "bootstrap"])
-def test_generic_rejects_invalid_staged_package_with_only_inert_artifacts(
+def test_generic_rejects_invalid_prepared_package_without_final_runtime_names(
     tmp_path: Path, corruption: str
 ):
     repository = Path(__file__).resolve().parents[1]
@@ -1069,11 +1297,11 @@ def test_generic_rejects_invalid_staged_package_with_only_inert_artifacts(
     capsule = root / "voice-intent-normalizer"
     layout = generic_layout_paths(state)
     generations = tuple(layout.generations.glob("g-*"))
-    assert (capsule / "capsule.json").is_file()
-    assert len(generations) == 1
-    assert (generations[0] / "generation.json").is_file()
-    assert layout.transaction.is_file()
+    assert not capsule.exists()
+    assert not generations
+    assert not layout.transaction.exists()
     assert not layout.status.exists()
+    assert not tuple(layout.staging.glob("*"))
     assert not tuple(root.glob(".voice-intent-normalizer.staging-*"))
 
 
