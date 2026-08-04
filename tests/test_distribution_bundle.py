@@ -216,7 +216,7 @@ print(json.dumps({{"status": result.status}}))
         ],
         env={
             "PATH": str(python.parent),
-            "VOICE_INTENT_HOME": str(tmp_path / "bootstrap-state"),
+            "VOICE_INTENT_HOME": str(state),
         },
         check=False,
         capture_output=True,

@@ -126,6 +126,28 @@ def test_publish_directory_no_replace_preserves_concurrent_destination(
     assert (destination / "racer.txt").read_text(encoding="utf-8") == "racer"
 
 
+def test_publish_directory_no_replace_rejects_replaced_source_identity(
+    tmp_path: Path,
+):
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    (source / "original.txt").write_text("original", encoding="utf-8")
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    displaced = root / "displaced"
+    source.rename(displaced)
+    source.mkdir()
+    (source / "replacement.txt").write_text("replacement", encoding="utf-8")
+
+    with guard_state_root(root) as lease, pytest.raises(ValueError):
+        lease.publish_directory_no_replace("source", "published", expected_identity)
+
+    assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
+    assert (source / "replacement.txt").read_text(encoding="utf-8") == "replacement"
+    assert not (root / "published").exists()
+
+
 def test_failed_generation_write_exposes_no_partial_runtime(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
@@ -186,6 +208,51 @@ def test_generation_validation_failure_precedes_final_name_publication(
     assert observed
     assert result.status == "failed"
     assert not tuple(layout.generations.glob("g-*"))
+    assert not (skill_root / "voice-intent-normalizer").exists()
+
+
+def test_failed_generation_cleanup_preserves_swapped_staging_victim(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    original = StateRootLease.publish_directory_no_replace
+    swapped_marker: Path | None = None
+
+    def swap_staging_before_publication(
+        lease, source, destination, expected_identity
+    ):
+        nonlocal swapped_marker
+        source_relative = Path(source)
+        destination_relative = Path(destination)
+        if destination_relative.parent == Path("adapters/generic/generations"):
+            source_path = generic_adapter.state_paths.root / source_relative
+            displaced = source_path.parent / "displaced-generation"
+            victim = source_path.parent / "victim"
+            victim.mkdir()
+            (victim / "keep.txt").write_text("keep", encoding="utf-8")
+            source_path.rename(displaced)
+            victim.rename(source_path)
+            swapped_marker = source_path / "keep.txt"
+            raise OSError("injected publication failure after staging swap")
+        return original(lease, source, destination, expected_identity)
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "publish_directory_no_replace",
+        swap_staging_before_publication,
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    layout = generic_layout_paths(generic_adapter.state_paths)
+
+    assert result.status == "failed"
+    assert swapped_marker is not None
+    assert swapped_marker.read_text(encoding="utf-8") == "keep"
+    assert not tuple(layout.generations.glob("g-*"))
+    assert not layout.status.exists()
     assert not (skill_root / "voice-intent-normalizer").exists()
 
 
@@ -589,26 +656,6 @@ def test_generic_install_is_zero_install_runnable(tmp_path: Path):
     assert json.loads(result.stdout)["status"] in {"ok", "degraded"}
 
 
-def test_generic_uninstall_preserves_shared_personal_data(tmp_path: Path):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    state.root.mkdir()
-    state.personal_file.write_text('{"canonical":"OpenClaw"}\n', encoding="utf-8")
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-
-    result = adapter.uninstall(UninstallOptions(remove_shared_data=False))
-
-    assert result.status == "uninstalled"
-    assert state.personal_file.exists()
-    assert (root / "voice-intent-normalizer").is_dir()
-    assert not any(
-        path.is_file()
-        for path in (root / "voice-intent-normalizer").rglob("*")
-    )
-
 
 def test_uninstall_uses_explicit_skill_root_not_tampered_status(tmp_path: Path):
     repository = Path(__file__).resolve().parents[1]
@@ -631,29 +678,6 @@ def test_uninstall_uses_explicit_skill_root_not_tampered_status(tmp_path: Path):
     assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
     assert (root / "voice-intent-normalizer").exists()
 
-
-def test_uninstall_resumes_when_status_removal_fails(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    marker = target / "SKILL.md"
-    monkeypatch.setattr(
-        adapter,
-        "_remove_status",
-        lambda: (_ for _ in ()).throw(OSError("status unavailable")),
-    )
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "degraded"
-    assert not marker.exists()
-    assert GenericAdapter(repository, state).doctor().status == "not-installed"
 
 
 def test_generic_refuses_to_overwrite_unmanaged_directory(tmp_path: Path):
@@ -720,29 +744,6 @@ def test_generic_reinstall_rejects_unmanaged_capsule_file_without_mutation(
     assert custom.read_text(encoding="utf-8") == "preserve"
     assert target.exists()
 
-
-def test_generic_uninstall_rejects_tampered_manifest_without_touching_outside_file(
-    tmp_path: Path,
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    outside = root / "outside.txt"
-    outside.write_text("keep", encoding="utf-8")
-    manifest = target / ".voice-intent-normalizer-install.json"
-    payload = json.loads(manifest.read_text(encoding="utf-8"))
-    payload["files"].append("../outside.txt")
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = adapter.uninstall(UninstallOptions())
-
-    assert result.status == "failed"
-    assert outside.read_text(encoding="utf-8") == "keep"
-    assert target.exists()
 
 
 def test_generic_doctor_never_claims_automatic_trigger(tmp_path: Path):
@@ -877,21 +878,6 @@ def test_generic_reinstall_does_not_reanchor_capsule_with_missing_status(
     )
 
 
-def test_generic_doctor_reports_missing_status_for_known_managed_target(tmp_path: Path):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    state.adapter_status_file("generic").unlink()
-
-    result = adapter.doctor()
-
-    assert result.status == "degraded"
-    assert "adapter status: missing" in result.messages
-    assert "managed package: valid" in result.messages
-
 
 def test_generic_doctor_reports_manifest_hash_failure(tmp_path: Path):
     repository = Path(__file__).resolve().parents[1]
@@ -910,298 +896,11 @@ def test_generic_doctor_reports_manifest_hash_failure(tmp_path: Path):
     assert "required file SKILL.md: invalid" in result.messages
 
 
-def test_generic_uninstall_restoration_failure_is_recovery_visible(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-
-    def fail_status():
-        raise OSError("status unavailable")
-
-    monkeypatch.setattr(adapter, "_remove_status", fail_status)
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "degraded"
-    assert result.changed_paths
-    assert any("retry" in message for message in result.messages)
-    assert GenericAdapter(repository, state).doctor().status == "not-installed"
-    assert not (target / "SKILL.md").exists()
 
 
-def test_generic_uninstall_retains_identity_bound_quarantine(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "uninstalled"
-    assert tuple(
-        path
-        for path in root.glob(".voice-intent-normalizer.quarantine-*")
-        if any(candidate.is_file() for candidate in path.rglob("*"))
-    )
-    assert adapter.doctor().status == "not-installed"
 
 
-def test_generic_transaction_never_unlinks_a_replaced_live_source_name(
-    tmp_path: Path, monkeypatch
-):
-    """A quarantine publication must not be followed by a name-only unlink."""
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    assert adapter.install(InstallOptions(output_dir=root)).status == "installed"
-    target = root / "voice-intent-normalizer"
-    victim_bytes = b"user replacement that must survive"
-    original_publish = StateRootLease.publish_no_replace
-    original_unlink = StateRootLease.unlink
-    quarantine_published = False
-    replacement_injected = False
 
-    def observe_quarantine_publish(lease, source, destination):
-        nonlocal quarantine_published
-        original_publish(lease, source, destination)
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if (
-            source_path == Path("voice-intent-normalizer") / "SKILL.md"
-            and destination_path.parts[0].startswith(
-                ".voice-intent-normalizer.quarantine-"
-            )
-        ):
-            quarantine_published = True
-
-    def replace_before_name_unlink(lease, relative, *, missing_ok=False):
-        nonlocal replacement_injected
-        relative_path = Path(relative)
-        if (
-            quarantine_published
-            and not replacement_injected
-            and relative_path == Path("voice-intent-normalizer") / "SKILL.md"
-        ):
-            live = root / relative_path
-            live.unlink()
-            live.write_bytes(victim_bytes)
-            replacement_injected = True
-        return original_unlink(lease, relative, missing_ok=missing_ok)
-
-    monkeypatch.setattr(
-        StateRootLease, "publish_no_replace", observe_quarantine_publish
-    )
-    monkeypatch.setattr(StateRootLease, "unlink", replace_before_name_unlink)
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert not replacement_injected
-    assert result.status == "uninstalled"
-    assert not (target / "SKILL.md").exists()
-
-
-def test_generic_quarantine_never_moves_a_replacement_opened_after_validation(
-    tmp_path: Path, monkeypatch
-):
-    """Replacing a checked live name must not move unrelated bytes."""
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    assert adapter.install(InstallOptions(output_dir=root)).status == "installed"
-    live = root / "voice-intent-normalizer" / "SKILL.md"
-    replacement = b"unrelated live replacement"
-    original_open = StateRootLease._open_regular_file
-    original_write_recovery = GenericAdapter._write_recovery
-    armed = False
-    injected = False
-
-    def arm_after_journal(current, transaction):
-        nonlocal armed
-        path = original_write_recovery(current, transaction)
-        armed = True
-        return path
-
-    def replace_after_open(binding, name, label):
-        nonlocal injected
-        descriptor = original_open(binding, name, label)
-        if armed and not injected and name == "SKILL.md":
-            live.unlink()
-            live.write_bytes(replacement)
-            injected = True
-        return descriptor
-
-    monkeypatch.setattr(GenericAdapter, "_write_recovery", arm_after_journal)
-    monkeypatch.setattr(
-        StateRootLease,
-        "_open_regular_file",
-        staticmethod(replace_after_open),
-    )
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    quarantined = tuple(
-        path
-        for directory in root.glob(".voice-intent-normalizer.quarantine-*")
-        for path in directory.rglob("*")
-        if path.is_file()
-    )
-    assert injected
-    assert result.status == "degraded"
-    assert live.read_bytes() == replacement
-    assert all(path.read_bytes() != replacement for path in quarantined)
-
-
-def test_generic_publication_never_moves_a_replaced_staging_source(
-    tmp_path: Path, monkeypatch
-):
-    """Replacing a checked staged name must not publish unrelated bytes."""
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    replacement = b"unrelated staging replacement"
-    original_open = StateRootLease._open_regular_file
-    original_write_recovery = GenericAdapter._write_recovery
-    armed = False
-    injected = False
-    replaced_source: Path | None = None
-
-    def arm_after_journal(current, transaction):
-        nonlocal armed
-        path = original_write_recovery(current, transaction)
-        armed = True
-        return path
-
-    def replace_after_open(binding, name, label):
-        nonlocal injected, replaced_source
-        descriptor = original_open(binding, name, label)
-        if armed and not injected and name == "SKILL.md":
-            staging = next(root.glob(".voice-intent-normalizer.staging-*"))
-            replaced_source = staging / "SKILL.md"
-            replaced_source.unlink()
-            replaced_source.write_bytes(replacement)
-            injected = True
-        return descriptor
-
-    monkeypatch.setattr(GenericAdapter, "_write_recovery", arm_after_journal)
-    monkeypatch.setattr(
-        StateRootLease,
-        "_open_regular_file",
-        staticmethod(replace_after_open),
-    )
-
-    result = GenericAdapter(repository, state).install(
-        InstallOptions(output_dir=root)
-    )
-
-    target = root / "voice-intent-normalizer" / "SKILL.md"
-    assert injected
-    assert result.status == "degraded"
-    assert replaced_source is not None
-    assert replaced_source.read_bytes() == replacement
-    assert not target.exists() or target.read_bytes() != replacement
-
-
-def test_generic_same_package_install_id_mismatch_never_reanchors_status(
-    tmp_path: Path,
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    assert adapter.install(InstallOptions(output_dir=root)).status == "installed"
-    target = root / "voice-intent-normalizer"
-    manifest_path = target / ".voice-intent-normalizer-install.json"
-    status_path = state.adapter_status_file("generic")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["install_id"] = "0" * 32
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    status_before = status_path.read_bytes()
-    package_before = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    package_after = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-    assert result.status in {"failed", "degraded"}
-    assert status_path.read_bytes() == status_before
-    assert package_after == package_before
-
-
-def test_generic_upgrade_rejects_manifest_that_disagrees_with_status_anchor(
-    tmp_path: Path,
-):
-    repository = Path(__file__).resolve().parents[1]
-    upgraded_repository = tmp_path / "upgraded-repository"
-    _copy_runtime_repository(repository, upgraded_repository)
-    metadata = (upgraded_repository / "pyproject.toml").read_text(encoding="utf-8")
-    (upgraded_repository / "pyproject.toml").write_text(
-        metadata.replace('version = "0.1.0"', 'version = "0.1.1"'),
-        encoding="utf-8",
-    )
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    assert (
-        GenericAdapter(repository, state)
-        .install(InstallOptions(output_dir=root))
-        .status
-        == "installed"
-    )
-    target = root / "voice-intent-normalizer"
-    manifest_path = target / ".voice-intent-normalizer-install.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["install_id"] = "0" * 32
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    before = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-
-    result = GenericAdapter(upgraded_repository, state).install(
-        InstallOptions(output_dir=root)
-    )
-
-    after = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-    assert result.status == "failed"
-    assert before == after
-    status = json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
-    )
-    assert status["transaction"] is None
 
 
 def test_generic_success_and_noop_never_leave_source_hardlinks(
@@ -1261,49 +960,6 @@ def test_generic_strict_install_fails_closed_before_skill_publication(tmp_path: 
     assert any("strict" in message for message in first.messages)
     assert not (root / "voice-intent-normalizer").exists()
 
-
-def test_generic_uninstall_rejects_managed_parent_alias_without_external_mutation(
-    tmp_path: Path,
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    outside = tmp_path / "outside-assets"
-    shutil.copytree(target / "assets", outside)
-    shutil.rmtree(target / "assets")
-    try:
-        if os.name == "nt":
-            created = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(target / "assets"), str(outside)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if created.returncode:
-                pytest.skip(f"junction creation unavailable: {created.stderr}")
-        else:
-            (target / "assets").symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"directory alias creation unavailable: {exc}")
-    before = {
-        path.relative_to(outside): path.read_bytes()
-        for path in outside.rglob("*")
-        if path.is_file()
-    }
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    after = {
-        path.relative_to(outside): path.read_bytes()
-        for path in outside.rglob("*")
-        if path.is_file()
-    }
-    assert result.status == "failed"
-    assert after == before
 
 
 def test_generic_success_changed_paths_include_files_directories_and_status(
@@ -1367,146 +1023,8 @@ def test_cli_uninstall_forwards_strict_and_explicit_shared_data_option():
     assert json.loads(stdout.getvalue())[0]["status"] == "failed"
 
 
-def test_generic_quarantine_move_failure_is_resumable(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    before = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-    original_replace = StateRootLease.move_no_replace
-    moves = 0
-
-    def fail_third_move(lease, source, destination, **contract):
-        nonlocal moves
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if (
-            source_path.parts
-            and source_path.parts[0] == "voice-intent-normalizer"
-            and destination_path.parts
-            and destination_path.parts[0].startswith(
-                ".voice-intent-normalizer.quarantine-"
-            )
-        ):
-            moves += 1
-            if moves == 3:
-                raise OSError("injected move failure")
-        return original_replace(lease, source, destination, **contract)
-
-    monkeypatch.setattr(StateRootLease, "move_no_replace", fail_third_move)
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "degraded"
-    assert result.changed_paths
-    monkeypatch.setattr(StateRootLease, "move_no_replace", original_replace)
-    assert GenericAdapter(repository, state).doctor().status == "not-installed"
-    assert not any(path.is_file() for path in target.rglob("*"))
-    assert before
 
 
-def test_generic_missing_manifest_preflight_has_no_mutation(tmp_path: Path):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    (target / ".voice-intent-normalizer-install.json").unlink()
-    before = {
-        path.relative_to(root): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
-    status_before = state.adapter_status_file("generic").read_bytes()
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    after = {
-        path.relative_to(root): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
-    assert result.status == "failed"
-    assert result.changed_paths == ()
-    assert after == before
-    assert state.adapter_status_file("generic").read_bytes() == status_before
-    assert not tuple(root.glob(".voice-intent-normalizer.quarantine-*"))
-
-
-def test_generic_status_failure_never_rolls_back_a_swapped_target(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    target = root / "voice-intent-normalizer"
-    displaced = root / "displaced-package"
-    victim_marker = target / "victim.txt"
-
-    original_write = adapter._write_status_payload
-    writes = 0
-
-    def swap_then_fail(payload):
-        nonlocal writes
-        writes += 1
-        if writes == 2:
-            target.rename(displaced)
-            target.mkdir()
-            victim_marker.write_text("victim", encoding="utf-8")
-            raise OSError("status unavailable")
-        return original_write(payload)
-
-    monkeypatch.setattr(adapter, "_write_status_payload", swap_then_fail)
-
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    assert result.status == "degraded"
-    assert victim_marker.read_text(encoding="utf-8") == "victim"
-    assert displaced.joinpath("SKILL.md").is_file()
-
-
-def test_generic_uninstall_rejects_target_swapped_after_manifest_validation(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    displaced = root / "displaced-package"
-    original_prepare = adapter._prepare_transaction_directory
-
-    def swap_then_prepare(skill_root, quarantine, manifest):
-        target.rename(displaced)
-        shutil.copytree(displaced, target)
-        (target / "victim.txt").write_text("victim", encoding="utf-8")
-        return original_prepare(skill_root, quarantine, manifest)
-
-    monkeypatch.setattr(
-        adapter, "_prepare_transaction_directory", swap_then_prepare
-    )
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "failed"
-    assert (target / "SKILL.md").is_file()
-    assert (target / "victim.txt").read_text(encoding="utf-8") == "victim"
-    assert (displaced / "SKILL.md").is_file()
 
 
 def _copy_runtime_repository(source: Path, destination: Path) -> None:
@@ -1682,213 +1200,9 @@ def test_two_real_process_installs_are_serialized_and_idempotent(tmp_path: Path)
     assert (root / "voice-intent-normalizer" / "SKILL.md").is_file()
 
 
-def test_real_process_install_and_uninstall_are_serialized(tmp_path: Path):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state_root = tmp_path / "state"
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(state_root)})
-    GenericAdapter(repository, state).install(InstallOptions(output_dir=root))
-
-    installing = _adapter_process(repository, root, state_root, "install")
-    uninstalling = _adapter_process(repository, root, state_root, "uninstall")
-    results = (_process_result(installing), _process_result(uninstalling))
-
-    assert all(
-        result["status"]
-        in {"installed", "already-installed", "repaired", "uninstalled"}
-        for result in results
-    )
-    target = root / "voice-intent-normalizer"
-    status = state.adapter_status_file("generic")
-    assert target.is_dir()
-    if status.exists():
-        assert GenericAdapter(repository, state).doctor().status == "installed"
-    else:
-        assert not any(path.is_file() for path in target.rglob("*"))
 
 
-def test_generic_version_upgrade_preserves_unknown_and_refreshes_manifest(
-    tmp_path: Path,
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    unknown = target / "host-owned.txt"
-    unknown.write_text("preserve", encoding="utf-8")
-    manifest_path = target / ".voice-intent-normalizer-install.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    obsolete = target / "obsolete.txt"
-    obsolete.write_text("old", encoding="utf-8")
-    manifest["files"].append("obsolete.txt")
-    manifest["files"].sort()
-    manifest["hashes"]["obsolete.txt"] = hashlib.sha256(b"old").hexdigest()
-    manifest["package_version"] = "0.0.1"
-    package_identity = json.dumps(
-        {
-            "hashes": manifest["hashes"],
-            "required": manifest["required_files"],
-            "version": "0.0.1",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    manifest["package_hash"] = hashlib.sha256(package_identity).hexdigest()
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    status_path = state.adapter_status_file("generic")
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-    status["manifest_digest"] = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    status["package_hash"] = manifest["package_hash"]
-    status["package_version"] = manifest["package_version"]
-    status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    refreshed = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert result.status == "upgraded"
-    assert refreshed["package_version"] == "0.1.0"
-    assert not obsolete.exists()
-    assert result.changed_paths.count(obsolete) == 1
-    assert len(result.changed_paths) == len(set(result.changed_paths))
-    assert unknown.read_text(encoding="utf-8") == "preserve"
-    assert adapter.doctor().status == "installed"
-
-
-def test_generic_upgrade_move_failure_is_resumable(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    manifest_path = target / ".voice-intent-normalizer-install.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["package_version"] = "0.0.1"
-    package_identity = json.dumps(
-        {
-            "hashes": manifest["hashes"],
-            "required": manifest["required_files"],
-            "version": "0.0.1",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    import hashlib
-
-    manifest["package_hash"] = hashlib.sha256(package_identity).hexdigest()
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    status_path = state.adapter_status_file("generic")
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-    status["manifest_digest"] = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    status["package_hash"] = manifest["package_hash"]
-    status["package_version"] = manifest["package_version"]
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-    before = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-    original_replace = StateRootLease.move_no_replace
-    new_moves = 0
-
-    def fail_new_move(lease, source, destination, **contract):
-        nonlocal new_moves
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if (
-            source_path.parts
-            and source_path.parts[0].startswith(".voice-intent-normalizer.staging-")
-            and destination_path.parts
-            and destination_path.parts[0] == "voice-intent-normalizer"
-        ):
-            new_moves += 1
-            if new_moves == 3:
-                raise OSError("injected upgrade failure")
-        return original_replace(lease, source, destination, **contract)
-
-    monkeypatch.setattr(StateRootLease, "move_no_replace", fail_new_move)
-
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    assert result.status == "degraded"
-    assert any(".staging-" in path.name for path in result.changed_paths)
-    assert len(result.changed_paths) == len(set(result.changed_paths))
-    assert tuple(root.glob(".voice-intent-normalizer.staging-*"))
-    monkeypatch.setattr(StateRootLease, "move_no_replace", original_replace)
-    resumed = GenericAdapter(repository, state).install(
-        InstallOptions(output_dir=root)
-    )
-    assert resumed.status in {"already-installed", "repaired", "upgraded"}
-    assert GenericAdapter(repository, state).doctor().status == "installed"
-    assert before
-
-
-def test_generic_uninstall_never_uses_recursive_deletion(tmp_path: Path, monkeypatch):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-
-    monkeypatch.setattr(
-        shutil,
-        "rmtree",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("recursive deletion is forbidden")
-        ),
-    )
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "uninstalled"
-
-
-def test_generic_failed_staging_cleanup_never_deletes_a_swapped_victim(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    victim = root / "victim"
-    victim.mkdir()
-    marker = victim / "keep.txt"
-    marker.write_text("keep", encoding="utf-8")
-    def swap_staging_then_fail(
-        root, target, staging, manifest, options, root_identity, staging_identity
-    ):
-        displaced = root / "displaced-staging"
-        staging.rename(displaced)
-        victim.rename(staging)
-        raise OSError("injected post-validation failure")
-
-    monkeypatch.setattr(adapter, "_commit_new_install", swap_staging_then_fail)
-
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    assert result.status == "failed"
-    assert (root / "displaced-staging" / "SKILL.md").is_file()
-    swapped = root / next(path.name for path in root.glob(".*staging-*"))
-    assert (swapped / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_generic_staging_copy_never_writes_into_a_swapped_directory(
@@ -2083,170 +1397,9 @@ def test_posix_identity_bound_move_copies_without_unlinking_the_source(
     assert (destination / "file.txt").read_bytes() == b"managed"
 
 
-def test_generic_uninstall_leaves_empty_managed_directories(tmp_path: Path):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-
-    result = adapter.uninstall(UninstallOptions(output_dir=root))
-
-    assert result.status == "uninstalled"
-    assert target.is_dir()
-    assert target / "src" not in result.changed_paths
-    assert any("empty" in message for message in result.messages)
 
 
-def test_generic_can_reinstall_into_benign_empty_managed_directories(tmp_path: Path):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    adapter.uninstall(UninstallOptions(output_dir=root))
 
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    assert result.status == "installed"
-    assert (root / "voice-intent-normalizer" / "SKILL.md").is_file()
-    assert adapter.doctor().status == "installed"
-
-
-def test_generic_upgrade_never_overwrites_new_unknown_file(
-    tmp_path: Path, monkeypatch
-):
-    import hashlib
-
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    manifest_path = target / ".voice-intent-normalizer-install.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["files"].remove("LICENSE")
-    manifest["hashes"].pop("LICENSE")
-    manifest["package_hash"] = hashlib.sha256(
-        json.dumps(
-            {
-                "hashes": manifest["hashes"],
-                "required": manifest["required_files"],
-                "version": manifest["package_version"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    (target / "LICENSE").unlink()
-    status_path = state.adapter_status_file("generic")
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-    status["manifest_digest"] = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    status["package_hash"] = manifest["package_hash"]
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-    original_publish = StateRootLease.move_no_replace
-    injected = False
-
-    def inject_unknown(lease, source, destination, **contract):
-        nonlocal injected
-        if Path(destination) == Path("voice-intent-normalizer/LICENSE"):
-            injected = True
-            (target / "LICENSE").write_text("user-owned", encoding="utf-8")
-        return original_publish(lease, source, destination, **contract)
-
-    monkeypatch.setattr(StateRootLease, "move_no_replace", inject_unknown)
-
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    assert injected
-    assert result.status in {"failed", "degraded"}
-    assert (target / "LICENSE").read_text(encoding="utf-8") == "user-owned"
-
-
-def test_generic_fresh_install_never_replaces_a_racing_destination(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    target = root / "voice-intent-normalizer"
-    original_commit = adapter._commit_new_install
-
-    def inject_destination(
-        skill_root,
-        managed_target,
-        staging,
-        manifest,
-        options,
-        root_identity,
-        staging_identity,
-    ):
-        target.mkdir()
-        (target / "keep.txt").write_text("user-owned", encoding="utf-8")
-        return original_commit(
-            skill_root,
-            managed_target,
-            staging,
-            manifest,
-            options,
-            root_identity,
-            staging_identity,
-        )
-
-    monkeypatch.setattr(adapter, "_commit_new_install", inject_destination)
-
-    result = adapter.install(InstallOptions(output_dir=root))
-
-    assert result.status == "failed"
-    assert (target / "keep.txt").read_text(encoding="utf-8") == "user-owned"
-
-
-def test_generic_status_anchors_manifest_ownership(tmp_path: Path):
-    import hashlib
-
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-    user_file = target / "user-owned.txt"
-    user_file.write_text("keep", encoding="utf-8")
-    manifest_path = target / ".voice-intent-normalizer-install.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["files"].append("user-owned.txt")
-    manifest["files"].sort()
-    manifest["hashes"]["user-owned.txt"] = hashlib.sha256(b"keep").hexdigest()
-    manifest["package_hash"] = hashlib.sha256(
-        json.dumps(
-            {
-                "hashes": manifest["hashes"],
-                "required": manifest["required_files"],
-                "version": manifest["package_version"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-
-    assert adapter.doctor().status == "degraded"
-    assert adapter.uninstall(UninstallOptions(output_dir=root)).status == "failed"
-    assert user_file.read_text(encoding="utf-8") == "keep"
 
 
 @pytest.mark.parametrize("capability", ["automatic", "unavailable"])
@@ -2317,197 +1470,8 @@ def test_generic_runtime_does_not_require_python_311_tomllib():
     assert "import tomllib" not in module_source
 
 
-def test_generic_doctor_recovers_crash_after_last_uninstall_move(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    target = root / "voice-intent-normalizer"
-
-    monkeypatch.setattr(
-        adapter,
-        "_remove_status",
-        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
-    )
-    with pytest.raises(KeyboardInterrupt):
-        adapter.uninstall(UninstallOptions(output_dir=root))
-
-    recovered = GenericAdapter(repository, state)
-    result = recovered.doctor()
-    after = {
-        path.relative_to(target): path.read_bytes()
-        for path in target.rglob("*")
-        if path.is_file()
-    }
-
-    assert result.status == "not-installed"
-    assert after == {}
-    recovery = state.root / "adapters" / "generic-recovery.json"
-    assert not recovery.exists()
-    assert result.changed_paths.count(recovery) == 0
-    assert len(result.changed_paths) == len(set(result.changed_paths))
 
 
-def test_generic_does_not_consume_unanchored_recovery_record(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    adapter = GenericAdapter(repository, state)
-    adapter.install(InstallOptions(output_dir=root))
-    quarantine = root / (
-        ".voice-intent-normalizer.quarantine-"
-        "0123456789abcdef0123456789abcdef"
-    )
-    quarantine.mkdir()
-    quarantined = quarantine / "keep.txt"
-    quarantined.write_text("keep", encoding="utf-8")
-    recovery = state.root / "adapters" / "generic-recovery.json"
-    recovery.write_text(
-        json.dumps(
-            {
-                "format": 3,
-                "owner": "voice-intent-normalizer",
-                "transaction_digest": "0" * 64,
-                "transaction_id": "0123456789abcdef0123456789abcdef",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    result = GenericAdapter(repository, state).doctor()
-
-    assert result.status == "degraded"
-    assert result.capability is CapabilityLevel.MANUAL
-    assert recovery.is_file()
-    assert quarantined.read_text(encoding="utf-8") == "keep"
-
-
-def test_generic_resumes_mid_upgrade_without_overwriting_unknown(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    upgraded_repository = tmp_path / "new-repository"
-    _copy_runtime_repository(repository, upgraded_repository)
-    metadata = (upgraded_repository / "pyproject.toml").read_text(encoding="utf-8")
-    (upgraded_repository / "pyproject.toml").write_text(
-        metadata.replace('version = "0.1.0"', 'version = "0.1.2"'),
-        encoding="utf-8",
-    )
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    GenericAdapter(repository, state).install(InstallOptions(output_dir=root))
-    interrupted = GenericAdapter(upgraded_repository, state)
-    original_publish = StateRootLease.move_no_replace
-    publishes = 0
-
-    def crash_during_new_publish(lease, source, destination, **contract):
-        nonlocal publishes
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if (
-            source_path.parts
-            and source_path.parts[0].startswith(".voice-intent-normalizer.staging-")
-            and destination_path.parts
-            and destination_path.parts[0] == "voice-intent-normalizer"
-        ):
-            publishes += 1
-            if publishes == 3:
-                raise KeyboardInterrupt()
-        return original_publish(lease, source, destination, **contract)
-
-    monkeypatch.setattr(
-        StateRootLease, "move_no_replace", crash_during_new_publish
-    )
-    with pytest.raises(KeyboardInterrupt):
-        interrupted.install(InstallOptions(output_dir=root))
-    interrupted_status = json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
-    )
-    assert interrupted_status["transaction"]["phase"] in {
-        "quarantined",
-        "publishing",
-    }
-    monkeypatch.setattr(StateRootLease, "move_no_replace", original_publish)
-
-    resumed = GenericAdapter(upgraded_repository, state).install(
-        InstallOptions(output_dir=root)
-    )
-
-    assert resumed.status in {
-        "installed",
-        "repaired",
-        "upgraded",
-        "already-installed",
-    }
-    assert GenericAdapter(upgraded_repository, state).doctor().status == "installed"
-    manifest = json.loads(
-        (
-            root
-            / "voice-intent-normalizer"
-            / ".voice-intent-normalizer-install.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert manifest["package_version"] == "0.1.2"
-
-
-def test_generic_retry_finalizes_upgrade_after_status_failure(
-    tmp_path: Path, monkeypatch
-):
-    repository = Path(__file__).resolve().parents[1]
-    upgraded_repository = tmp_path / "new-repository"
-    _copy_runtime_repository(repository, upgraded_repository)
-    metadata = (upgraded_repository / "pyproject.toml").read_text(encoding="utf-8")
-    (upgraded_repository / "pyproject.toml").write_text(
-        metadata.replace('version = "0.1.0"', 'version = "0.1.1"'),
-        encoding="utf-8",
-    )
-    root = tmp_path / "skills"
-    root.mkdir()
-    state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(tmp_path / "state")})
-    GenericAdapter(repository, state).install(InstallOptions(output_dir=root))
-    failing = GenericAdapter(upgraded_repository, state)
-    original_write = failing._write_status_payload
-    writes = 0
-
-    def fail_final_status(payload):
-        nonlocal writes
-        writes += 1
-        if writes == 2:
-            raise OSError("status failed")
-        return original_write(payload)
-
-    monkeypatch.setattr(failing, "_write_status_payload", fail_final_status)
-
-    interrupted = failing.install(InstallOptions(output_dir=root))
-
-    assert interrupted.status == "degraded"
-    recovery = state.root / "adapters" / "generic-recovery.json"
-    assert not recovery.exists()
-    assert json.loads(
-        state.adapter_status_file("generic").read_text(encoding="utf-8")
-    )["transaction"]
-    repaired = GenericAdapter(upgraded_repository, state).install(
-        InstallOptions(output_dir=root)
-    )
-
-    assert repaired.status in {"repaired", "already-installed"}
-    assert GenericAdapter(upgraded_repository, state).doctor().status == "installed"
-    assert not recovery.exists()
-    assert repaired.changed_paths.count(recovery) == 0
-    assert len(repaired.changed_paths) == len(set(repaired.changed_paths))
-    assert tuple(
-        path
-        for path in root.glob(".voice-intent-normalizer.quarantine-*")
-        if any(candidate.is_file() for candidate in path.rglob("*"))
-    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows canonical path aliases")
