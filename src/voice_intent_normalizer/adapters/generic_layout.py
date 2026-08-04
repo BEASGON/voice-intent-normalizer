@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import stat
@@ -11,10 +13,14 @@ from pathlib import Path
 from types import MappingProxyType
 
 from voice_intent_normalizer.adapters.generic_contract import (
+    CapsuleRef,
+    GenerationRef,
+    StatusV5,
     build_manifest,
     canonical_json_bytes,
     manifest_digest,
     validate_manifest,
+    validate_status_v5,
 )
 from voice_intent_normalizer.paths import StatePaths
 
@@ -70,6 +76,18 @@ _GENERATION_FILES = (
     "src/voice_intent_normalizer/adapters/generic_layout.py",
 )
 _VERSION_PATTERN = re.compile(br'(?m)^version = "([^"\r\n]+)"$')
+_TRANSACTION_ID_PATTERN = re.compile(r"t-[0-9a-f]{32}")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+CAPSULE_PROTOCOL_VERSION = "1"
+TRANSACTION_PHASES = (
+    "generation-published",
+    "capsule-published",
+    "activation-pending",
+    "rollback-pending",
+    "deactivation-pending",
+    "capsule-retired",
+    "cleanup-pending",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,9 +144,11 @@ def capsule_source_files(repository: str | Path) -> dict[str, bytes]:
         for destination, source in _CAPSULE_SOURCES.items()
     }
     _enforce_source_limits(files)
-    package_version = _package_version(_read_direct_source(root, "pyproject.toml"))
     manifest = build_manifest(
-        "capsule", "voice-intent-normalizer", package_version, files
+        "capsule",
+        "voice-intent-normalizer",
+        CAPSULE_PROTOCOL_VERSION,
+        files,
     )
     result = {**files, "capsule.json": canonical_json_bytes(manifest)}
     return dict(sorted(result.items()))
@@ -200,6 +220,176 @@ def prepare_versioned_artifacts(
         files=MappingProxyType(dict(sorted(generation_files.items()))),
     )
     return VersionedArtifacts(capsule=capsule, generation=generation)
+
+
+def generation_ref_payload(artifact: VersionedArtifact) -> dict[str, object]:
+    """Return the canonical status reference for one prepared generation."""
+    if artifact.kind != "generation":
+        raise ValueError("generation reference requires a generation artifact")
+    return {
+        "generation_id": artifact.identifier,
+        "manifest_digest": artifact.manifest_digest,
+        "package_hash": artifact.package_hash,
+        "package_version": artifact.package_version,
+    }
+
+
+def status_v5_payload(
+    *,
+    capability: str,
+    capsule: CapsuleRef | VersionedArtifact,
+    active: GenerationRef | VersionedArtifact,
+    previous: GenerationRef | VersionedArtifact | None,
+    transaction_id: str | None = None,
+    transaction_phase: str | None = None,
+) -> dict[str, object]:
+    """Build one canonical V5 payload from already validated references."""
+    if isinstance(capsule, VersionedArtifact):
+        if capsule.kind != "capsule":
+            raise ValueError("invalid capsule reference")
+        capsule_payload = {
+            "protocol": 1,
+            "manifest_digest": capsule.manifest_digest,
+            "package_hash": capsule.package_hash,
+        }
+    else:
+        capsule_payload = {
+            "protocol": capsule.protocol,
+            "manifest_digest": capsule.manifest_digest,
+            "package_hash": capsule.package_hash,
+        }
+
+    def generation_payload(
+        value: GenerationRef | VersionedArtifact,
+    ) -> dict[str, object]:
+        if isinstance(value, VersionedArtifact):
+            return generation_ref_payload(value)
+        return {
+            "generation_id": value.generation_id,
+            "manifest_digest": value.manifest_digest,
+            "package_hash": value.package_hash,
+            "package_version": value.package_version,
+        }
+
+    if (transaction_id is None) != (transaction_phase is None):
+        raise ValueError("incomplete adapter transaction")
+    transaction = None
+    if transaction_id is not None:
+        if (
+            _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
+            or transaction_phase not in TRANSACTION_PHASES
+        ):
+            raise ValueError("invalid adapter transaction")
+        transaction = {"id": transaction_id, "phase": transaction_phase}
+    return {
+        "format": 5,
+        "layout": "versioned-v1",
+        "capability": capability,
+        "capsule": capsule_payload,
+        "active": generation_payload(active),
+        "previous": None if previous is None else generation_payload(previous),
+        "transaction": transaction,
+    }
+
+
+def canonical_status_v5(
+    payload: object, *, skill_root: Path, generations_root: Path
+) -> tuple[StatusV5, bytes]:
+    """Validate V5 status and require its sole canonical byte representation."""
+    status = validate_status_v5(
+        payload, skill_root=skill_root, generations_root=generations_root
+    )
+    rebuilt = status_v5_payload(
+        capability=status.capability,
+        capsule=status.capsule,
+        active=status.active,
+        previous=status.previous,
+        transaction_id=status.transaction_id,
+        transaction_phase=status.transaction_phase,
+    )
+    canonical = canonical_json_bytes(rebuilt)
+    if isinstance(payload, bytes) and payload != canonical:
+        raise ValueError("adapter status is not canonical")
+    if isinstance(payload, str) and payload.encode("utf-8") != canonical:
+        raise ValueError("adapter status is not canonical")
+    return status, canonical
+
+
+def validate_anchored_manifest(
+    payload: object,
+    *,
+    kind: str,
+    identifier: str,
+    expected_manifest_digest: str,
+    expected_package_hash: str,
+    expected_package_version: str | None = None,
+) -> Mapping[str, object]:
+    """Validate a manifest against a complete protected status reference."""
+    manifest = validate_manifest(payload)
+    canonical = canonical_json_bytes(manifest)
+    if isinstance(payload, bytes) and payload != canonical:
+        raise ValueError("artifact manifest is not canonical")
+    if (
+        manifest["kind"] != kind
+        or manifest["identifier"] != identifier
+        or manifest["package_hash"] != expected_package_hash
+        or manifest_digest(manifest) != expected_manifest_digest
+        or (
+            expected_package_version is not None
+            and manifest["package_version"] != expected_package_version
+        )
+    ):
+        raise ValueError("artifact manifest is not anchored by adapter status")
+    return manifest
+
+
+def recovery_marker_bytes(transaction_id: str, status_bytes: bytes) -> bytes:
+    """Return the minimal independent marker for one status transaction."""
+    if _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None:
+        raise ValueError("invalid recovery transaction id")
+    return canonical_json_bytes(
+        {
+            "status_digest": hashlib.sha256(status_bytes).hexdigest(),
+            "transaction_id": transaction_id,
+        }
+    )
+
+
+def validate_recovery_marker(
+    payload: bytes, *, transaction_id: str, status_bytes: bytes
+) -> None:
+    """Require a canonical marker bound to the exact authoritative status."""
+    try:
+        value = json.loads(
+            payload,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid adapter recovery marker") from exc
+    expected = recovery_marker_bytes(transaction_id, status_bytes)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"status_digest", "transaction_id"}
+        or value.get("transaction_id") != transaction_id
+        or not isinstance(value.get("status_digest"), str)
+        or _SHA256_PATTERN.fullmatch(str(value["status_digest"])) is None
+        or payload != expected
+    ):
+        raise ValueError("adapter recovery marker is not status anchored")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
 
 
 def _direct_repository(repository: str | Path) -> Path:

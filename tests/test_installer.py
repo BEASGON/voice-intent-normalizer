@@ -64,6 +64,38 @@ def generic_adapter(tmp_path: Path) -> GenericAdapter:
     return GenericAdapter(repository, state)
 
 
+@pytest.fixture
+def repository_v2(tmp_path: Path) -> Path:
+    source = Path(__file__).resolve().parents[1]
+    repository = tmp_path / "repository-v2"
+    shutil.copytree(
+        source,
+        repository,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".worktrees",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+        ),
+    )
+    pyproject = repository / "pyproject.toml"
+    original = pyproject.read_bytes()
+    assert b'version = "0.1.0"' in original
+    pyproject.write_bytes(
+        original.replace(b'version = "0.1.0"', b'version = "0.2.0"', 1)
+    )
+    return repository
+
+
+def _capsule_bytes(capsule: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(capsule).as_posix(): path.read_bytes()
+        for path in capsule.rglob("*")
+        if path.is_file()
+    }
+
+
 def _validated_installed_layout(
     adapter: GenericAdapter, skill_root: Path
 ) -> tuple[Path, Path, dict[str, object]]:
@@ -455,7 +487,14 @@ def test_first_capsule_publication_rejects_concurrently_appearing_target(
 
     assert result.status == "failed"
     assert (target / "racer.txt").read_text(encoding="utf-8") == "racer"
-    assert not generic_adapter.state_paths.adapter_status_file("generic").exists()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.transaction_phase == "generation-published"
+    assert layout.transaction.is_file()
 
 
 def test_first_install_smoke_failure_never_activates_status(
@@ -548,8 +587,8 @@ def test_first_install_status_failure_leaves_complete_inert_artifacts(
 
     assert result.status == "failed"
     assert not layout.status.exists()
-    assert layout.transaction.is_file()
-    assert (skill_root / "voice-intent-normalizer" / "capsule.json").is_file()
+    assert not layout.transaction.exists()
+    assert not (skill_root / "voice-intent-normalizer").exists()
     assert len(generations) == 1
     validate_manifest((generations[0] / "generation.json").read_bytes())
 
@@ -586,7 +625,13 @@ def test_transaction_parent_fsync_failure_reports_committed_marker(
     assert result.status == "failed"
     assert layout.transaction.is_file()
     assert result.changed_paths.count(layout.transaction) == 1
-    assert not tuple(layout.generations.glob("g-*"))
+    assert len(tuple(layout.generations.glob("g-*"))) == 1
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.transaction_phase == "generation-published"
     assert not (skill_root / "voice-intent-normalizer").exists()
 
 
@@ -623,14 +668,19 @@ def test_generation_parent_fsync_failure_preserves_recovery_anchor(
     assert failed.status == "failed"
     assert len(published) == 1
     assert layout.transaction.is_file()
-    assert not layout.status.exists()
+    pending = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert pending.transaction_phase == "generation-published"
     published_paths = {published[0], *published[0].rglob("*")}
     assert published_paths <= set(failed.changed_paths)
     assert all(failed.changed_paths.count(path) == 1 for path in published_paths)
 
     recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
 
-    assert recovered.status == "installed"
+    assert recovered.status in {"installed", "already-installed"}
     assert tuple(layout.generations.glob("g-*")) == published
     assert not layout.transaction.exists()
 
@@ -655,7 +705,12 @@ def test_generation_post_rename_validation_failure_reports_complete_publication(
     assert len(published) == 1
     assert (published[0] / "generation.json").is_file()
     assert layout.transaction.is_file()
-    assert not layout.status.exists()
+    pending = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert pending.transaction_phase == "generation-published"
     published_paths = {published[0], *published[0].rglob("*")}
     assert published_paths <= set(result.changed_paths)
     assert all(result.changed_paths.count(path) == 1 for path in published_paths)
@@ -679,7 +734,6 @@ def test_capsule_parent_fsync_failure_reports_complete_publication(
             not injected
             and Path(relative) == Path(".")
             and (capsule / "capsule.json").is_file()
-            and not layout.status.exists()
         ):
             injected = True
             raise OSError("injected capsule-parent fsync failure")
@@ -694,7 +748,12 @@ def test_capsule_parent_fsync_failure_reports_complete_publication(
     assert result.status == "failed"
     assert len(generations) == 1
     assert layout.transaction.is_file()
-    assert not layout.status.exists()
+    pending = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert pending.transaction_phase == "generation-published"
     published_paths = {
         capsule,
         *capsule.rglob("*"),
@@ -724,7 +783,12 @@ def test_capsule_post_rename_validation_failure_reports_complete_publication(
     assert len(generations) == 1
     assert (capsule / "capsule.json").is_file()
     assert layout.transaction.is_file()
-    assert not layout.status.exists()
+    pending = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert pending.transaction_phase == "generation-published"
     published_paths = {
         capsule,
         *capsule.rglob("*"),
@@ -808,7 +872,7 @@ def test_transaction_parent_fsync_failure_after_activation_is_committed(
     ).status == "already-installed"
 
 
-def test_post_activation_cleanup_failure_leaves_recoverable_transaction(
+def test_pre_activation_marker_cleanup_failure_leaves_recoverable_transaction(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
     monkeypatch: pytest.MonkeyPatch,
@@ -816,34 +880,39 @@ def test_post_activation_cleanup_failure_leaves_recoverable_transaction(
     skill_root = tmp_path / "skills"
     skill_root.mkdir()
     layout = generic_layout_paths(generic_adapter.state_paths)
-    original = generic_adapter._remove_first_install_transaction
+    original = generic_adapter._remove_recovery_marker
     injected = False
 
-    def fail_cleanup(*, missing_ok=False):
+    def fail_cleanup(*, missing_ok: bool):
         nonlocal injected
-        assert not missing_ok
+        assert missing_ok
         assert layout.status.is_file()
         assert layout.transaction.is_file()
         injected = True
-        raise OSError("injected post-activation cleanup failure")
+        raise OSError("injected pre-activation marker cleanup failure")
 
     monkeypatch.setattr(
-        generic_adapter, "_remove_first_install_transaction", fail_cleanup
+        generic_adapter, "_remove_recovery_marker", fail_cleanup
     )
 
     result = generic_adapter.install(InstallOptions(output_dir=skill_root))
-    _validated_installed_layout(generic_adapter, skill_root)
+    pending = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
 
     assert injected
-    assert result.status == "installed"
+    assert result.status == "failed"
+    assert pending.transaction_phase == "activation-pending"
     assert layout.transaction.is_file()
 
     monkeypatch.setattr(
-        generic_adapter, "_remove_first_install_transaction", original
+        generic_adapter, "_remove_recovery_marker", original
     )
     recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
 
-    assert recovered.status == "installed"
+    assert recovered.status in {"installed", "already-installed"}
     assert not layout.transaction.exists()
 
 
@@ -859,7 +928,13 @@ def test_no_fallible_artifact_validation_runs_after_status_activation(
 
     def reject_post_activation_validation(root, relative, artifact):
         if layout.status.exists():
-            raise OSError("injected post-activation validation failure")
+            status = validate_status_v5(
+                layout.status.read_bytes(),
+                skill_root=skill_root,
+                generations_root=layout.generations,
+            )
+            if status.transaction_id is None:
+                raise OSError("injected post-activation validation failure")
         return original(root, relative, artifact)
 
     monkeypatch.setattr(
@@ -872,6 +947,46 @@ def test_no_fallible_artifact_validation_runs_after_status_activation(
     _validated_installed_layout(generic_adapter, skill_root)
 
     assert result.status == "installed"
+
+
+def test_no_anchored_tree_validation_runs_after_terminal_activation(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = generic_adapter._validate_anchored_tree
+    terminal_validation_attempted = False
+
+    def reject_after_terminal(*args, **kwargs):
+        nonlocal terminal_validation_attempted
+        if layout.status.exists():
+            status = validate_status_v5(
+                layout.status.read_bytes(),
+                skill_root=skill_root,
+                generations_root=layout.generations,
+            )
+            if status.transaction_id is None:
+                terminal_validation_attempted = True
+                raise OSError("injected post-terminal anchored validation")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        generic_adapter, "_validate_anchored_tree", reject_after_terminal
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "installed"
+    assert not terminal_validation_attempted
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.transaction_id is None
 
 
 def test_outer_state_operation_teardown_failure_preserves_committed_install(
@@ -955,7 +1070,9 @@ def test_first_install_retry_adopts_only_transaction_anchored_artifacts(
     assert recovered.status == "installed"
     assert capsule.is_dir()
     assert generation.is_dir()
-    assert len(tuple(layout.generations.glob("g-*"))) == 1
+    generations = tuple(layout.generations.glob("g-*"))
+    assert len(generations) == 2
+    assert generation in generations
     assert not layout.transaction.exists()
 
 
@@ -1015,6 +1132,685 @@ def test_versioned_already_installed_is_a_zero_mutation_noop(
     assert after == before
     assert len(tuple(layout.generations.glob("g-*"))) == 1
     assert not tuple(layout.staging.iterdir())
+
+
+def test_upgrade_switches_complete_generation_and_keeps_previous(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    first = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    assert first.status == "installed"
+    capsule = skill_root / "voice-intent-normalizer"
+    capsule_before = _capsule_bytes(capsule)
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    before = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+
+    upgraded_adapter = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    result = upgraded_adapter.install(InstallOptions(output_dir=skill_root))
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+
+    assert result.status == "upgraded"
+    assert status.active.package_version == "0.2.0"
+    assert status.previous is not None
+    assert status.previous.package_version == "0.1.0"
+    assert status.previous.generation_id == before.active.generation_id
+    assert status.transaction_id is None
+    assert (layout.generations / status.active.generation_id).is_dir()
+    assert (layout.generations / status.previous.generation_id).is_dir()
+    assert _capsule_bytes(capsule) == capsule_before
+
+
+def test_failed_upgrade_activation_leaves_previous_generation_selected(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    before = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    upgraded_adapter = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    original_write = upgraded_adapter._write_status_payload
+
+    def fail_terminal_activation(payload: dict[str, object]) -> None:
+        active = payload.get("active")
+        if (
+            payload.get("transaction") is None
+            and isinstance(active, dict)
+            and active.get("package_version") == "0.2.0"
+        ):
+            raise OSError("injected activation failure")
+        original_write(payload)
+
+    monkeypatch.setattr(
+        upgraded_adapter, "_write_status_payload", fail_terminal_activation
+    )
+    result = upgraded_adapter.install(InstallOptions(output_dir=skill_root))
+    interrupted = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+
+    assert result.status == "failed"
+    assert interrupted.active.generation_id == before.active.generation_id
+    assert interrupted.active.package_version == "0.1.0"
+    assert interrupted.previous is not None
+    assert interrupted.previous.package_version == "0.2.0"
+    assert interrupted.transaction_phase == "activation-pending"
+
+
+def test_failed_upgrade_smoke_leaves_status_and_generations_unchanged(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status_before = layout.status.read_bytes()
+    generations_before = tuple(layout.generations.iterdir())
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    smoke_attempted = False
+
+    def fail_smoke(capsule, generation) -> None:
+        nonlocal smoke_attempted
+        assert capsule.kind == "capsule"
+        assert generation.package_version == "0.2.0"
+        smoke_attempted = True
+        raise ValueError("injected candidate smoke failure")
+
+    monkeypatch.setattr(upgraded, "_smoke_generation", fail_smoke)
+
+    result = upgraded.install(InstallOptions(output_dir=skill_root))
+
+    assert smoke_attempted
+    assert result.status == "failed"
+    assert layout.status.read_bytes() == status_before
+    assert tuple(layout.generations.iterdir()) == generations_before
+
+
+def test_doctor_validates_active_previous_and_capsule_anchors(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    upgraded_adapter = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    assert upgraded_adapter.install(
+        InstallOptions(output_dir=skill_root)
+    ).status == "upgraded"
+    assert upgraded_adapter.doctor().status == "installed"
+
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.previous is not None
+    previous_file = layout.generations / status.previous.generation_id / "LICENSE"
+    previous_file.write_bytes(b"tampered previous generation")
+
+    result = upgraded_adapter.doctor()
+    after = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert result.status == "degraded"
+    assert after.active.generation_id == status.active.generation_id
+
+
+@pytest.mark.parametrize(
+    "bad_status",
+    (
+        b'{"format":5,"format":5}',
+        b'{"format":6}',
+        b"not-json",
+    ),
+)
+def test_doctor_rejects_malformed_duplicate_or_future_status_without_reanchoring(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    bad_status: bytes,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    layout.status.write_bytes(bad_status)
+
+    result = generic_adapter.doctor()
+
+    assert result.status == "degraded"
+    assert layout.status.read_bytes() == bad_status
+
+
+def test_doctor_reports_missing_status_without_reanchoring_capsule(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    capsule_before = _capsule_bytes(skill_root / "voice-intent-normalizer")
+    layout.status.unlink()
+
+    result = generic_adapter.doctor()
+
+    assert result.status == "degraded"
+    assert not layout.status.exists()
+    assert _capsule_bytes(skill_root / "voice-intent-normalizer") == capsule_before
+
+
+@pytest.mark.parametrize(
+    "bad_manifest",
+    (b'{"format":1,"format":1}', b'{"format":2}', b"not-json"),
+)
+def test_doctor_rejects_malformed_duplicate_or_future_generation_manifest(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    bad_manifest: bytes,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status_before = layout.status.read_bytes()
+    status = validate_status_v5(
+        status_before,
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    manifest = layout.generations / status.active.generation_id / "generation.json"
+    manifest.write_bytes(bad_manifest)
+
+    result = generic_adapter.doctor()
+
+    assert result.status == "degraded"
+    assert layout.status.read_bytes() == status_before
+    assert manifest.read_bytes() == bad_manifest
+
+
+def test_doctor_rejects_unanchored_generation_reference_without_searching_names(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    payload = json.loads(layout.status.read_bytes())
+    active = payload["active"]
+    assert isinstance(active, dict)
+    active["generation_id"] = (
+        f"g-{active['package_hash']}-{'f' * 32}"
+    )
+    unanchored = canonical_json_bytes(payload)
+    layout.status.write_bytes(unanchored)
+
+    result = generic_adapter.doctor()
+
+    assert result.status == "degraded"
+    assert layout.status.read_bytes() == unanchored
+
+
+def test_uninstall_removes_only_anchored_private_state_and_preserves_shared_data(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    upgraded_adapter = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    assert upgraded_adapter.install(
+        InstallOptions(output_dir=skill_root)
+    ).status == "upgraded"
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.previous is not None
+    anchored = {status.active.generation_id, status.previous.generation_id}
+    unrelated_generation = layout.generations / "unrelated-adapter-state"
+    unrelated_generation.mkdir()
+    (unrelated_generation / "owned-elsewhere").write_text("keep", encoding="utf-8")
+    shared = generic_adapter.state_paths.personal_file
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text('{"alias":"keep"}\n', encoding="utf-8")
+    other_status = generic_adapter.state_paths.root / "adapters" / "other.json"
+    other_status.write_text('{"owner":"other"}', encoding="utf-8")
+
+    result = upgraded_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+
+    assert result.status == "uninstalled"
+    assert upgraded_adapter.doctor().status == "not-installed"
+    assert not (skill_root / "voice-intent-normalizer").exists()
+    assert not layout.status.exists()
+    assert all(
+        not (layout.generations / generation_id).exists()
+        for generation_id in anchored
+    )
+    assert (unrelated_generation / "owned-elsewhere").read_text(
+        encoding="utf-8"
+    ) == "keep"
+    assert shared.read_text(encoding="utf-8") == '{"alias":"keep"}\n'
+    assert other_status.read_text(encoding="utf-8") == '{"owner":"other"}'
+
+
+def test_uninstall_refuses_unknown_capsule_entry_without_deleting_it(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    capsule = skill_root / "voice-intent-normalizer"
+    unknown = capsule / "owned-by-someone-else.txt"
+    unknown.write_text("preserve", encoding="utf-8")
+
+    result = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+
+    assert result.status in {"failed", "degraded"}
+    assert unknown.read_text(encoding="utf-8") == "preserve"
+    assert capsule.is_dir()
+
+
+def test_capsule_identity_replacement_during_retirement_is_never_deleted(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    original_publish = StateRootLease.publish_directory_no_replace
+    saved_original = skill_root / "saved-original-capsule"
+    replacement_bytes = b"third-party replacement"
+    injected = False
+
+    def replace_tombstone_after_commit(
+        lease,
+        source,
+        destination,
+        expected_identity,
+        *,
+        on_committed=None,
+    ):
+        nonlocal injected
+        if Path(source) != Path("voice-intent-normalizer"):
+            return original_publish(
+                lease,
+                source,
+                destination,
+                expected_identity,
+                on_committed=on_committed,
+            )
+
+        def replace_published_identity() -> None:
+            nonlocal injected
+            if on_committed is not None:
+                on_committed()
+            tombstone = skill_root / Path(destination)
+            tombstone.rename(saved_original)
+            tombstone.mkdir()
+            (tombstone / "replacement.txt").write_bytes(replacement_bytes)
+            injected = True
+
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=replace_published_identity,
+        )
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "publish_directory_no_replace",
+        replace_tombstone_after_commit,
+    )
+
+    result = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+
+    assert injected
+    assert result.status in {"failed", "degraded"}
+    candidates = tuple(skill_root.glob(".voice-intent-normalizer.retired-*")) + (
+        skill_root / "voice-intent-normalizer",
+    )
+    replacement = next(
+        candidate / "replacement.txt"
+        for candidate in candidates
+        if (candidate / "replacement.txt").is_file()
+    )
+    assert replacement.read_bytes() == replacement_bytes
+    assert (saved_original / "capsule.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("generation-published", "capsule-published", "activation-pending"),
+)
+def test_first_install_recovery_is_idempotent_after_each_activation_phase(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    original = generic_adapter._write_transaction_status
+    interrupted = False
+
+    def interrupt_after_phase(root: Path, payload: dict[str, object]) -> None:
+        nonlocal interrupted
+        original(root, payload)
+        transaction = payload.get("transaction")
+        if (
+            not interrupted
+            and isinstance(transaction, dict)
+            and transaction.get("phase") == phase
+        ):
+            interrupted = True
+            raise OSError(f"injected interruption after {phase}")
+
+    monkeypatch.setattr(
+        generic_adapter, "_write_transaction_status", interrupt_after_phase
+    )
+    failed = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    monkeypatch.setattr(
+        generic_adapter, "_write_transaction_status", original
+    )
+
+    assert interrupted
+    assert failed.status == "failed"
+    recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert recovered.status in {"installed", "already-installed"}
+    assert status.active.package_version == "0.1.0"
+    assert status.transaction_id is None
+    assert generic_adapter.doctor().status == "installed"
+
+
+@pytest.mark.parametrize(
+    "phase", ("generation-published", "activation-pending")
+)
+def test_upgrade_recovery_completes_only_a_fully_anchored_candidate(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    original = upgraded._write_transaction_status
+    interrupted = False
+
+    def interrupt_after_phase(root: Path, payload: dict[str, object]) -> None:
+        nonlocal interrupted
+        original(root, payload)
+        transaction = payload.get("transaction")
+        if (
+            not interrupted
+            and isinstance(transaction, dict)
+            and transaction.get("phase") == phase
+        ):
+            interrupted = True
+            raise OSError(f"injected interruption after {phase}")
+
+    monkeypatch.setattr(upgraded, "_write_transaction_status", interrupt_after_phase)
+    assert upgraded.install(InstallOptions(output_dir=skill_root)).status == "failed"
+    monkeypatch.setattr(upgraded, "_write_transaction_status", original)
+
+    assert interrupted
+    assert upgraded.doctor().status == "installed"
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.active.package_version == "0.2.0"
+    assert status.previous is not None
+    assert status.previous.package_version == "0.1.0"
+    assert status.transaction_id is None
+
+
+def test_recovery_rolls_back_a_tampered_candidate_through_rollback_pending(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    original = upgraded._write_transaction_status
+
+    def stop_activation(root: Path, payload: dict[str, object]) -> None:
+        original(root, payload)
+        transaction = payload.get("transaction")
+        if isinstance(transaction, dict) and transaction.get("phase") == (
+            "activation-pending"
+        ):
+            raise OSError("injected activation interruption")
+
+    monkeypatch.setattr(upgraded, "_write_transaction_status", stop_activation)
+    assert upgraded.install(InstallOptions(output_dir=skill_root)).status == "failed"
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    pending = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert pending.previous is not None
+    candidate_file = (
+        layout.generations / pending.previous.generation_id / "LICENSE"
+    )
+    candidate_file.write_bytes(b"tampered candidate")
+    rollback_seen = False
+
+    def stop_rollback(root: Path, payload: dict[str, object]) -> None:
+        nonlocal rollback_seen
+        original(root, payload)
+        transaction = payload.get("transaction")
+        if isinstance(transaction, dict) and transaction.get("phase") == (
+            "rollback-pending"
+        ):
+            rollback_seen = True
+            raise OSError("injected rollback interruption")
+
+    monkeypatch.setattr(upgraded, "_write_transaction_status", stop_rollback)
+    assert upgraded.doctor().status == "degraded"
+    monkeypatch.setattr(upgraded, "_write_transaction_status", original)
+    assert rollback_seen
+    assert upgraded.doctor().status == "installed"
+    restored = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    assert restored.active.package_version == "0.1.0"
+    assert restored.previous is None
+    assert restored.transaction_id is None
+
+
+@pytest.mark.parametrize(
+    "phase", ("deactivation-pending", "capsule-retired", "cleanup-pending")
+)
+def test_uninstall_recovery_completes_each_deactivation_phase(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    original = generic_adapter._write_transaction_status
+    interrupted = False
+
+    def interrupt_after_phase(root: Path, payload: dict[str, object]) -> None:
+        nonlocal interrupted
+        original(root, payload)
+        transaction = payload.get("transaction")
+        if (
+            not interrupted
+            and isinstance(transaction, dict)
+            and transaction.get("phase") == phase
+        ):
+            interrupted = True
+            raise OSError(f"injected interruption after {phase}")
+
+    monkeypatch.setattr(
+        generic_adapter, "_write_transaction_status", interrupt_after_phase
+    )
+    first = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+    monkeypatch.setattr(
+        generic_adapter, "_write_transaction_status", original
+    )
+
+    assert interrupted
+    assert first.status == "degraded"
+    retry = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+    assert retry.status in {"uninstalled", "not-installed"}
+    assert generic_adapter.doctor().status == "not-installed"
+    assert not (skill_root / "voice-intent-normalizer").exists()
+
+
+def test_uninstall_recovery_finishes_generation_cleanup_and_status_removal(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    assert upgraded.install(InstallOptions(output_dir=skill_root)).status == "upgraded"
+    original_retire = upgraded._retire_generation
+    retired_once = False
+
+    def stop_after_one_generation(reference, transaction_id):
+        nonlocal retired_once
+        original_retire(reference, transaction_id)
+        if not retired_once:
+            retired_once = True
+            raise OSError("injected generation cleanup interruption")
+
+    monkeypatch.setattr(upgraded, "_retire_generation", stop_after_one_generation)
+    assert upgraded.uninstall(
+        UninstallOptions(output_dir=skill_root)
+    ).status == "degraded"
+    monkeypatch.setattr(upgraded, "_retire_generation", original_retire)
+    original_remove = upgraded._remove_status
+    removed = False
+
+    def stop_after_status_removal() -> None:
+        nonlocal removed
+        original_remove()
+        removed = True
+        raise OSError("injected status removal interruption")
+
+    monkeypatch.setattr(upgraded, "_remove_status", stop_after_status_removal)
+    assert upgraded.uninstall(
+        UninstallOptions(output_dir=skill_root)
+    ).status == "degraded"
+    monkeypatch.setattr(upgraded, "_remove_status", original_remove)
+    assert retired_once and removed
+    assert upgraded.uninstall(
+        UninstallOptions(output_dir=skill_root)
+    ).status == "not-installed"
+    assert upgraded.doctor().status == "not-installed"
+
+
+def test_doctor_rejects_unanchored_recovery_marker_without_mutating_it(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    marker = generic_layout_paths(generic_adapter.state_paths).transaction
+    bad_marker = (
+        b'{"status_digest":"'
+        + b"0" * 64
+        + b'","transaction_id":"t-'
+        + b"1" * 32
+        + b'"}'
+    )
+    marker.write_bytes(bad_marker)
+
+    result = generic_adapter.doctor()
+
+    assert result.status == "degraded"
+    assert marker.read_bytes() == bad_marker
 
 
 def test_versioned_strict_mode_fails_before_any_mutation(
@@ -1197,9 +1993,9 @@ def test_generic_keeps_identity_bound_package_when_status_recording_fails(
 
     layout = generic_layout_paths(state)
     assert result.status == "failed"
-    assert (root / "voice-intent-normalizer" / "capsule.json").is_file()
+    assert not (root / "voice-intent-normalizer").exists()
     assert len(tuple(layout.generations.glob("g-*"))) == 1
-    assert layout.transaction.is_file()
+    assert not layout.transaction.exists()
     assert not layout.status.exists()
 
 
@@ -1395,7 +2191,7 @@ def test_generic_success_and_noop_never_leave_source_hardlinks(
 
     assert first.status == "installed"
     assert second.status == "already-installed"
-    assert not tuple(root.glob(".voice-intent-normalizer.staging-*"))
+    assert not tuple(root.glob(".voice-intent-normalizer.capsule-*"))
     assert not tuple(generic_layout_paths(state).staging.iterdir())
     assert os.stat(root / "voice-intent-normalizer" / "SKILL.md").st_nlink == 1
 
@@ -1552,7 +2348,7 @@ def test_generic_rejects_invalid_prepared_package_without_final_runtime_names(
     assert not layout.transaction.exists()
     assert not layout.status.exists()
     assert not tuple(layout.staging.glob("*"))
-    assert not tuple(root.glob(".voice-intent-normalizer.staging-*"))
+    assert not tuple(root.glob(".voice-intent-normalizer.capsule-*"))
 
 
 def test_installer_detect_and_doctor_isolate_exceptions_and_preserve_order():
@@ -1705,11 +2501,11 @@ def test_generic_staging_copy_never_writes_into_a_swapped_directory(
         original_write(lease, relative, data)
         relative_path = Path(relative)
         if (
-            not swapped
-            and relative_path.parts
-            and relative_path.parts[0].startswith(
-                ".voice-intent-normalizer.staging-"
-            )
+                not swapped
+                and relative_path.parts
+                and relative_path.parts[0].startswith(
+                    ".voice-intent-normalizer.capsule-"
+                )
         ):
             staging = root / relative_path.parts[0]
             try:
@@ -1726,7 +2522,7 @@ def test_generic_staging_copy_never_writes_into_a_swapped_directory(
     result = adapter.install(InstallOptions(output_dir=root))
 
     if swapped:
-        staging = next(root.glob(".voice-intent-normalizer.staging-*"))
+        staging = next(root.glob(".voice-intent-normalizer.capsule-*"))
         assert result.status == "failed"
         assert (staging / "keep.txt").read_text(encoding="utf-8") == "keep"
         assert {path.name for path in staging.iterdir()} == {"keep.txt"}
@@ -1898,42 +2694,7 @@ def test_generic_status_rejects_non_generic_capabilities(
     result = adapter.doctor()
 
     assert result.status == "degraded"
-    assert result.capability is CapabilityLevel.MANUAL
-
-
-@pytest.mark.parametrize("relative", [r"..\outside.txt", "../outside.txt"])
-def test_generic_manifest_rejects_mixed_separator_traversal(relative: str):
-    assert GenericAdapter._manifest_files({"files": [relative]}) is None
-
-
-@pytest.mark.parametrize(
-    "relative",
-    [
-        r"C:\outside.txt",
-        "C:/outside.txt",
-        r"\\server\share\outside.txt",
-        "//server/share/outside.txt",
-        "name:stream",
-        "CON",
-        "dir/NUL.txt",
-        "trailing.",
-        "trailing ",
-        "a//b",
-        "/absolute",
-    ],
-)
-def test_generic_manifest_rejects_nonportable_paths(relative: str):
-    assert GenericAdapter._manifest_files({"files": [relative]}) is None
-
-
-def test_generic_manifest_rejects_excessive_size_and_depth():
-    too_long = "a" * 513
-    too_deep = "/".join("a" for _ in range(33))
-    too_many = [f"file-{index}" for index in range(4097)]
-
-    assert GenericAdapter._manifest_files({"files": [too_long]}) is None
-    assert GenericAdapter._manifest_files({"files": [too_deep]}) is None
-    assert GenericAdapter._manifest_files({"files": too_many}) is None
+    assert result.capability is CapabilityLevel.UNAVAILABLE
 
 
 def test_generic_runtime_does_not_require_python_311_tomllib():
