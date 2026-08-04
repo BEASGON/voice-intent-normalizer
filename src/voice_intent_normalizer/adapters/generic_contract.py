@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Mapping, Sized
 from dataclasses import dataclass
@@ -36,6 +37,16 @@ _TRANSACTION_PHASES = frozenset(
         "cleanup-pending",
     }
 )
+_STATUS_FIELDS = {
+    "format",
+    "layout",
+    "selected_skill_root",
+    "capability",
+    "capsule",
+    "active",
+    "previous",
+    "transaction",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +78,7 @@ class StatusV5:
     previous: GenerationRef | None
     transaction_id: str | None
     transaction_phase: str | None
+    selected_skill_root: Path
     capsule_root: Path
     active_root: Path
     previous_root: Path | None
@@ -151,15 +163,9 @@ def validate_status_v5(
 ) -> StatusV5:
     """Validate V5 status and derive paths without accepting JSON path strings."""
     value = _json_value(payload, "adapter status")
-    value = _mapping_with_fields(value, {
-        "format",
-        "layout",
-        "capability",
-        "capsule",
-        "active",
-        "previous",
-        "transaction",
-    }, "invalid adapter status fields")
+    value = _mapping_with_fields(
+        value, _STATUS_FIELDS, "invalid adapter status fields"
+    )
     if value["format"] != STATUS_FORMAT or type(value["format"]) is not int:
         raise ValueError("unsupported adapter status format")
     if value["layout"] != LAYOUT_NAME:
@@ -168,6 +174,11 @@ def validate_status_v5(
         raise ValueError("invalid generic adapter capability")
     if not isinstance(skill_root, Path) or not isinstance(generations_root, Path):
         raise ValueError("trusted roots must be paths")
+    selected_skill_root = _validate_selected_skill_root(
+        value["selected_skill_root"]
+    )
+    if not _same_selected_skill_root(selected_skill_root, skill_root):
+        raise ValueError("selected skill root does not match trusted root")
     capsule = _validate_capsule(value["capsule"])
     active = _validate_generation_ref(value["active"], "active generation")
     previous_value = value["previous"]
@@ -191,10 +202,24 @@ def validate_status_v5(
         previous=previous,
         transaction_id=transaction_id,
         transaction_phase=transaction_phase,
+        selected_skill_root=selected_skill_root,
         capsule_root=capsule_root,
         active_root=active_root,
         previous_root=previous_root,
     )
+
+
+def status_skill_root(payload: object) -> Path:
+    """Extract only the canonical protected skill-root selector from V5 status."""
+    value = _json_value(payload, "adapter status")
+    value = _mapping_with_fields(
+        value, _STATUS_FIELDS, "invalid adapter status fields"
+    )
+    if value["format"] != STATUS_FORMAT or type(value["format"]) is not int:
+        raise ValueError("unsupported adapter status format")
+    if value["layout"] != LAYOUT_NAME:
+        raise ValueError("unsupported adapter status layout")
+    return _validate_selected_skill_root(value["selected_skill_root"])
 
 
 def _manifest_mapping(
@@ -373,6 +398,23 @@ def _validate_version(value: object) -> None:
         or any(ord(character) < 0x20 for character in value)
     ):
         raise ValueError("invalid package version")
+
+
+def _validate_selected_skill_root(value: object) -> Path:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("invalid selected skill root")
+    selected = Path(value)
+    if not selected.is_absolute() or os.fspath(selected) != value:
+        raise ValueError("invalid selected skill root")
+    return selected
+
+
+def _same_selected_skill_root(selected: Path, trusted: Path) -> bool:
+    selected_value = os.fspath(selected)
+    trusted_value = os.fspath(trusted)
+    if os.name == "nt":
+        return os.path.normcase(selected_value) == os.path.normcase(trusted_value)
+    return selected_value == trusted_value
 
 
 def _validate_relative_path(value: str) -> None:

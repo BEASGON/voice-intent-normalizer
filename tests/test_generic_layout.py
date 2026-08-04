@@ -15,6 +15,7 @@ from voice_intent_normalizer.adapters.generic_contract import (
     build_manifest,
     canonical_json_bytes,
     manifest_digest,
+    status_skill_root,
     validate_manifest,
     validate_status_v5,
 )
@@ -42,10 +43,11 @@ def _manifest() -> dict[str, object]:
     }
 
 
-def _status() -> dict[str, object]:
+def _status(skill_root: Path) -> dict[str, object]:
     return {
         "format": 5,
         "layout": "versioned-v1",
+        "selected_skill_root": str(skill_root),
         "capability": "manual",
         "capsule": {
             "protocol": 1,
@@ -156,7 +158,7 @@ def test_manifest_round_trip_anchors_status_without_a_hash_fixed_point(
     manifest = build_manifest(
         "generation", generation_id, "1.2.3", {"SKILL.md": b"skill"}
     )
-    status = _status()
+    status = _status(tmp_path / "skills")
     status["active"] = {
         "generation_id": generation_id,
         "manifest_digest": manifest_digest(manifest),
@@ -323,7 +325,7 @@ def test_validate_status_v5_reconstructs_roots_from_trusted_skill_root(tmp_path:
 
     generations = tmp_path / "state" / "adapters" / "generic" / "generations"
     status = validate_status_v5(
-        _status(), skill_root=skill_root, generations_root=generations
+        _status(skill_root), skill_root=skill_root, generations_root=generations
     )
 
     assert status.capsule_root == skill_root / "voice-intent-normalizer"
@@ -331,9 +333,54 @@ def test_validate_status_v5_reconstructs_roots_from_trusted_skill_root(tmp_path:
     assert status.previous_root == generations / _PREVIOUS_GENERATION_ID
 
 
+def test_validate_status_v5_requires_matching_selected_skill_root(tmp_path: Path):
+    """Catch protected status omitting or redirecting its durable skill root."""
+    skill_root = tmp_path / "skills"
+    payload = _status(skill_root)
+
+    status = validate_status_v5(
+        payload,
+        skill_root=skill_root,
+        generations_root=tmp_path / "state" / "generations",
+    )
+
+    assert status.selected_skill_root == skill_root
+
+
+def test_validate_status_v5_rejects_a_mismatched_selected_skill_root(
+    tmp_path: Path,
+):
+    """Catch full status validation trusting a selector over its retained root."""
+    trusted = tmp_path / "skills"
+    redirected = tmp_path / "other-skills"
+
+    with pytest.raises(ValueError):
+        validate_status_v5(
+            _status(redirected),
+            skill_root=trusted,
+            generations_root=tmp_path / "state" / "generations",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), (("format", 6), ("layout", "versioned-v2"))
+)
+def test_status_skill_root_rejects_unsupported_status_selector(
+    tmp_path: Path, field: str, value: object
+):
+    """Catch future status selecting a filesystem root before full validation."""
+    payload = _status(tmp_path / "skills")
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        status_skill_root(canonical_json_bytes(payload))
+
+
 @pytest.mark.parametrize(
     "mutate",
     (
+        lambda status: status.pop("selected_skill_root"),
+        lambda status: status.__setitem__("selected_skill_root", "relative/root"),
         lambda status: status.__setitem__("unexpected", True),
         lambda status: status.__setitem__("format", 6),
         lambda status: status["active"].__setitem__("generation_id", "../escape"),
@@ -345,13 +392,14 @@ def test_validate_status_v5_rejects_unanchored_or_future_references(
     tmp_path: Path, mutate
 ):
     """Catch a future, aliased, or duplicate generation becoming selectable."""
-    status = _status()
+    skill_root = tmp_path / "skills"
+    status = _status(skill_root)
     mutate(status)
 
     with pytest.raises(ValueError):
         validate_status_v5(
             status,
-            skill_root=tmp_path / "skills",
+            skill_root=skill_root,
             generations_root=tmp_path / "state" / "generations",
         )
 

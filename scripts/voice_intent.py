@@ -313,6 +313,7 @@ def _protected_capsule_digest(payload) -> str:
     if not isinstance(payload, dict) or set(payload) != {
         "format",
         "layout",
+        "selected_skill_root",
         "capability",
         "capsule",
         "active",

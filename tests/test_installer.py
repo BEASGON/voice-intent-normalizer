@@ -1289,6 +1289,220 @@ def test_doctor_validates_active_previous_and_capsule_anchors(
     assert after.active.generation_id == status.active.generation_id
 
 
+def test_fresh_installer_doctor_uses_protected_selected_skill_root(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    repository = Path(__file__).resolve().parents[1]
+    fresh = Installer(
+        {"generic": GenericAdapter(repository, generic_adapter.state_paths)}
+    )
+
+    result = fresh.doctor(("generic",))[0]
+
+    assert result.status == "installed"
+    assert "shared state: available" in result.messages
+
+
+def test_cli_doctor_uses_protected_root_with_a_fresh_installer(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    from io import StringIO
+
+    from voice_intent_normalizer import cli
+
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    fresh = cli.default_installer(generic_adapter.state_paths)
+    stdout = StringIO()
+
+    code = cli.main(
+        ["doctor", "--platform", "generic", "--json"],
+        service=object(),
+        installer=fresh,
+        stdout=stdout,
+    )
+
+    assert code == 0
+    assert json.loads(stdout.getvalue())[0]["status"] == "installed"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("tampered", "relative", "unc-network", "mapped-drive", "ads", "mismatch"),
+)
+def test_fresh_doctor_rejects_unsafe_selected_roots_without_mutation(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    status_path = generic_layout_paths(generic_adapter.state_paths).status
+    payload = json.loads(status_path.read_bytes())
+    if corruption == "tampered":
+        selected: object = 7
+    elif corruption == "relative":
+        selected = "relative/skills"
+    elif corruption == "unc-network":
+        selected = r"\\server\share\skills"
+    elif corruption == "mapped-drive":
+        selected = r"Z:\mapped\skills"
+        if os.name == "nt":
+            original_drive_type = paths_module._windows_drive_type
+            monkeypatch.setattr(
+                paths_module,
+                "_windows_drive_type",
+                lambda root: 4
+                if str(root).casefold().startswith("z:")
+                else original_drive_type(root),
+            )
+    elif corruption == "ads":
+        selected = f"{skill_root}:stream"
+    else:
+        redirected = tmp_path / "other-skills"
+        redirected.mkdir()
+        selected = str(redirected)
+    payload["selected_skill_root"] = selected
+    tampered = canonical_json_bytes(payload)
+    status_path.write_bytes(tampered)
+    repository = Path(__file__).resolve().parents[1]
+    fresh = Installer(
+        {"generic": GenericAdapter(repository, generic_adapter.state_paths)}
+    )
+
+    result = fresh.doctor(("generic",))[0]
+
+    assert result.status == "degraded"
+    assert status_path.read_bytes() == tampered
+    assert (skill_root / "voice-intent-normalizer").is_dir()
+
+
+def test_fresh_doctor_rejects_selected_root_alias_without_mutation(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    alias = tmp_path / "skills-alias"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(skill_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert created.returncode == 0, created.stderr
+    else:
+        alias.symlink_to(skill_root, target_is_directory=True)
+    status_path = generic_layout_paths(generic_adapter.state_paths).status
+    payload = json.loads(status_path.read_bytes())
+    payload["selected_skill_root"] = str(alias)
+    tampered = canonical_json_bytes(payload)
+    status_path.write_bytes(tampered)
+    repository = Path(__file__).resolve().parents[1]
+    fresh = Installer(
+        {"generic": GenericAdapter(repository, generic_adapter.state_paths)}
+    )
+
+    try:
+        result = fresh.doctor(("generic",))[0]
+    finally:
+        if os.name == "nt":
+            os.rmdir(alias)
+        else:
+            alias.unlink()
+
+    assert result.status == "degraded"
+    assert status_path.read_bytes() == tampered
+    assert (skill_root / "voice-intent-normalizer").is_dir()
+
+
+def test_public_doctor_stays_degraded_when_capsule_reports_degraded_shared_state(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    repository = Path(__file__).resolve().parents[1]
+    fresh_adapter = GenericAdapter(repository, generic_adapter.state_paths)
+    diagnostic = {
+        "status": "degraded",
+        "state_root": str(generic_adapter.state_paths.root),
+        "diagnostics": ["state_unavailable"],
+    }
+    monkeypatch.setattr(
+        fresh_adapter,
+        "_run_capsule",
+        lambda _capsule, _state, _working: subprocess.CompletedProcess(
+            args=("capsule", "doctor", "--json"),
+            returncode=0,
+            stdout=json.dumps(diagnostic),
+            stderr="",
+        ),
+    )
+
+    result = Installer({"generic": fresh_adapter}).doctor(("generic",))[0]
+
+    assert result.status == "degraded"
+    assert "shared state: available" not in result.messages
+
+
+def test_public_doctor_requires_complete_bootstrap_diagnostic_protocol(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    repository = Path(__file__).resolve().parents[1]
+    fresh_adapter = GenericAdapter(repository, generic_adapter.state_paths)
+    monkeypatch.setattr(
+        fresh_adapter,
+        "_run_capsule",
+        lambda _capsule, _state, _working: subprocess.CompletedProcess(
+            args=("capsule", "doctor", "--json"),
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "ok",
+                    "state_root": str(tmp_path / "wrong-state"),
+                    "diagnostics": [],
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    result = Installer({"generic": fresh_adapter}).doctor(("generic",))[0]
+
+    assert result.status == "degraded"
+    assert "shared state: available" not in result.messages
+
+
 @pytest.mark.parametrize(
     "bad_status",
     (

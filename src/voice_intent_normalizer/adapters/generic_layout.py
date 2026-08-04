@@ -236,6 +236,7 @@ def generation_ref_payload(artifact: VersionedArtifact) -> dict[str, object]:
 
 def status_v5_payload(
     *,
+    skill_root: Path,
     capability: str,
     capsule: CapsuleRef | VersionedArtifact,
     active: GenerationRef | VersionedArtifact,
@@ -284,6 +285,7 @@ def status_v5_payload(
     return {
         "format": 5,
         "layout": "versioned-v1",
+        "selected_skill_root": os.fspath(skill_root),
         "capability": capability,
         "capsule": capsule_payload,
         "active": generation_payload(active),
@@ -300,6 +302,7 @@ def canonical_status_v5(
         payload, skill_root=skill_root, generations_root=generations_root
     )
     rebuilt = status_v5_payload(
+        skill_root=status.selected_skill_root,
         capability=status.capability,
         capsule=status.capsule,
         active=status.active,

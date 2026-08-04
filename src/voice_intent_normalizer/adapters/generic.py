@@ -18,7 +18,12 @@ from pathlib import Path
 from ..paths import StatePaths, StateRootLease, guard_state_root, validate_state_root
 from ..updater import _retained_lease_update_lock
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
-from .generic_contract import GenerationRef, StatusV5, canonical_json_bytes
+from .generic_contract import (
+    GenerationRef,
+    StatusV5,
+    canonical_json_bytes,
+    status_skill_root,
+)
 from .generic_layout import (
     VersionedArtifact,
     VersionedArtifacts,
@@ -129,6 +134,7 @@ class GenericAdapter:
         ):
             if status.capability != capability.value:
                 payload = status_v5_payload(
+                    skill_root=status.selected_skill_root,
                     capability=capability.value,
                     capsule=status.capsule,
                     active=status.active,
@@ -153,6 +159,7 @@ class GenericAdapter:
         artifacts = self._prepare_versioned_artifacts(secrets.token_hex(16))
         self._smoke_generation(artifacts.capsule, artifacts.generation)
         payload = status_v5_payload(
+            skill_root=root,
             capability=self._capability(options).value,
             capsule=artifacts.capsule,
             active=artifacts.generation,
@@ -173,6 +180,7 @@ class GenericAdapter:
         payload = self._replace_phase(payload, "activation-pending")
         self._write_transaction_status(root, payload)
         final = status_v5_payload(
+            skill_root=root,
             capability=self._capability(options).value,
             capsule=artifacts.capsule,
             active=artifacts.generation,
@@ -197,6 +205,7 @@ class GenericAdapter:
         self._smoke_generation(artifacts.capsule, artifacts.generation)
         transaction_id = f"t-{secrets.token_hex(16)}"
         payload = status_v5_payload(
+            skill_root=status.selected_skill_root,
             capability=self._capability(options).value,
             capsule=status.capsule,
             active=status.active,
@@ -213,6 +222,7 @@ class GenericAdapter:
             payload = self._replace_phase(payload, "activation-pending")
             self._write_transaction_status(root, payload)
             final = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=self._capability(options).value,
                 capsule=status.capsule,
                 active=artifacts.generation,
@@ -250,6 +260,20 @@ class GenericAdapter:
             raise ValueError("installed capsule protocol differs from this build")
 
     def _read_versioned_status(self, root: Path) -> StatusV5 | None:
+        raw = self._read_status_bytes()
+        if raw is None:
+            return None
+        with guard_state_root(root) as skill_root_lease:
+            if not skill_root_lease.root_exists:
+                raise ValueError("selected skill root is unavailable")
+            status, _ = canonical_status_v5(
+                raw,
+                skill_root=skill_root_lease.root,
+                generations_root=generic_layout_paths(self.state_paths).generations,
+            )
+        return status
+
+    def _read_status_bytes(self) -> bytes | None:
         lease = self._state_lease()
         if (
             not lease.root_exists
@@ -257,13 +281,15 @@ class GenericAdapter:
             or not lease.exists(_STATUS_RELATIVE)
         ):
             return None
-        raw = lease.read_bytes(_STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status")
-        status, _ = canonical_status_v5(
-            raw,
-            skill_root=root,
-            generations_root=generic_layout_paths(self.state_paths).generations,
+        return lease.read_bytes(
+            _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
         )
-        return status
+
+    def _protected_skill_root(self) -> Path | None:
+        raw = self._read_status_bytes()
+        if raw is None:
+            return None
+        return self._safe_skill_root(status_skill_root(raw))
 
     def _read_required_status(self, root: Path) -> StatusV5:
         status = self._read_versioned_status(root)
@@ -384,6 +410,7 @@ class GenericAdapter:
                 raise ValueError("recovery marker is not status anchored")
             return
         status_payload = status_v5_payload(
+            skill_root=status.selected_skill_root,
             capability=status.capability,
             capsule=status.capsule,
             active=status.active,
@@ -493,6 +520,7 @@ class GenericAdapter:
                         return
                 self._validate_capsule_ref(root, status)
                 payload = status_v5_payload(
+                    skill_root=status.selected_skill_root,
                     capability=status.capability,
                     capsule=status.capsule,
                     active=status.active,
@@ -507,6 +535,7 @@ class GenericAdapter:
                 self._validate_generation_ref(status.previous)
             except Exception:
                 payload = status_v5_payload(
+                    skill_root=status.selected_skill_root,
                     capability=status.capability,
                     capsule=status.capsule,
                     active=status.active,
@@ -517,6 +546,7 @@ class GenericAdapter:
                 self._write_transaction_status(root, payload)
                 return
             payload = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=status.capability,
                 capsule=status.capsule,
                 active=status.active,
@@ -533,6 +563,7 @@ class GenericAdapter:
             self._validate_capsule_ref(root, status)
             self._validate_generation_ref(status.active)
             payload = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=status.capability,
                 capsule=status.capsule,
                 active=status.active,
@@ -554,6 +585,7 @@ class GenericAdapter:
                     self._validate_generation_ref(status.previous)
                 except Exception:
                     payload = status_v5_payload(
+                        skill_root=status.selected_skill_root,
                         capability=status.capability,
                         capsule=status.capsule,
                         active=status.active,
@@ -566,6 +598,7 @@ class GenericAdapter:
                 active = status.previous
                 previous = status.active
             final = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=status.capability,
                 capsule=status.capsule,
                 active=active,
@@ -578,6 +611,7 @@ class GenericAdapter:
             self._validate_capsule_ref(root, status)
             self._validate_generation_ref(status.active)
             final = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=status.capability,
                 capsule=status.capsule,
                 active=status.active,
@@ -614,12 +648,9 @@ class GenericAdapter:
                 return AdapterResult(
                     self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
                 )
-            return AdapterResult(
-                self.platform,
-                "degraded",
-                CapabilityLevel.UNAVAILABLE,
-                ("selected skill root is required to verify installed state",),
-            )
+            root = self._protected_skill_root()
+            if root is None:
+                raise ValueError("selected skill root is unavailable")
         root = self._safe_skill_root(root)
         status = self._read_versioned_status(root)
         if status is None:
@@ -728,6 +759,7 @@ class GenericAdapter:
         self._validate_complete_status(root, status, smoke=False)
         transaction_id = f"t-{secrets.token_hex(16)}"
         payload = status_v5_payload(
+            skill_root=status.selected_skill_root,
             capability=status.capability,
             capsule=status.capsule,
             active=status.active,
@@ -758,6 +790,7 @@ class GenericAdapter:
                 self._validate_generation_ref(status.previous)
             self._retire_capsule(root, status)
             payload = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=status.capability,
                 capsule=status.capsule,
                 active=status.active,
@@ -772,6 +805,7 @@ class GenericAdapter:
                 raise ValueError("capsule name was replaced after retirement")
             self._remove_retired_capsule(root, status)
             payload = status_v5_payload(
+                skill_root=status.selected_skill_root,
                 capability=status.capability,
                 capsule=status.capsule,
                 active=status.active,
@@ -1375,6 +1409,7 @@ class GenericAdapter:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
             status = status_v5_payload(
+                skill_root=capsule_root.parent,
                 capability=CapabilityLevel.MANUAL.value,
                 capsule=capsule,
                 active=generation,
@@ -1386,31 +1421,41 @@ class GenericAdapter:
             working = sandbox_root / "cwd"
             working.mkdir()
             result = self._run_capsule(capsule_root, state, working)
-        if result.returncode != 0:
-            raise ValueError("published generation smoke test failed")
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise ValueError("published generation smoke test failed") from exc
-        if not isinstance(payload, dict) or payload.get("status") not in {
-            "ok",
-            "degraded",
-        }:
-            raise ValueError("published generation smoke test failed")
+        self._require_successful_capsule_diagnostic(
+            result,
+            expected_state_root=state,
+            error="published generation smoke test failed",
+        )
 
     def _smoke_installed(self, root: Path) -> None:
         result = self._run_capsule(root / _NAME, self.state_paths.root, root)
+        self._require_successful_capsule_diagnostic(
+            result,
+            expected_state_root=self.state_paths.root,
+            error="installed capsule cannot reach its active generation",
+        )
+
+    @staticmethod
+    def _require_successful_capsule_diagnostic(
+        result: subprocess.CompletedProcess[str],
+        *,
+        expected_state_root: Path,
+        error: str,
+    ) -> None:
         if result.returncode != 0:
-            raise ValueError("installed capsule cannot reach its active generation")
+            raise ValueError(error)
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            raise ValueError("installed capsule returned invalid diagnostics") from exc
-        if not isinstance(payload, dict) or payload.get("status") not in {
-            "ok",
-            "degraded",
-        }:
-            raise ValueError("installed capsule returned invalid diagnostics")
+            raise ValueError(error) from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"status", "state_root", "diagnostics"}
+            or payload.get("status") != "ok"
+            or payload.get("state_root") != os.fspath(expected_state_root)
+            or payload.get("diagnostics") != []
+        ):
+            raise ValueError(error)
 
     @staticmethod
     def _run_capsule(

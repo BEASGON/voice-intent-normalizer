@@ -86,6 +86,7 @@ def built_runtime(tmp_path: Path) -> BuiltRuntime:
     status_payload = {
         "format": 5,
         "layout": "versioned-v1",
+        "selected_skill_root": str(skill_root),
         "capability": "manual",
         "capsule": {
             "protocol": 1,
@@ -380,7 +381,9 @@ def test_capsule_bootstrap_rejects_existing_pycache_bytecode(
     _assert_rejected_without_marker(built_runtime)
 
 
-@pytest.mark.parametrize("mismatch", ["file", "manifest", "status", "capsule"])
+@pytest.mark.parametrize(
+    "mismatch", ["file", "manifest", "status", "capsule", "skill-root"]
+)
 def test_capsule_bootstrap_rejects_hash_and_anchor_mismatches(
     built_runtime: BuiltRuntime, mismatch: str
 ):
@@ -402,10 +405,14 @@ def test_capsule_bootstrap_rejects_hash_and_anchor_mismatches(
         payload = _manifest_dict(built_runtime.status)
         payload["active"]["manifest_digest"] = "0" * 64
         built_runtime.status.write_text(json.dumps(payload), encoding="utf-8")
-    else:
+    elif mismatch == "capsule":
         payload = _manifest_dict(built_runtime.status)
         payload["capsule"]["manifest_digest"] = "0" * 64
         built_runtime.status.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        payload = _manifest_dict(built_runtime.status)
+        payload["selected_skill_root"] = str(built_runtime.capsule.parent.parent)
+        built_runtime.status.write_bytes(canonical_json_bytes(payload))
 
     _assert_rejected_without_marker(built_runtime)
 
