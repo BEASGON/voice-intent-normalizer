@@ -7,7 +7,7 @@ import os
 import secrets
 import stat
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -353,12 +353,17 @@ class StateRootLease:
         source: str | Path,
         destination: str | Path,
         expected_identity: tuple[int, int],
+        *,
+        on_committed: Callable[[], None] | None = None,
     ) -> None:
         """Atomically publish one exact direct directory without replacement.
 
         The source and destination must be direct children of retained directory
         bindings.  Only native exclusive directory-renames are accepted; there
         is deliberately no check-then-``os.rename`` fallback.
+
+        ``on_committed`` runs immediately after the native namespace rename,
+        before post-rename identity verification or directory durability work.
         """
         if (
             not isinstance(expected_identity, tuple)
@@ -388,6 +393,8 @@ class StateRootLease:
                             destination_path,
                         ) from exc
                     raise
+                if on_committed is not None:
+                    on_committed()
                 if _stat_identity(os.fstat(descriptor)) != expected_identity:
                     raise OSError("published directory identity changed")
             published = os.stat(destination_path, follow_symlinks=False)
@@ -427,6 +434,8 @@ class StateRootLease:
                 destination_binding.descriptor,
                 destination_name,
             )
+            if on_committed is not None:
+                on_committed()
             try:
                 published_descriptor = os.open(
                     destination_name,

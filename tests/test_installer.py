@@ -8,10 +8,12 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import voice_intent_normalizer.paths as paths_module
 from voice_intent_normalizer.adapters.base import (
     AdapterResult,
     CapabilityLevel,
@@ -87,6 +89,76 @@ def _validated_installed_layout(
     return capsule, generation, json.loads(raw_status)
 
 
+def _inject_post_rename_identity_validation_fault(
+    monkeypatch: pytest.MonkeyPatch, target_kind: str
+) -> dict[str, bool]:
+    original_publish = StateRootLease.publish_directory_no_replace
+    original_identity = paths_module._stat_identity
+    state = {"armed": False, "injected": False}
+
+    def fail_identity_after_commit(info):
+        if state["armed"]:
+            state["armed"] = False
+            state["injected"] = True
+            raise OSError(
+                f"injected {target_kind} post-rename identity-validation failure"
+            )
+        return original_identity(info)
+
+    def publish_with_validation_fault(
+        lease,
+        source,
+        destination,
+        expected_identity,
+        *,
+        on_committed=None,
+    ):
+        destination_path = Path(destination)
+        is_target = (
+            destination_path.name == "voice-intent-normalizer"
+            if target_kind == "capsule"
+            else destination_path.parent == Path("adapters/generic/generations")
+        )
+        assert on_committed is not None
+        if not is_target:
+            return original_publish(
+                lease,
+                source,
+                destination,
+                expected_identity,
+                on_committed=on_committed,
+            )
+
+        def record_commit_then_arm_validation_fault():
+            on_committed()
+            state["armed"] = True
+
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=record_commit_then_arm_validation_fault,
+        )
+
+    if os.name != "nt":
+        def fail_post_rename_recovery(*_args):
+            raise OSError("injected post-rename recovery failure")
+
+        monkeypatch.setattr(
+            paths_module,
+            "_restore_posix_directory_publication",
+            fail_post_rename_recovery,
+        )
+    monkeypatch.setattr(paths_module, "_stat_identity", fail_identity_after_commit)
+    monkeypatch.setattr(
+        StateRootLease,
+        "publish_directory_no_replace",
+        publish_with_validation_fault,
+    )
+    return state
+
+
 def test_publish_directory_no_replace_moves_exact_directory_identity(
     tmp_path: Path,
 ):
@@ -104,6 +176,47 @@ def test_publish_directory_no_replace_moves_exact_directory_identity(
     assert not source.exists()
     assert (published.stat().st_dev, published.stat().st_ino) == expected_identity
     assert (published / "complete.txt").read_text(encoding="utf-8") == "complete"
+
+
+def test_publish_directory_no_replace_notifies_before_post_rename_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    (source / "complete.txt").write_text("complete", encoding="utf-8")
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    original_identity = paths_module._stat_identity
+    committed = False
+    validation_fault_observed = False
+
+    def fail_validation_after_commit(info):
+        nonlocal validation_fault_observed
+        if committed:
+            validation_fault_observed = True
+            raise OSError("injected post-rename identity-validation failure")
+        return original_identity(info)
+
+    def record_commit():
+        nonlocal committed
+        committed = True
+
+    with guard_state_root(root) as lease:
+        monkeypatch.setattr(
+            paths_module, "_stat_identity", fail_validation_after_commit
+        )
+        with pytest.raises(OSError):
+            lease.publish_directory_no_replace(
+                "source",
+                "published",
+                expected_identity,
+                on_committed=record_commit,
+            )
+
+    assert committed
+    assert validation_fault_observed
 
 
 def test_publish_directory_no_replace_preserves_concurrent_destination(
@@ -222,7 +335,12 @@ def test_failed_generation_cleanup_preserves_swapped_staging_victim(
     swapped_marker: Path | None = None
 
     def swap_staging_before_publication(
-        lease, source, destination, expected_identity
+        lease,
+        source,
+        destination,
+        expected_identity,
+        *,
+        on_committed=None,
     ):
         nonlocal swapped_marker
         source_relative = Path(source)
@@ -237,7 +355,13 @@ def test_failed_generation_cleanup_preserves_swapped_staging_victim(
             victim.rename(source_path)
             swapped_marker = source_path / "keep.txt"
             raise OSError("injected publication failure after staging swap")
-        return original(lease, source, destination, expected_identity)
+        return original(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=on_committed,
+        )
 
     monkeypatch.setattr(
         StateRootLease,
@@ -300,12 +424,25 @@ def test_first_capsule_publication_rejects_concurrently_appearing_target(
     target = skill_root / "voice-intent-normalizer"
     original = getattr(StateRootLease, "publish_directory_no_replace", None)
 
-    def publish_with_racer(lease, source, destination, expected_identity):
+    def publish_with_racer(
+        lease,
+        source,
+        destination,
+        expected_identity,
+        *,
+        on_committed=None,
+    ):
         if Path(destination).name == "voice-intent-normalizer":
             target.mkdir()
             (target / "racer.txt").write_text("racer", encoding="utf-8")
         assert original is not None
-        return original(lease, source, destination, expected_identity)
+        return original(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=on_committed,
+        )
 
     monkeypatch.setattr(
         StateRootLease,
@@ -498,6 +635,32 @@ def test_generation_parent_fsync_failure_preserves_recovery_anchor(
     assert not layout.transaction.exists()
 
 
+def test_generation_post_rename_validation_failure_reports_complete_publication(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    fault = _inject_post_rename_identity_validation_fault(
+        monkeypatch, "generation"
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    published = tuple(layout.generations.glob("g-*"))
+
+    assert fault["injected"]
+    assert result.status == "failed"
+    assert len(published) == 1
+    assert (published[0] / "generation.json").is_file()
+    assert layout.transaction.is_file()
+    assert not layout.status.exists()
+    published_paths = {published[0], *published[0].rglob("*")}
+    assert published_paths <= set(result.changed_paths)
+    assert all(result.changed_paths.count(path) == 1 for path in published_paths)
+
+
 def test_capsule_parent_fsync_failure_reports_complete_publication(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
@@ -530,6 +693,36 @@ def test_capsule_parent_fsync_failure_reports_complete_publication(
     assert injected
     assert result.status == "failed"
     assert len(generations) == 1
+    assert layout.transaction.is_file()
+    assert not layout.status.exists()
+    published_paths = {
+        capsule,
+        *capsule.rglob("*"),
+        generations[0],
+        *generations[0].rglob("*"),
+    }
+    assert published_paths <= set(result.changed_paths)
+    assert all(result.changed_paths.count(path) == 1 for path in published_paths)
+
+
+def test_capsule_post_rename_validation_failure_reports_complete_publication(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    capsule = skill_root / "voice-intent-normalizer"
+    fault = _inject_post_rename_identity_validation_fault(monkeypatch, "capsule")
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    generations = tuple(layout.generations.glob("g-*"))
+
+    assert fault["injected"]
+    assert result.status == "failed"
+    assert len(generations) == 1
+    assert (capsule / "capsule.json").is_file()
     assert layout.transaction.is_file()
     assert not layout.status.exists()
     published_paths = {
@@ -679,6 +872,63 @@ def test_no_fallible_artifact_validation_runs_after_status_activation(
     _validated_installed_layout(generic_adapter, skill_root)
 
     assert result.status == "installed"
+
+
+def test_outer_state_operation_teardown_failure_preserves_committed_install(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    original = generic_adapter._state_operation
+
+    @contextmanager
+    def fail_after_real_teardown(*, create, lock_missing=True):
+        with original(create=create, lock_missing=lock_missing) as lease:
+            yield lease
+        raise OSError("injected outer state-operation teardown failure")
+
+    monkeypatch.setattr(
+        generic_adapter, "_state_operation", fail_after_real_teardown
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "installed"
+    _validated_installed_layout(generic_adapter, skill_root)
+
+
+def test_outer_state_operation_teardown_failure_before_activation_is_failed(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = generic_adapter._state_operation
+
+    @contextmanager
+    def fail_after_real_teardown(*, create, lock_missing=True):
+        with original(create=create, lock_missing=lock_missing) as lease:
+            yield lease
+        raise OSError("injected outer state-operation teardown failure")
+
+    def fail_before_activation(_payload):
+        raise OSError("injected pre-activation status failure")
+
+    monkeypatch.setattr(
+        generic_adapter, "_state_operation", fail_after_real_teardown
+    )
+    monkeypatch.setattr(
+        generic_adapter, "_write_status_payload", fail_before_activation
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "failed"
+    assert not layout.status.exists()
 
 
 def test_first_install_retry_adopts_only_transaction_anchored_artifacts(

@@ -88,6 +88,7 @@ class GenericAdapter:
         self._unanchored_recovery = False
         self._recovered_uninstall = False
         self._change_events: list[Path] = []
+        self._committed_install_status_bytes: bytes | None = None
 
     def detect(self) -> AdapterResult:
         return self.doctor()
@@ -95,15 +96,25 @@ class GenericAdapter:
     def install(self, options: InstallOptions) -> AdapterResult:
         self._recovery_changes = ()
         self._change_events = []
+        self._committed_install_status_bytes = None
         if options.strict:
             return self._failed(
                 "strict installation is unavailable for the generic adapter"
             )
+        result: AdapterResult | None = None
         try:
             with self._state_operation(create=True):
                 result = self._install_locked(options)
         except Exception:
-            result = self._failed("generic installation was not completed")
+            if (
+                result is None
+                or result.status != "installed"
+                or self._committed_install_status_bytes is None
+                or not self._status_bytes_are_active(
+                    self._committed_install_status_bytes
+                )
+            ):
+                result = self._failed("generic installation was not completed")
         return self._with_recovery_changes(result)
 
     def _install_locked(self, options: InstallOptions) -> AdapterResult:
@@ -182,6 +193,9 @@ class GenericAdapter:
             except Exception:
                 if not self._status_payload_is_active(status_payload):
                     raise
+            self._committed_install_status_bytes = canonical_json_bytes(
+                status_payload
+            )
             try:
                 self._remove_first_install_transaction()
             except Exception:
@@ -367,6 +381,7 @@ class GenericAdapter:
             expected = self._versioned_status_payload(artifacts, options)
             self._validate_first_install_transaction(transaction, root, expected)
             committed_result = self._committed_result("installed", options)
+            self._committed_install_status_bytes = canonical_json_bytes(expected)
             try:
                 self._remove_first_install_transaction()
             except Exception:
@@ -515,10 +530,11 @@ class GenericAdapter:
                 ),
             ) as lease:
                 lease.publish_directory_no_replace(
-                    stage_relative, final_relative, expected_identity
+                    stage_relative,
+                    final_relative,
+                    expected_identity,
+                    on_committed=on_published,
                 )
-                if on_published is not None:
-                    on_published()
                 lease.fsync_directory(stage_relative.parent)
                 if final_relative.parent != stage_relative.parent:
                     lease.fsync_directory(final_relative.parent)
@@ -2010,12 +2026,24 @@ class GenericAdapter:
 
     def _status_bytes_are_active(self, expected: bytes) -> bool:
         try:
-            return (
-                self._state_lease().read_bytes(
-                    _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
+            if self._active_state_lease is not None:
+                return (
+                    self._active_state_lease.read_bytes(
+                        _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
+                    )
+                    == expected
                 )
-                == expected
-            )
+            with guard_state_root(
+                self.state_paths.root, retained_dirs=(_GENERIC_RELATIVE,)
+            ) as lease:
+                return (
+                    lease.root_exists
+                    and lease.available(_GENERIC_RELATIVE)
+                    and lease.read_bytes(
+                        _STATUS_RELATIVE, _MANIFEST_LIMIT, "adapter status"
+                    )
+                    == expected
+                )
         except (OSError, ValueError):
             return False
 
