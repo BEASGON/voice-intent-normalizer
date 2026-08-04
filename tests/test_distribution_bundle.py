@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import runpy
@@ -131,6 +132,46 @@ def _run_isolated(
     )
 
 
+def _assert_sdist_runtime_inventory(sdist: Path) -> None:
+    with tarfile.open(sdist, "r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        assert names
+        assert len(names) == len(set(names))
+        parts = [name.split("/") for name in names]
+        assert all(
+            components
+            and components[0]
+            and "\\" not in name
+            and all(component not in {"", ".", ".."} for component in components)
+            for name, components in zip(names, parts, strict=True)
+        )
+        roots = {components[0] for components in parts}
+        assert len(roots) == 1
+        root = roots.pop()
+        assert all(name == root or name.startswith(f"{root}/") for name in names)
+        assert not any("_skill_bundle" in components for components in parts)
+        for relative in RUNTIME_FILES:
+            anchored = f"{root}/{relative}"
+            matches = [
+                member
+                for member in members
+                if member.name == relative
+                or member.name.endswith(f"/{relative}")
+            ]
+            assert len(matches) == 1
+            assert matches[0].name == anchored
+            assert matches[0].isfile()
+
+
+def _write_synthetic_sdist(path: Path, entries: list[tuple[str, bytes]]) -> None:
+    with tarfile.open(path, "w:gz") as archive:
+        for name, data in entries:
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+
+
 def test_setup_validates_the_exact_explicit_runtime_source_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -145,6 +186,64 @@ def test_setup_validates_the_exact_explicit_runtime_source_inventory(
         sources[relative] == (repository / relative).read_bytes()
         for relative in sources
     )
+
+
+def test_setup_rejects_same_size_in_place_mutation_during_retained_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    namespace = _load_setup_namespace(monkeypatch)
+    read_direct_source = namespace["_read_direct_source"]
+    repository = _copy_runtime_sources(tmp_path / "repository")
+    source = repository / "SKILL.md"
+    original = source.read_bytes()
+    replacement = bytes(byte ^ 1 for byte in original)
+    before = source.stat()
+    mutated = False
+
+    def mutate_source_in_place() -> None:
+        nonlocal mutated
+        if mutated:
+            return
+        mutated = True
+        with source.open("r+b", buffering=0) as stream:
+            stream.write(replacement)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(
+            source,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 10_000_000_000),
+        )
+
+    original_path_read_bytes = Path.read_bytes
+
+    def path_read_bytes_then_mutate(path: Path) -> bytes:
+        data = original_path_read_bytes(path)
+        if path == source:
+            mutate_source_in_place()
+        return data
+
+    original_os_read = os.read
+
+    def retained_read_then_mutate(descriptor: int, size: int) -> bytes:
+        data = original_os_read(descriptor, size)
+        if data:
+            mutate_source_in_place()
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", path_read_bytes_then_mutate)
+    monkeypatch.setattr(os, "read", retained_read_then_mutate)
+
+    with pytest.raises(RuntimeError, match="changed while read"):
+        read_direct_source(repository, "SKILL.md")
+
+    after = source.stat()
+    assert mutated
+    assert (after.st_dev, after.st_ino, after.st_size) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+    )
+    assert after.st_mtime_ns != before.st_mtime_ns
 
 
 def test_setup_rejects_missing_duplicate_aliased_and_extra_runtime_sources(
@@ -263,10 +362,56 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
             or "/_skill_bundle/.superpowers/" in name
             for name in names
         )
-    with tarfile.open(sdist, "r:gz") as archive:
-        names = archive.getnames()
-        for relative in RUNTIME_FILES:
-            assert any(name.endswith(f"/{relative}") for name in names)
+    _assert_sdist_runtime_inventory(sdist)
+
+
+@pytest.mark.parametrize(
+    "invalid_member",
+    [
+        pytest.param("second-root/PKG-INFO", id="second-top-level-root"),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0/SKILL.md",
+            id="duplicate-required-member",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0/misplaced/SKILL.md",
+            id="misplaced-required-member",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0/"
+            "src/voice_intent_normalizer/_skill_bundle/SKILL.md",
+            id="generated-package-bundle",
+        ),
+        pytest.param(
+            "voice_intent_normalizer-0.1.0/_skill_bundle/stale.txt",
+            id="stale-root-bundle",
+        ),
+    ],
+)
+def test_sdist_runtime_inventory_rejects_misplaced_duplicate_and_stale_members(
+    tmp_path: Path, invalid_member: str
+):
+    root = "voice_intent_normalizer-0.1.0"
+    entries = [
+        (f"{root}/{relative}", f"runtime:{relative}".encode())
+        for relative in RUNTIME_FILES
+    ]
+    entries.extend(
+        [
+            (f"{root}/PKG-INFO", b"metadata"),
+            (f"{root}/setup.cfg", b"standard sdist metadata"),
+            (
+                f"{root}/src/voice_intent_normalizer.egg-info/SOURCES.txt",
+                b"standard egg metadata",
+            ),
+            (invalid_member, b"invalid duplicate or misplaced member"),
+        ]
+    )
+    sdist = tmp_path / "synthetic.tar.gz"
+    _write_synthetic_sdist(sdist, entries)
+
+    with pytest.raises(AssertionError):
+        _assert_sdist_runtime_inventory(sdist)
 
 
 def test_rebuild_clears_stale_generated_bundle_files(tmp_path: Path):

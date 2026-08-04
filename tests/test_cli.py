@@ -101,6 +101,78 @@ def test_runtime_repository_rejects_extra_wheel_bundle_file(
         cli._runtime_repository()
 
 
+@pytest.mark.parametrize(
+    "relative",
+    [
+        pytest.param(
+            "src/voice_intent_normalizer/__pycache__/ambient."
+            f"{sys.implementation.cache_tag}.pyc",
+            id="orphan",
+        ),
+        pytest.param(
+            "src/voice_intent_normalizer/__pycache__/cli.cpython-000.pyc",
+            id="wrong-cache-tag",
+        ),
+        pytest.param(
+            "src/voice_intent_normalizer/__pycache__/cli."
+            f"{sys.implementation.cache_tag}.PYC",
+            id="uppercase-extension",
+        ),
+        pytest.param(
+            "src/voice_intent_normalizer/misplaced/__pycache__/cli."
+            f"{sys.implementation.cache_tag}.pyc",
+            id="misplaced-cache",
+        ),
+        pytest.param(
+            "references/__pycache__/correction-policy."
+            f"{sys.implementation.cache_tag}.pyc",
+            id="arbitrary-non-python-sibling",
+        ),
+        pytest.param(
+            "src/voice_intent_normalizer/__pycache__/cli."
+            f"{sys.implementation.cache_tag}.pyd",
+            id="native-loader-extra",
+        ),
+    ],
+)
+def test_runtime_repository_rejects_non_allowlisted_wheel_bytecode(
+    monkeypatch, tmp_path: Path, relative: str
+):
+    from voice_intent_normalizer import cli
+
+    fake_module, bundle = _wheel_bundle(tmp_path / "installed")
+    artifact = bundle / relative
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"attacker-supplied bytecode")
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli.resources, "files", lambda package: fake_module.parent)
+
+    with pytest.raises(RuntimeError, match="bundle"):
+        cli._runtime_repository()
+
+
+def test_runtime_repository_rejects_allowlisted_wheel_bytecode_alias(
+    monkeypatch, tmp_path: Path
+):
+    from voice_intent_normalizer import cli
+
+    fake_module, bundle = _wheel_bundle(tmp_path / "installed")
+    cache = bundle / "src/voice_intent_normalizer/__pycache__"
+    cache.mkdir()
+    external = tmp_path / "external.pyc"
+    external.write_bytes(b"attacker-supplied bytecode")
+    alias = cache / f"cli.{sys.implementation.cache_tag}.pyc"
+    try:
+        alias.symlink_to(external)
+    except OSError as exc:  # pragma: no cover - required alias capability
+        pytest.fail(f"test platform cannot create the required bytecode alias: {exc}")
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli.resources, "files", lambda package: fake_module.parent)
+
+    with pytest.raises(RuntimeError, match="bundle"):
+        cli._runtime_repository()
+
+
 def test_runtime_repository_accepts_only_a_manifest_anchored_generation(
     monkeypatch, tmp_path: Path
 ):

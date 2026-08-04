@@ -176,7 +176,14 @@ def _validated_generation_repository(repository: Path, module: Path) -> Path:
 def _runtime_repository_complete(repository: Path, *, exact: bool = False) -> bool:
     try:
         expected = generation_source_files(repository)
-        if exact and _direct_tree_files(repository, ignore_bytecode=True) != expected:
+        allowed_bytecode = _allowed_installer_bytecode_paths(expected)
+        if (
+            exact
+            and _direct_tree_files(
+                repository, allowed_bytecode=allowed_bytecode
+            )
+            != expected
+        ):
             return False
     except (OSError, RuntimeError, ValueError):
         return False
@@ -184,7 +191,7 @@ def _runtime_repository_complete(repository: Path, *, exact: bool = False) -> bo
 
 
 def _direct_tree_files(
-    root: Path, *, ignore_bytecode: bool = False
+    root: Path, *, allowed_bytecode: frozenset[str] | None = None
 ) -> dict[str, bytes]:
     _physical_directory(root, "runtime repository")
     pending = [root]
@@ -204,8 +211,10 @@ def _direct_tree_files(
             if _is_alias(info):
                 raise RuntimeError("runtime repository contains an alias")
             if stat.S_ISDIR(info.st_mode):
-                if ignore_bytecode and path.name == "__pycache__":
-                    _validate_installer_bytecode_cache(path)
+                if allowed_bytecode is not None and path.name == "__pycache__":
+                    _validate_installer_bytecode_cache(
+                        path, root, allowed_bytecode
+                    )
                     continue
                 pending.append(path)
                 continue
@@ -216,7 +225,33 @@ def _direct_tree_files(
     return files
 
 
-def _validate_installer_bytecode_cache(directory: Path) -> None:
+def _allowed_installer_bytecode_paths(
+    sources: dict[str, bytes],
+) -> frozenset[str]:
+    cache_tag = sys.implementation.cache_tag
+    if not isinstance(cache_tag, str) or not cache_tag:
+        raise RuntimeError("runtime bytecode cache tag is unavailable")
+    allowed: set[str] = set()
+    for relative in sources:
+        source = Path(relative)
+        if source.suffix != ".py":
+            continue
+        prefix = source.parent / "__pycache__" / f"{source.stem}.{cache_tag}"
+        allowed.add((prefix.parent / f"{prefix.name}.pyc").as_posix())
+        for optimization in (1, 2):
+            allowed.add(
+                prefix.with_name(
+                    f"{prefix.name}.opt-{optimization}.pyc"
+                ).as_posix()
+            )
+    return frozenset(allowed)
+
+
+def _validate_installer_bytecode_cache(
+    directory: Path,
+    root: Path,
+    allowed: frozenset[str],
+) -> None:
     try:
         entries = tuple(os.scandir(directory))
     except OSError as exc:
@@ -230,7 +265,7 @@ def _validate_installer_bytecode_cache(directory: Path) -> None:
         if (
             _is_alias(info)
             or not stat.S_ISREG(info.st_mode)
-            or path.suffix.casefold() != ".pyc"
+            or path.relative_to(root).as_posix() not in allowed
         ):
             raise RuntimeError("runtime bundle bytecode cache contains an extra file")
 

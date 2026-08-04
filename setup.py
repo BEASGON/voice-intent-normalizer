@@ -109,19 +109,64 @@ def _read_direct_source(root: Path, relative: str) -> bytes:
         raise RuntimeError(f"missing runtime bundle source: {relative}") from exc
     if not stat.S_ISREG(before.st_mode) or _is_alias(before):
         raise RuntimeError(f"runtime bundle source contains an alias: {relative}")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        data = source.read_bytes()
-        after = source.lstat()
+        descriptor = os.open(source, flags)
     except OSError as exc:
         raise RuntimeError(f"runtime bundle source is unavailable: {relative}") from exc
+    try:
+        handle_before = os.fstat(descriptor)
+        before_snapshot = _source_snapshot(handle_before, relative)
+        if _source_identity(before) != _source_identity(handle_before):
+            raise RuntimeError(
+                f"runtime bundle source changed while read: {relative}"
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        handle_after = os.fstat(descriptor)
+        after_snapshot = _source_snapshot(handle_after, relative)
+        after = source.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"runtime bundle source is unavailable: {relative}"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(handle_before.st_mode) or not stat.S_ISREG(
+        handle_after.st_mode
+    ):
+        raise RuntimeError(f"runtime bundle source contains an alias: {relative}")
+    if _is_alias(after) or not stat.S_ISREG(after.st_mode):
+        raise RuntimeError(f"runtime bundle source contains an alias: {relative}")
     if (
-        _is_alias(after)
-        or len(data) != before.st_size
-        or (before.st_dev, before.st_ino, before.st_size)
-        != (after.st_dev, after.st_ino, after.st_size)
+        before_snapshot != after_snapshot
+        or len(data) != handle_before.st_size
+        or _source_identity(after) != _source_identity(handle_after)
     ):
         raise RuntimeError(f"runtime bundle source changed while read: {relative}")
     return data
+
+
+def _source_identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _source_snapshot(info: os.stat_result, relative: str) -> tuple[int, ...]:
+    names = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    values = tuple(getattr(info, name, None) for name in names)
+    if (
+        any(not isinstance(value, int) or value < 0 for value in values)
+        or values[1] == 0
+    ):
+        raise RuntimeError(
+            f"runtime bundle source has no stable change indicator: {relative}"
+        )
+    return values
 
 
 def _direct_python_sources(repository: Path) -> tuple[str, ...]:
