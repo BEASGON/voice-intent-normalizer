@@ -293,6 +293,143 @@ def test_publish_directory_no_replace_rejects_replaced_source_identity(
     assert not (root / "published").exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory-handle contract")
+def test_windows_directory_publication_renames_the_exact_retained_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    (source / "managed.txt").write_text("managed", encoding="utf-8")
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    original_open = paths_module._open_windows_directory_for_move
+    replaced = False
+
+    @contextmanager
+    def replace_name_after_handle_open(path):
+        nonlocal replaced
+        with original_open(path) as descriptor:
+            displaced = root / "displaced"
+            source.rename(displaced)
+            source.mkdir()
+            (source / "replacement.txt").write_text("replacement", encoding="utf-8")
+            replaced = True
+            yield descriptor
+
+    monkeypatch.setattr(
+        paths_module,
+        "_open_windows_directory_for_move",
+        replace_name_after_handle_open,
+    )
+
+    with guard_state_root(root) as lease:
+        lease.publish_directory_no_replace("source", "published", expected_identity)
+
+    assert replaced
+    assert (source / "replacement.txt").read_text(encoding="utf-8") == "replacement"
+    assert (root / "published/managed.txt").read_text(encoding="utf-8") == "managed"
+    assert not (root / "displaced").exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux renameat2 contract"
+)
+def test_linux_directory_publication_uses_renameat2_noreplace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    original = paths_module._rename_linux_directory_no_replace
+    calls = []
+
+    def record_call(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(paths_module, "_rename_linux_directory_no_replace", record_call)
+
+    with guard_state_root(root) as lease:
+        lease.publish_directory_no_replace("source", "published", expected_identity)
+
+    assert len(calls) == 1
+    assert (root / "published").is_dir()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin renamex_np contract")
+def test_darwin_directory_publication_uses_renamex_np_excl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    original = paths_module._rename_darwin_directory_no_replace
+    calls = []
+
+    def record_call(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(
+        paths_module, "_rename_darwin_directory_no_replace", record_call
+    )
+
+    with guard_state_root(root) as lease:
+        lease.publish_directory_no_replace("source", "published", expected_identity)
+
+    assert len(calls) == 1
+    assert (root / "published").is_dir()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux renameat2 unavailability"
+)
+def test_linux_unavailable_renameat2_fails_before_namespace_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import ctypes
+
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep", encoding="utf-8")
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: object())
+
+    with guard_state_root(root) as lease, pytest.raises(OSError, match="unavailable"):
+        lease.publish_directory_no_replace("source", "published", expected_identity)
+
+    assert (source / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert not (root / "published").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin renamex_np unavailability")
+def test_darwin_unavailable_renamex_np_fails_before_namespace_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import ctypes
+
+    root = tmp_path / "authority"
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("keep", encoding="utf-8")
+    expected_identity = (source.stat().st_dev, source.stat().st_ino)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: object())
+
+    with guard_state_root(root) as lease, pytest.raises(OSError, match="unavailable"):
+        lease.publish_directory_no_replace("source", "published", expected_identity)
+
+    assert (source / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert not (root / "published").exists()
+
+
 def test_failed_generation_write_exposes_no_partial_runtime(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
@@ -1169,6 +1306,34 @@ def test_upgrade_switches_complete_generation_and_keeps_previous(
     assert (layout.generations / status.active.generation_id).is_dir()
     assert (layout.generations / status.previous.generation_id).is_dir()
     assert _capsule_bytes(capsule) == capsule_before
+
+
+def test_status_generation_roots_are_never_derived_from_staging(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    assert upgraded.install(InstallOptions(output_dir=skill_root)).status == "upgraded"
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+
+    assert status.active_root == layout.generations / status.active.generation_id
+    assert status.previous is not None
+    assert status.previous_root == (
+        layout.generations / status.previous.generation_id
+    )
+    assert layout.staging not in status.active_root.parents
+    assert layout.staging not in status.previous_root.parents
 
 
 def test_failed_upgrade_activation_leaves_previous_generation_selected(

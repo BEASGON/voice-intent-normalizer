@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import stat
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
@@ -14,11 +16,16 @@ from typing import Any, TextIO
 
 from .adapters.base import AdapterResult, InstallOptions, UninstallOptions
 from .adapters.generic import GenericAdapter
+from .adapters.generic_contract import canonical_json_bytes, validate_manifest
+from .adapters.generic_layout import generation_source_files
 from .installer import Installer
 from .models import Candidate, CorrectionDecision, Scope
 from .paths import StatePaths, guard_project_root
 from .project_scan import scan_project
 from .service import NormalizeRequest, NormalizerService
+
+GENERATION_MANIFEST_FILENAME = "generation.json"
+_WINDOWS_REPARSE_POINT = 0x400
 
 
 class _UsageError(ValueError):
@@ -102,14 +109,20 @@ def default_installer(paths: StatePaths | None = None) -> Installer:
 
 
 def _runtime_repository() -> Path:
-    """Return the authoritative checkout or the wheel's bundled skill files."""
-    module = Path(__file__).resolve()
+    """Return one exact checkout, wheel bundle, or anchored generation root."""
+    module = _physical_regular_file(Path(__file__), "runtime CLI module")
     checkout = module.parents[2]
-    checkout_module = (
-        checkout / "src" / "voice_intent_normalizer" / "cli.py"
-    ).resolve()
-    if module == checkout_module and _runtime_repository_complete(checkout):
-        return checkout
+    checkout_module = checkout / "src" / "voice_intent_normalizer" / "cli.py"
+    if _same_physical_file(module, checkout_module):
+        manifest_path = checkout / GENERATION_MANIFEST_FILENAME
+        if _entry_exists(manifest_path):
+            return _validated_generation_repository(checkout, module)
+        if _runtime_repository_complete(checkout):
+            return checkout.resolve(strict=True)
+        raise RuntimeError("runtime checkout is incomplete")
+
+    package_root = module.parent
+    expected_bundle = package_root / "_skill_bundle"
     bundle_resource = resources.files("voice_intent_normalizer").joinpath(
         "_skill_bundle"
     )
@@ -117,44 +130,186 @@ def _runtime_repository() -> Path:
         bundle = Path(os.fspath(bundle_resource)).resolve(strict=True)
     except (OSError, TypeError):
         raise RuntimeError("runtime skill bundle is not a physical directory") from None
-    if not _runtime_repository_complete(bundle):
+    if not _same_physical_directory(bundle, expected_bundle):
+        raise RuntimeError("runtime skill bundle does not belong to imported package")
+    if not _runtime_repository_complete(bundle, exact=True):
         raise RuntimeError("runtime skill bundle is unavailable")
     return bundle
 
 
-def _runtime_repository_complete(repository: Path) -> bool:
-    required = (
-        "SKILL.md",
-        "LICENSE",
-        "pyproject.toml",
-        "agents/openai.yaml",
-        "assets/lexicons/base-zh.jsonl",
-        "assets/lexicons/hotwords-snapshot.jsonl",
-        "assets/lexicons/domains/ai.jsonl",
-        "assets/lexicons/domains/product-design.jsonl",
-        "assets/lexicons/domains/software-development.jsonl",
-        "references/correction-policy.md",
-        "references/domain-packs.md",
-        "references/lexicon-schema.md",
-        "scripts/voice_intent.py",
-        "src/voice_intent_normalizer/__init__.py",
-        "src/voice_intent_normalizer/cli.py",
-        "src/voice_intent_normalizer/hook.py",
-        "src/voice_intent_normalizer/installer.py",
-        "src/voice_intent_normalizer/learning.py",
-        "src/voice_intent_normalizer/lexicon.py",
-        "src/voice_intent_normalizer/matching.py",
-        "src/voice_intent_normalizer/models.py",
-        "src/voice_intent_normalizer/paths.py",
-        "src/voice_intent_normalizer/policy.py",
-        "src/voice_intent_normalizer/project_scan.py",
-        "src/voice_intent_normalizer/service.py",
-        "src/voice_intent_normalizer/updater.py",
-        "src/voice_intent_normalizer/adapters/__init__.py",
-        "src/voice_intent_normalizer/adapters/base.py",
-        "src/voice_intent_normalizer/adapters/generic.py",
+def _validated_generation_repository(repository: Path, module: Path) -> Path:
+    source = repository / "src"
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if entry and _same_resolved_path(Path(entry), source):
+            raise RuntimeError(
+                "runtime generation cannot be selected through PYTHONPATH"
+            )
+    expected_module = source / "voice_intent_normalizer" / "cli.py"
+    if not _same_physical_file(module, expected_module):
+        raise RuntimeError("runtime generation module origin does not match")
+    try:
+        expected = generation_source_files(repository)
+        actual = _direct_tree_files(repository)
+        manifest_bytes = actual[GENERATION_MANIFEST_FILENAME]
+        manifest = validate_manifest(manifest_bytes)
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("runtime generation is unavailable") from exc
+    if canonical_json_bytes(manifest) != manifest_bytes:
+        raise RuntimeError("runtime generation manifest is not canonical")
+    expected_names = set(expected)
+    if (
+        set(actual) != {*expected_names, GENERATION_MANIFEST_FILENAME}
+        or manifest["kind"] != "generation"
+        or manifest["identifier"] != repository.name
+        or set(manifest["files"]) != expected_names
+    ):
+        raise RuntimeError("runtime generation manifest does not match source tree")
+    hashes = manifest["file_hashes"]
+    if any(
+        hashes[relative] != hashlib.sha256(data).hexdigest()
+        for relative, data in expected.items()
+    ):
+        raise RuntimeError("runtime generation file hash does not match")
+    return repository.resolve(strict=True)
+
+
+def _runtime_repository_complete(repository: Path, *, exact: bool = False) -> bool:
+    try:
+        expected = generation_source_files(repository)
+        if exact and _direct_tree_files(repository, ignore_bytecode=True) != expected:
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _direct_tree_files(
+    root: Path, *, ignore_bytecode: bool = False
+) -> dict[str, bytes]:
+    _physical_directory(root, "runtime repository")
+    pending = [root]
+    files: dict[str, bytes] = {}
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as exc:
+            raise RuntimeError("runtime repository is unavailable") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                raise RuntimeError("runtime repository is unavailable") from exc
+            if _is_alias(info):
+                raise RuntimeError("runtime repository contains an alias")
+            if stat.S_ISDIR(info.st_mode):
+                if ignore_bytecode and path.name == "__pycache__":
+                    _validate_installer_bytecode_cache(path)
+                    continue
+                pending.append(path)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError("runtime repository contains an alias")
+            relative = path.relative_to(root).as_posix()
+            files[relative] = path.read_bytes()
+    return files
+
+
+def _validate_installer_bytecode_cache(directory: Path) -> None:
+    try:
+        entries = tuple(os.scandir(directory))
+    except OSError as exc:
+        raise RuntimeError("runtime bundle bytecode cache is unavailable") from exc
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("runtime bundle bytecode cache is unavailable") from exc
+        if (
+            _is_alias(info)
+            or not stat.S_ISREG(info.st_mode)
+            or path.suffix.casefold() != ".pyc"
+        ):
+            raise RuntimeError("runtime bundle bytecode cache contains an extra file")
+
+
+def _physical_regular_file(path: Path, label: str) -> Path:
+    candidate = path.absolute()
+    try:
+        info = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or _is_alias(info)
+        or os.path.normcase(os.fspath(candidate))
+        != os.path.normcase(os.fspath(resolved))
+    ):
+        raise RuntimeError(f"{label} contains an alias")
+    return resolved
+
+
+def _physical_directory(path: Path, label: str) -> Path:
+    candidate = path.absolute()
+    try:
+        info = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or _is_alias(info)
+        or os.path.normcase(os.fspath(candidate))
+        != os.path.normcase(os.fspath(resolved))
+    ):
+        raise RuntimeError(f"{label} contains an alias")
+    return resolved
+
+
+def _same_physical_file(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, _physical_regular_file(right, "runtime module"))
+    except (OSError, RuntimeError):
+        return False
+
+
+def _same_physical_directory(left: Path, right: Path) -> bool:
+    try:
+        left_direct = _physical_directory(left, "runtime bundle")
+        right_direct = _physical_directory(right, "runtime bundle")
+        return os.path.samefile(left_direct, right_direct)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _same_resolved_path(left: Path, right: Path) -> bool:
+    try:
+        left_value = left.resolve(strict=True)
+        right_value = right.resolve(strict=True)
+    except OSError:
+        return False
+    return os.path.normcase(os.fspath(left_value)) == os.path.normcase(
+        os.fspath(right_value)
     )
-    return all((repository / relative).is_file() for relative in required)
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError("runtime repository is unavailable") from exc
+    return True
+
+
+def _is_alias(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+    )
 
 
 def main(

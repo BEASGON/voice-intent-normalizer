@@ -16,6 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from voice_intent_normalizer.adapters.generic_layout import (
+    generation_source_files,
+    prepare_versioned_artifacts,
+)
 from voice_intent_normalizer.learning import LearningEvent
 from voice_intent_normalizer.models import (
     CorrectionDecision,
@@ -24,6 +28,34 @@ from voice_intent_normalizer.models import (
     Scope,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_runtime_files(root: Path, files: dict[str, bytes]) -> Path:
+    for relative, data in files.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return root
+
+
+def _wheel_bundle(tmp_path: Path) -> tuple[Path, Path]:
+    package = tmp_path / "site-packages" / "voice_intent_normalizer"
+    module = package / "cli.py"
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_bytes((ROOT / "src/voice_intent_normalizer/cli.py").read_bytes())
+    bundle = _write_runtime_files(
+        package / "_skill_bundle", generation_source_files(ROOT)
+    )
+    return module, bundle
+
+
+def _generation_root(tmp_path: Path) -> Path:
+    artifact = prepare_versioned_artifacts(ROOT, "0" * 32).generation
+    return _write_runtime_files(
+        tmp_path / "generations" / artifact.identifier, dict(artifact.files)
+    )
+
 
 def test_runtime_repository_ignores_ambient_parent_skill(monkeypatch, tmp_path: Path):
     from voice_intent_normalizer import cli
@@ -31,48 +63,88 @@ def test_runtime_repository_ignores_ambient_parent_skill(monkeypatch, tmp_path: 
     ambient = tmp_path / "ambient"
     (ambient / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
     (ambient / "SKILL.md").write_text("ambient", encoding="utf-8")
-    fake_module = ambient / "site" / "voice_intent_normalizer" / "cli.py"
-    bundle_parent = tmp_path / "installed-package"
-    bundle = bundle_parent / "_skill_bundle"
-    required = (
-        "SKILL.md",
-        "LICENSE",
-        "pyproject.toml",
-        "agents/openai.yaml",
-        "assets/lexicons/base-zh.jsonl",
-        "assets/lexicons/hotwords-snapshot.jsonl",
-        "assets/lexicons/domains/ai.jsonl",
-        "assets/lexicons/domains/product-design.jsonl",
-        "assets/lexicons/domains/software-development.jsonl",
-        "references/correction-policy.md",
-        "references/domain-packs.md",
-        "references/lexicon-schema.md",
-        "scripts/voice_intent.py",
-        "src/voice_intent_normalizer/__init__.py",
-        "src/voice_intent_normalizer/cli.py",
-        "src/voice_intent_normalizer/hook.py",
-        "src/voice_intent_normalizer/installer.py",
-        "src/voice_intent_normalizer/learning.py",
-        "src/voice_intent_normalizer/lexicon.py",
-        "src/voice_intent_normalizer/matching.py",
-        "src/voice_intent_normalizer/models.py",
-        "src/voice_intent_normalizer/paths.py",
-        "src/voice_intent_normalizer/policy.py",
-        "src/voice_intent_normalizer/project_scan.py",
-        "src/voice_intent_normalizer/service.py",
-        "src/voice_intent_normalizer/updater.py",
-        "src/voice_intent_normalizer/adapters/__init__.py",
-        "src/voice_intent_normalizer/adapters/base.py",
-        "src/voice_intent_normalizer/adapters/generic.py",
-    )
-    for relative in required:
-        path = bundle / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(relative, encoding="utf-8")
+    fake_module, bundle = _wheel_bundle(ambient / "installed")
     monkeypatch.setattr(cli, "__file__", str(fake_module))
-    monkeypatch.setattr(cli.resources, "files", lambda package: bundle_parent)
+    monkeypatch.setattr(cli.resources, "files", lambda package: fake_module.parent)
 
     assert cli._runtime_repository() == bundle.resolve()
+
+
+def test_runtime_repository_rejects_resource_lookalike_outside_imported_package(
+    monkeypatch, tmp_path: Path
+):
+    from voice_intent_normalizer import cli
+
+    fake_module, _ = _wheel_bundle(tmp_path / "installed")
+    lookalike = _write_runtime_files(
+        tmp_path / "resource-lookalike" / "_skill_bundle",
+        generation_source_files(ROOT),
+    )
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli.resources, "files", lambda package: lookalike.parent)
+
+    with pytest.raises(RuntimeError, match="bundle"):
+        cli._runtime_repository()
+
+
+def test_runtime_repository_rejects_extra_wheel_bundle_file(
+    monkeypatch, tmp_path: Path
+):
+    from voice_intent_normalizer import cli
+
+    fake_module, bundle = _wheel_bundle(tmp_path / "installed")
+    (bundle / "ambient.py").write_text("raise RuntimeError\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+    monkeypatch.setattr(cli.resources, "files", lambda package: fake_module.parent)
+
+    with pytest.raises(RuntimeError, match="bundle"):
+        cli._runtime_repository()
+
+
+def test_runtime_repository_accepts_only_a_manifest_anchored_generation(
+    monkeypatch, tmp_path: Path
+):
+    from voice_intent_normalizer import cli
+
+    generation = _generation_root(tmp_path)
+    module = generation / "src/voice_intent_normalizer/cli.py"
+    monkeypatch.setattr(cli, "__file__", str(module))
+
+    assert cli._runtime_repository() == generation.resolve()
+
+    manifest = generation / "generation.json"
+    original = manifest.read_bytes()
+    manifest.write_bytes(original.replace(b'"format":1', b'"format":1,"format":1', 1))
+    with pytest.raises(RuntimeError, match="generation"):
+        cli._runtime_repository()
+
+
+def test_runtime_repository_rejects_generation_selected_only_by_pythonpath(
+    tmp_path: Path,
+):
+    generation = _generation_root(tmp_path)
+    source = generation / "src"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(source)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from voice_intent_normalizer import cli; "
+                "print(cli._runtime_repository())"
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "generation" in result.stderr
 
 
 class FakeService:
