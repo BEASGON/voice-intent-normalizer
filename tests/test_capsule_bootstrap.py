@@ -170,6 +170,53 @@ def test_capsule_bootstrap_runs_only_the_status_anchored_generation(
     assert json.loads(result.stdout)["status"] == "ok"
 
 
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "generation-published",
+        "capsule-published",
+        "activation-pending",
+        "rollback-pending",
+        "deactivation-pending",
+        "capsule-retired",
+        "cleanup-pending",
+    ),
+)
+def test_capsule_bootstrap_rejects_nonterminal_status_without_old_active_shape(
+    built_runtime: BuiltRuntime,
+    phase: str,
+):
+    payload = _manifest_dict(built_runtime.status)
+    payload["transaction"] = {"id": f"t-{'1' * 32}", "phase": phase}
+    built_runtime.status.write_bytes(canonical_json_bytes(payload))
+
+    _assert_rejected_without_marker(built_runtime)
+
+
+@pytest.mark.parametrize(
+    "phase", ("generation-published", "activation-pending", "rollback-pending")
+)
+def test_capsule_bootstrap_launches_only_old_active_during_upgrade_recovery(
+    built_runtime: BuiltRuntime,
+    phase: str,
+):
+    payload = _manifest_dict(built_runtime.status)
+    candidate_hash = "2" * 64
+    payload["previous"] = {
+        "generation_id": f"g-{candidate_hash}-{'3' * 32}",
+        "manifest_digest": "4" * 64,
+        "package_hash": candidate_hash,
+        "package_version": "0.2.0",
+    }
+    payload["transaction"] = {"id": f"t-{'5' * 32}", "phase": phase}
+    built_runtime.status.write_bytes(canonical_json_bytes(payload))
+
+    result = _run_bootstrap(built_runtime)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "ok"
+
+
 @pytest.mark.parametrize("failure", ["absent", "duplicate", "malformed", "future"])
 def test_capsule_bootstrap_rejects_untrusted_status(
     built_runtime: BuiltRuntime, failure: str

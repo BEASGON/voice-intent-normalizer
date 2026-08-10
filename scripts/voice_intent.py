@@ -129,6 +129,8 @@ def _installed_generation_source(capsule: Path) -> Path:
         or not _same_native_file(capsule, status.capsule_root)
     ):
         raise RuntimeError("installed capsule metadata is not anchored")
+    if not contract.status_allows_active_generation_launch(status):
+        raise RuntimeError("installed adapter transaction is not launchable")
 
     generation = status.active_root
     _require_direct_tree_path(generation, trusted_root=state_root)

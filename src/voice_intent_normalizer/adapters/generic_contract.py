@@ -37,6 +37,9 @@ _TRANSACTION_PHASES = frozenset(
         "cleanup-pending",
     }
 )
+_OLD_ACTIVE_LAUNCH_PHASES = frozenset(
+    {"generation-published", "activation-pending", "rollback-pending"}
+)
 _STATUS_FIELDS = {
     "format",
     "layout",
@@ -206,6 +209,18 @@ def validate_status_v5(
         capsule_root=capsule_root,
         active_root=active_root,
         previous_root=previous_root,
+    )
+
+
+def status_allows_active_generation_launch(status: StatusV5) -> bool:
+    """Permit terminal status or an explicitly anchored old active generation."""
+    if not isinstance(status, StatusV5):
+        return False
+    if status.transaction_phase is None:
+        return True
+    return (
+        status.transaction_phase in _OLD_ACTIVE_LAUNCH_PHASES
+        and status.previous is not None
     )
 
 

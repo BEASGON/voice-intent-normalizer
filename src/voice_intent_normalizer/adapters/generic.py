@@ -171,6 +171,7 @@ class GenericAdapter:
             artifacts.generation,
             recovering=False,
             on_published=lambda: self._write_transaction_status(root, payload),
+            publication_anchor=canonical_json_bytes(payload),
         )
         self._ensure_capsule(
             root, artifacts.capsule, transaction_id, recovering=False
@@ -189,7 +190,6 @@ class GenericAdapter:
         pending = self._read_required_status(root)
         self._validate_capsule_ref(root, pending)
         self._validate_generation_ref(pending.active)
-        self._smoke_installed(root)
         result = self._committed_result("installed", options)
         self._write_terminal_status(root, final)
         self._record_install_commit(result, final)
@@ -218,6 +218,7 @@ class GenericAdapter:
                 artifacts.generation,
                 recovering=False,
                 on_published=lambda: self._write_transaction_status(root, payload),
+                publication_anchor=canonical_json_bytes(payload),
             )
             payload = self._replace_phase(payload, "activation-pending")
             self._write_transaction_status(root, payload)
@@ -233,7 +234,6 @@ class GenericAdapter:
             self._validate_generation_ref(pending.active)
             assert pending.previous is not None
             self._validate_generation_ref(pending.previous)
-            self._smoke_installed(root)
             result = self._committed_result("upgraded", options)
             self._write_terminal_status(root, final)
             self._record_install_commit(result, final)
@@ -1114,6 +1114,7 @@ class GenericAdapter:
         *,
         recovering: bool,
         on_published: Callable[[], None] | None = None,
+        publication_anchor: bytes | None = None,
     ) -> Path:
         final_relative = _GENERATIONS_RELATIVE / artifact.identifier
         final = self.state_paths.root / final_relative
@@ -1137,6 +1138,11 @@ class GenericAdapter:
             final_relative,
             artifact,
             on_published=record_publication,
+            preserve_published=(
+                None
+                if publication_anchor is None
+                else lambda: self._status_bytes_are_active(publication_anchor)
+            ),
         )
         self._validate_generation_directory(
             self.state_paths.root, final_relative, artifact
@@ -1178,6 +1184,7 @@ class GenericAdapter:
         artifact: VersionedArtifact,
         *,
         on_published: Callable[[], None] | None = None,
+        preserve_published: Callable[[], bool] | None = None,
     ) -> None:
         directories = set(self._artifact_directories(stage_relative, artifact))
         if final_relative.parent != Path("."):
@@ -1186,6 +1193,16 @@ class GenericAdapter:
             sorted(directories, key=lambda path: (len(path.parts), str(path)))
         )
         expected_identity: tuple[int, int] | None = None
+        publication_committed = False
+        publication_callback_completed = False
+
+        def notify_publication() -> None:
+            nonlocal publication_committed, publication_callback_completed
+            publication_committed = True
+            if on_published is not None:
+                on_published()
+            publication_callback_completed = True
+
         try:
             with guard_state_root(
                 root,
@@ -1236,13 +1253,24 @@ class GenericAdapter:
                     stage_relative,
                     final_relative,
                     expected_identity,
-                    on_committed=on_published,
+                    on_committed=notify_publication,
                 )
                 lease.fsync_directory(stage_relative.parent)
                 if final_relative.parent != stage_relative.parent:
                     lease.fsync_directory(final_relative.parent)
         except BaseException:
             if expected_identity is not None:
+                if publication_committed and not publication_callback_completed:
+                    anchored = False
+                    if preserve_published is not None:
+                        try:
+                            anchored = preserve_published()
+                        except Exception:
+                            anchored = False
+                    if not anchored:
+                        self._cleanup_staged_artifact(
+                            root, final_relative, artifact, expected_identity
+                        )
                 self._cleanup_staged_artifact(
                     root, stage_relative, artifact, expected_identity
                 )

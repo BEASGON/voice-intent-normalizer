@@ -704,7 +704,7 @@ def test_real_smoke_runs_before_any_final_runtime_name(
     _validated_installed_layout(generic_adapter, skill_root)
 
 
-def test_first_install_status_failure_leaves_complete_inert_artifacts(
+def test_first_install_status_callback_failure_removes_unanchored_generation(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
     monkeypatch: pytest.MonkeyPatch,
@@ -726,8 +726,7 @@ def test_first_install_status_failure_leaves_complete_inert_artifacts(
     assert not layout.status.exists()
     assert not layout.transaction.exists()
     assert not (skill_root / "voice-intent-normalizer").exists()
-    assert len(generations) == 1
-    validate_manifest((generations[0] / "generation.json").read_bytes())
+    assert generations == ()
 
 
 def test_transaction_parent_fsync_failure_reports_committed_marker(
@@ -1183,7 +1182,7 @@ def test_outer_state_operation_teardown_failure_before_activation_is_failed(
     assert not layout.status.exists()
 
 
-def test_first_install_retry_adopts_only_transaction_anchored_artifacts(
+def test_first_install_callback_failure_retry_and_uninstall_leave_no_generation(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
     monkeypatch: pytest.MonkeyPatch,
@@ -1208,9 +1207,106 @@ def test_first_install_retry_adopts_only_transaction_anchored_artifacts(
     assert capsule.is_dir()
     assert generation.is_dir()
     generations = tuple(layout.generations.glob("g-*"))
-    assert len(generations) == 2
+    assert len(generations) == 1
     assert generation in generations
     assert not layout.transaction.exists()
+
+    uninstalled = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+
+    assert uninstalled.status == "uninstalled"
+    assert not tuple(layout.generations.glob("g-*"))
+
+
+def test_callback_failure_cleanup_preserves_replaced_generation_without_adopting_it(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original = generic_adapter._write_status_payload
+    replacement: Path | None = None
+
+    def replace_published_generation(_payload: dict[str, object]) -> None:
+        nonlocal replacement
+        published = tuple(layout.generations.glob("g-*"))
+        assert len(published) == 1
+        replacement = published[0]
+        displaced = layout.generations / "displaced-owned-generation"
+        replacement.rename(displaced)
+        replacement.mkdir()
+        (replacement / "keep.txt").write_text("replacement", encoding="utf-8")
+        shutil.rmtree(displaced)
+        raise OSError("injected status callback failure after identity replacement")
+
+    monkeypatch.setattr(
+        generic_adapter, "_write_status_payload", replace_published_generation
+    )
+    failed = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert failed.status == "failed"
+    assert replacement is not None
+    marker = replacement / "keep.txt"
+    assert marker.read_text(encoding="utf-8") == "replacement"
+
+    monkeypatch.setattr(generic_adapter, "_write_status_payload", original)
+    recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+
+    assert recovered.status == "installed"
+    assert status.active.generation_id != replacement.name
+    assert marker.read_text(encoding="utf-8") == "replacement"
+
+    uninstalled = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
+
+    assert uninstalled.status == "uninstalled"
+    assert marker.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.parametrize("operation", ("first-install", "upgrade"))
+def test_preterminal_smoke_uses_only_an_isolated_terminal_status(
+    operation: str,
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    expected_status = "installed"
+    adapter = generic_adapter
+    if operation == "upgrade":
+        assert generic_adapter.install(
+            InstallOptions(output_dir=skill_root)
+        ).status == "installed"
+        adapter = GenericAdapter(repository_v2, generic_adapter.state_paths)
+        expected_status = "upgraded"
+    original_run = adapter._run_capsule
+    public_nonterminal_smoke = False
+
+    def observe_run(capsule: Path, state: Path, working: Path):
+        nonlocal public_nonterminal_smoke
+        if state == adapter.state_paths.root:
+            layout = generic_layout_paths(adapter.state_paths)
+            status = validate_status_v5(
+                layout.status.read_bytes(),
+                skill_root=skill_root,
+                generations_root=layout.generations,
+            )
+            public_nonterminal_smoke = status.transaction_phase is not None
+        return original_run(capsule, state, working)
+
+    monkeypatch.setattr(adapter, "_run_capsule", observe_run)
+
+    result = adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == expected_status
+    assert not public_nonterminal_smoke
 
 
 def test_first_install_changed_paths_are_exact_and_unique(
@@ -1416,6 +1512,60 @@ def test_failed_upgrade_smoke_leaves_status_and_generations_unchanged(
     assert result.status == "failed"
     assert layout.status.read_bytes() == status_before
     assert tuple(layout.generations.iterdir()) == generations_before
+
+
+def test_upgrade_status_callback_failure_retry_and_uninstall_leave_only_anchors(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    status_before = layout.status.read_bytes()
+    generations_before = set(layout.generations.glob("g-*"))
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    original = upgraded._write_status_payload
+
+    def fail_candidate_anchor(payload: dict[str, object]) -> None:
+        transaction = payload.get("transaction")
+        if (
+            isinstance(transaction, dict)
+            and transaction.get("phase") == "generation-published"
+        ):
+            raise OSError("injected upgrade status callback failure")
+        original(payload)
+
+    monkeypatch.setattr(upgraded, "_write_status_payload", fail_candidate_anchor)
+    failed = upgraded.install(InstallOptions(output_dir=skill_root))
+
+    assert failed.status == "failed"
+    assert layout.status.read_bytes() == status_before
+    assert set(layout.generations.glob("g-*")) == generations_before
+
+    monkeypatch.setattr(upgraded, "_write_status_payload", original)
+    retried = upgraded.install(InstallOptions(output_dir=skill_root))
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+
+    assert retried.status == "upgraded"
+    assert status.previous is not None
+    assert set(layout.generations.glob("g-*")) == {
+        layout.generations / status.active.generation_id,
+        layout.generations / status.previous.generation_id,
+    }
+
+    uninstalled = upgraded.uninstall(UninstallOptions(output_dir=skill_root))
+
+    assert uninstalled.status == "uninstalled"
+    assert not tuple(layout.generations.glob("g-*"))
 
 
 def test_doctor_validates_active_previous_and_capsule_anchors(
@@ -2348,7 +2498,7 @@ def test_generic_refuses_to_overwrite_unmanaged_directory(tmp_path: Path):
     assert marker.read_text(encoding="utf-8") == "do not replace"
 
 
-def test_generic_keeps_identity_bound_package_when_status_recording_fails(
+def test_generic_removes_identity_bound_package_when_status_recording_fails(
     tmp_path: Path, monkeypatch
 ):
     repository = Path(__file__).resolve().parents[1]
@@ -2373,7 +2523,7 @@ def test_generic_keeps_identity_bound_package_when_status_recording_fails(
     layout = generic_layout_paths(state)
     assert result.status == "failed"
     assert not (root / "voice-intent-normalizer").exists()
-    assert len(tuple(layout.generations.glob("g-*"))) == 1
+    assert not tuple(layout.generations.glob("g-*"))
     assert not layout.transaction.exists()
     assert not layout.status.exists()
 
