@@ -58,6 +58,14 @@ class _ValidatedTree:
     directories: tuple[Path, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _CleanupTree:
+    directories: tuple[Path, ...]
+    identities: Mapping[Path, tuple[int, int]]
+    files: tuple[Path, ...]
+    children: Mapping[Path, frozenset[str]]
+
+
 class GenericAdapter:
     """Install one stable capsule selecting immutable private generations."""
 
@@ -191,7 +199,6 @@ class GenericAdapter:
         self._stage_and_publish_generation(
             artifacts.generation,
             recovering=False,
-            publication_anchor=journal_bytes,
         )
         journal = self._advance_transaction_status(
             root,
@@ -287,7 +294,6 @@ class GenericAdapter:
             self._stage_and_publish_generation(
                 artifacts.generation,
                 recovering=False,
-                publication_anchor=journal_bytes,
             )
             journal = self._advance_transaction_status(
                 root,
@@ -413,6 +419,19 @@ class GenericAdapter:
     def _write_ownership_journal(self, payload: bytes) -> None:
         """Commit exact journal bytes or prove that the same bytes committed."""
         lease = self._state_lease()
+        if lease.exists(_TRANSACTION_RELATIVE):
+            current = lease.read_bytes(
+                _TRANSACTION_RELATIVE,
+                _MANIFEST_LIMIT,
+                "adapter ownership journal",
+            )
+            if current != payload:
+                raise ValueError("adapter ownership journal conflicts with intent")
+            lease.fsync_directory(_GENERIC_RELATIVE)
+            self._record_changes(
+                (generic_layout_paths(self.state_paths).transaction,)
+            )
+            return
         try:
             lease.write_bytes_atomic(_TRANSACTION_RELATIVE, payload)
             lease.fsync_directory(_GENERIC_RELATIVE)
@@ -430,6 +449,43 @@ class GenericAdapter:
             except (OSError, ValueError):
                 pass
             if not committed:
+                raise
+        self._record_changes((generic_layout_paths(self.state_paths).transaction,))
+
+    def _replace_ownership_journal(
+        self,
+        root: Path,
+        *,
+        current_journal: OwnershipJournal,
+        payload: bytes,
+    ) -> None:
+        lease = self._state_lease()
+        if not lease.exists(_TRANSACTION_RELATIVE):
+            raise FileNotFoundError("adapter ownership journal is missing")
+        current_bytes = lease.read_bytes(
+            _TRANSACTION_RELATIVE,
+            _MANIFEST_LIMIT,
+            "adapter ownership journal",
+        )
+        observed = validate_ownership_journal(
+            current_bytes,
+            skill_root=root,
+            generations_root=generic_layout_paths(self.state_paths).generations,
+        )
+        if observed != current_journal:
+            raise ValueError("adapter ownership journal changed before transition")
+        if current_bytes == payload:
+            return
+        try:
+            lease.write_bytes_atomic(_TRANSACTION_RELATIVE, payload)
+            lease.fsync_directory(_GENERIC_RELATIVE)
+        except OSError:
+            committed = lease.read_bytes(
+                _TRANSACTION_RELATIVE,
+                _MANIFEST_LIMIT,
+                "adapter ownership journal",
+            )
+            if committed != payload:
                 raise
         self._record_changes((generic_layout_paths(self.state_paths).transaction,))
 
@@ -474,8 +530,11 @@ class GenericAdapter:
             before_status_bytes=before_bytes,
             after_status_bytes=after_bytes,
         )
-        if not self._journal_bytes_are_active(journal_bytes):
-            self._write_ownership_journal(journal_bytes)
+        self._replace_ownership_journal(
+            root,
+            current_journal=journal,
+            payload=journal_bytes,
+        )
         advanced = validate_ownership_journal(
             journal_bytes,
             skill_root=root,
@@ -534,22 +593,6 @@ class GenericAdapter:
         )
         if self._read_status_bytes() != expected:
             raise ValueError("terminal status is not exact")
-
-    def _journal_bytes_are_active(self, expected: bytes) -> bool:
-        try:
-            lease = self._state_lease()
-            return (
-                lease.root_exists
-                and lease.available(_GENERIC_RELATIVE)
-                and lease.read_bytes(
-                    _TRANSACTION_RELATIVE,
-                    _MANIFEST_LIMIT,
-                    "adapter ownership journal",
-                )
-                == expected
-            )
-        except (OSError, ValueError):
-            return False
 
     def _write_status_payload(self, payload: dict[str, object]) -> None:
         data = canonical_json_bytes(payload)
@@ -1351,7 +1394,6 @@ class GenericAdapter:
         artifact: VersionedArtifact,
         *,
         recovering: bool,
-        publication_anchor: bytes | None = None,
     ) -> Path:
         final_relative = _GENERATIONS_RELATIVE / artifact.identifier
         final = self.state_paths.root / final_relative
@@ -1373,11 +1415,7 @@ class GenericAdapter:
             final_relative,
             artifact,
             on_published=record_publication,
-            preserve_published=(
-                None
-                if publication_anchor is None
-                else lambda: self._journal_bytes_are_active(publication_anchor)
-            ),
+            preserve_published=True,
         )
         self._validate_generation_directory(
             self.state_paths.root, final_relative, artifact
@@ -1419,14 +1457,9 @@ class GenericAdapter:
         artifact: VersionedArtifact,
         *,
         on_published: Callable[[], None] | None = None,
-        preserve_published: Callable[[], bool] | None = None,
+        preserve_published: bool = False,
     ) -> None:
-        directories = set(self._artifact_directories(stage_relative, artifact))
-        if final_relative.parent != Path("."):
-            directories.add(final_relative.parent)
-        retained = tuple(
-            sorted(directories, key=lambda path: (len(path.parts), str(path)))
-        )
+        directories = self._artifact_directories(stage_relative, artifact)
         expected_identity: tuple[int, int] | None = None
         publication_committed = False
         publication_callback_completed = False
@@ -1441,7 +1474,11 @@ class GenericAdapter:
         try:
             with guard_state_root(
                 root,
-                retained_dirs=retained,
+                retained_dirs=tuple(
+                    path
+                    for path in (stage_relative.parent, stage_relative)
+                    if path != Path(".")
+                ),
                 create_retained=True,
                 exclusive_create_retained=(stage_relative,),
             ) as lease:
@@ -1453,6 +1490,42 @@ class GenericAdapter:
                     artifact.files[artifact.manifest_name],
                 )
                 lease.fsync_directory(stage_relative)
+            for directory in directories:
+                if directory == stage_relative:
+                    continue
+                retained = {
+                    stage_relative.parent,
+                    stage_relative,
+                    directory.parent,
+                }
+                retained.discard(Path("."))
+                with guard_state_root(
+                    root,
+                    retained_dirs=tuple(
+                        sorted(
+                            retained,
+                            key=lambda path: (len(path.parts), str(path)),
+                        )
+                    ),
+                ) as lease:
+                    if self._directory_identity(lease.stat(stage_relative)) != (
+                        expected_identity
+                    ):
+                        raise ValueError("staging directory identity changed")
+                    lease.mkdir(directory)
+                    lease.fsync_directory(directory.parent)
+            with guard_state_root(
+                root,
+                retained_dirs=tuple(
+                    path
+                    for path in (stage_relative.parent, *directories)
+                    if path != Path(".")
+                ),
+            ) as lease:
+                if self._directory_identity(lease.stat(stage_relative)) != (
+                    expected_identity
+                ):
+                    raise ValueError("staging directory identity changed")
                 for relative, data in artifact.files.items():
                     if relative == artifact.manifest_name:
                         continue
@@ -1460,7 +1533,7 @@ class GenericAdapter:
                         lease, stage_relative / Path(relative), data
                     )
                 for directory in sorted(
-                    self._artifact_directories(stage_relative, artifact),
+                    directories,
                     key=lambda path: (len(path.parts), str(path)),
                     reverse=True,
                 ):
@@ -1496,13 +1569,7 @@ class GenericAdapter:
         except BaseException:
             if expected_identity is not None:
                 if publication_committed and not publication_callback_completed:
-                    anchored = False
-                    if preserve_published is not None:
-                        try:
-                            anchored = preserve_published()
-                        except Exception:
-                            anchored = False
-                    if not anchored:
+                    if not preserve_published:
                         self._cleanup_staged_artifact(
                             root, final_relative, artifact, expected_identity
                         )
@@ -1526,39 +1593,139 @@ class GenericAdapter:
         artifact: VersionedArtifact,
         expected_identity: tuple[int, int],
     ) -> None:
-        directories = self._artifact_directories(stage_relative, artifact)
-        try:
-            with guard_state_root(root, retained_dirs=directories) as lease:
-                if self._directory_identity(lease.stat(stage_relative)) != (
-                    expected_identity
-                ):
-                    return
-                for relative in artifact.files:
-                    path = stage_relative / Path(relative)
-                    temporary = path.parent / f".{path.name}.tmp"
-                    lease.unlink(temporary, missing_ok=True)
-                    lease.unlink(path, missing_ok=True)
-        except (FileNotFoundError, OSError, ValueError):
+        tree = self._preflight_staged_cleanup(
+            root, stage_relative, artifact, expected_identity
+        )
+        if tree is None:
             return
+        retained = tuple(
+            path
+            for path in (stage_relative.parent, *tree.directories)
+            if path != Path(".")
+        )
+        with guard_state_root(root, retained_dirs=retained) as lease:
+            for directory in tree.directories:
+                info = lease.stat(directory)
+                self._require_direct_directory(info)
+                if self._directory_identity(info) != tree.identities[directory]:
+                    raise ValueError("cleanup directory identity changed")
+                if frozenset(lease.listdir(directory)) != tree.children[directory]:
+                    raise ValueError("cleanup tree changed after preflight")
+            for path in tree.files:
+                info = lease.stat(path)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0)
+                    & _WINDOWS_REPARSE_POINT
+                ):
+                    raise ValueError("unsafe cleanup file")
+            for path in tree.files:
+                lease.unlink(path)
         for directory in sorted(
-            directories,
+            tree.directories,
             key=lambda path: (len(path.parts), str(path)),
             reverse=True,
         ):
             parent = directory.parent
             retained = () if parent == Path(".") else (parent,)
-            try:
-                with guard_state_root(root, retained_dirs=retained) as lease:
-                    info = lease.stat(directory)
-                    self._require_direct_directory(info)
-                    if directory == stage_relative and (
-                        self._directory_identity(info) != expected_identity
+            with guard_state_root(root, retained_dirs=retained) as lease:
+                info = lease.stat(directory)
+                self._require_direct_directory(info)
+                if self._directory_identity(info) != tree.identities[directory]:
+                    raise ValueError("cleanup directory identity changed")
+                lease.rmdir(directory)
+                lease.fsync_directory(parent)
+
+    def _preflight_staged_cleanup(
+        self,
+        root: Path,
+        stage_relative: Path,
+        artifact: VersionedArtifact,
+        expected_identity: tuple[int, int],
+    ) -> _CleanupTree | None:
+        stage = root / stage_relative
+        try:
+            root_info = stage.lstat()
+        except FileNotFoundError:
+            return None
+        self._require_direct_directory(root_info)
+        if self._directory_identity(root_info) != expected_identity:
+            raise ValueError("staging directory identity changed")
+
+        expected_directories = set(
+            self._artifact_directories(stage_relative, artifact)
+        )
+        expected_files = {
+            stage_relative / Path(relative) for relative in artifact.files
+        }
+        expected_temporaries = {
+            path.parent / f".{path.name}.tmp" for path in expected_files
+        }
+        allowed_files = expected_files | expected_temporaries
+        identities: dict[Path, tuple[int, int]] = {}
+        children: dict[Path, frozenset[str]] = {}
+        files: list[Path] = []
+        pending = [stage_relative]
+        while pending:
+            directory = pending.pop()
+            absolute = root / directory
+            before = absolute.lstat()
+            self._require_direct_directory(before)
+            identity = self._directory_identity(before)
+            identities[directory] = identity
+            names: set[str] = set()
+            with os.scandir(absolute) as entries:
+                for entry in entries:
+                    names.add(entry.name)
+                    path = directory / entry.name
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode) and not (
+                        stat.S_ISLNK(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0)
+                        & _WINDOWS_REPARSE_POINT
                     ):
-                        return
-                    lease.rmdir(directory)
-                    lease.fsync_directory(parent)
-            except (FileNotFoundError, OSError, ValueError):
-                return
+                        if path not in expected_directories:
+                            raise ValueError("unexpected cleanup entry")
+                        pending.append(path)
+                    elif stat.S_ISREG(info.st_mode) and not (
+                        stat.S_ISLNK(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0)
+                        & _WINDOWS_REPARSE_POINT
+                    ):
+                        if path not in allowed_files:
+                            raise ValueError("unexpected cleanup entry")
+                        files.append(path)
+                    else:
+                        raise ValueError("unsafe cleanup entry")
+            after = absolute.lstat()
+            self._require_direct_directory(after)
+            if self._directory_identity(after) != identity:
+                raise ValueError("cleanup directory identity changed")
+            children[directory] = frozenset(names)
+
+        directories = tuple(
+            sorted(identities, key=lambda path: (len(path.parts), str(path)))
+        )
+        retained = tuple(
+            path
+            for path in (stage_relative.parent, *directories)
+            if path != Path(".")
+        )
+        with guard_state_root(root, retained_dirs=retained) as lease:
+            for directory in directories:
+                info = lease.stat(directory)
+                self._require_direct_directory(info)
+                if self._directory_identity(info) != identities[directory]:
+                    raise ValueError("cleanup directory identity changed")
+                if frozenset(lease.listdir(directory)) != children[directory]:
+                    raise ValueError("cleanup tree changed during preflight")
+        return _CleanupTree(
+            directories=directories,
+            identities=identities,
+            files=tuple(sorted(files, key=str)),
+            children=children,
+        )
 
     def _validate_generation_directory(
         self, root: Path, relative: Path, artifact: VersionedArtifact

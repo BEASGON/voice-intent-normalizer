@@ -984,6 +984,292 @@ def test_generation_publication_callback_failure_never_removes_journal_anchor(
     assert result.changed_paths.count(layout.transaction) == 1
 
 
+def test_conflicting_journal_fails_closed_before_status_transition(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch a transition overwriting journal bytes that no longer match ownership."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_stage = generic_adapter._stage_and_publish_generation
+    conflict = b'{"conflict":"preserve-exactly"}'
+
+    def conflict_after_publication(*args, **kwargs):
+        result = original_stage(*args, **kwargs)
+        layout.transaction.write_bytes(conflict)
+        return result
+
+    monkeypatch.setattr(
+        generic_adapter,
+        "_stage_and_publish_generation",
+        conflict_after_publication,
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "failed"
+    assert layout.transaction.read_bytes() == conflict
+    assert not layout.status.exists()
+    assert len(tuple(layout.generations.iterdir())) == 1
+
+
+def test_unreadable_journal_fails_closed_before_status_transition(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch a journal read error being treated as permission to replace bytes."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_stage = generic_adapter._stage_and_publish_generation
+    original_read = StateRootLease.read_bytes
+    armed = False
+
+    def arm_after_publication(*args, **kwargs):
+        nonlocal armed
+        result = original_stage(*args, **kwargs)
+        armed = True
+        return result
+
+    def fail_journal_read(lease, relative, limit, label="state file"):
+        if armed and Path(relative) == Path("adapters/generic/transaction.json"):
+            raise OSError("injected unreadable journal")
+        return original_read(lease, relative, limit, label)
+
+    monkeypatch.setattr(
+        generic_adapter, "_stage_and_publish_generation", arm_after_publication
+    )
+    monkeypatch.setattr(StateRootLease, "read_bytes", fail_journal_read)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "failed"
+    assert layout.transaction.is_file()
+    assert not layout.status.exists()
+    assert len(tuple(layout.generations.iterdir())) == 1
+
+
+def test_callback_internal_failure_preserves_final_even_if_journal_conflicts(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch an incomplete publication callback deleting a journal-owned final."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_prepare = generic_adapter._prepare_versioned_artifacts
+    original_record = generic_adapter._record_changes
+    conflict = b'{"conflict":"callback-internal"}'
+    candidate = None
+
+    def capture_artifacts(nonce: str):
+        nonlocal candidate
+        artifacts = original_prepare(nonce)
+        candidate = artifacts.generation
+        return artifacts
+
+    def fail_generation_callback(paths):
+        if candidate is not None and any(
+            path == layout.generations / candidate.identifier for path in paths
+        ):
+            layout.transaction.write_bytes(conflict)
+            raise OSError("injected failure inside publication callback")
+        original_record(paths)
+
+    monkeypatch.setattr(
+        generic_adapter, "_prepare_versioned_artifacts", capture_artifacts
+    )
+    monkeypatch.setattr(generic_adapter, "_record_changes", fail_generation_callback)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert candidate is not None
+    final = layout.generations / candidate.identifier
+    assert result.status == "failed"
+    assert layout.transaction.read_bytes() == conflict
+    assert final.is_dir()
+    assert (final / "generation.json").is_file()
+    assert not layout.status.exists()
+
+
+def test_generation_manifest_precedes_actual_nested_directory_creation(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch retained-directory setup creating nested stage paths before manifest."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    events: list[tuple[str, Path]] = []
+    original_mkdir = StateRootLease.mkdir
+    original_write = StateRootLease.write_bytes_exclusive
+
+    def observe_mkdir(lease, relative, *, mode=0o700, exist_ok=False):
+        relative = Path(relative)
+        if Path("adapters/generic/staging") in relative.parents:
+            events.append(("mkdir", relative))
+        return original_mkdir(lease, relative, mode=mode, exist_ok=exist_ok)
+
+    def observe_write(lease, relative, data):
+        relative = Path(relative)
+        if relative.name == "generation.json":
+            events.append(("manifest", relative))
+        return original_write(lease, relative, data)
+
+    monkeypatch.setattr(StateRootLease, "mkdir", observe_mkdir)
+    monkeypatch.setattr(StateRootLease, "write_bytes_exclusive", observe_write)
+
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+
+    kinds = [kind for kind, _ in events]
+    assert "mkdir" in kinds
+    assert kinds[0] == "manifest"
+    assert all(kind == "mkdir" for kind in kinds[1:])
+
+
+@pytest.mark.parametrize("failure", ("unlink", "rmdir", "fsync"))
+def test_candidate_cleanup_propagates_filesystem_failures(
+    failure: str,
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch cleanup swallowing a destructive filesystem operation failure."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_publish = StateRootLease.publish_directory_no_replace
+    original_unlink = StateRootLease.unlink
+    original_rmdir = StateRootLease.rmdir
+    original_fsync = StateRootLease.fsync_directory
+    cleanup_started = False
+    injected = False
+
+    def fail_publication(
+        lease, source, destination, expected_identity, *, on_committed=None
+    ):
+        nonlocal cleanup_started
+        if Path(destination).parent == Path("adapters/generic/generations"):
+            cleanup_started = True
+            raise OSError("injected publication failure")
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=on_committed,
+        )
+
+    def fail_unlink(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        if failure == "unlink" and cleanup_started and not injected:
+            injected = True
+            raise OSError("cleanup unlink failure")
+        return original_unlink(lease, relative, missing_ok=missing_ok)
+
+    def fail_rmdir(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        if failure == "rmdir" and cleanup_started and not injected:
+            injected = True
+            raise OSError("cleanup rmdir failure")
+        return original_rmdir(lease, relative, missing_ok=missing_ok)
+
+    def fail_fsync(lease, relative=Path(".")):
+        nonlocal injected
+        if failure == "fsync" and cleanup_started and not injected:
+            injected = True
+            raise OSError("cleanup fsync failure")
+        return original_fsync(lease, relative)
+
+    monkeypatch.setattr(
+        StateRootLease, "publish_directory_no_replace", fail_publication
+    )
+    monkeypatch.setattr(StateRootLease, "unlink", fail_unlink)
+    monkeypatch.setattr(StateRootLease, "rmdir", fail_rmdir)
+    monkeypatch.setattr(StateRootLease, "fsync_directory", fail_fsync)
+
+    with generic_adapter._state_operation(create=True):
+        with pytest.raises(OSError, match=f"cleanup {failure} failure"):
+            generic_adapter._first_install(
+                skill_root, InstallOptions(output_dir=skill_root)
+            )
+
+    assert injected
+    assert layout.transaction.is_file()
+
+
+def test_candidate_cleanup_extra_entry_causes_zero_deletions(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch cleanup deleting declared files before discovering a conflict."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_publish = StateRootLease.publish_directory_no_replace
+    original_unlink = StateRootLease.unlink
+    original_prepare = generic_adapter._prepare_versioned_artifacts
+    candidate = None
+    unlink_calls = 0
+    conflict_bytes = b"preserve conflict"
+
+    def capture_artifacts(nonce: str):
+        nonlocal candidate
+        artifacts = original_prepare(nonce)
+        candidate = artifacts.generation
+        return artifacts
+
+    def add_conflict_then_fail(
+        lease, source, destination, expected_identity, *, on_committed=None
+    ):
+        if Path(destination).parent == Path("adapters/generic/generations"):
+            extra = generic_adapter.state_paths.root / Path(source) / "unexpected.bin"
+            extra.write_bytes(conflict_bytes)
+            raise OSError("injected publication failure with extra entry")
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=on_committed,
+        )
+
+    def count_unlinks(lease, relative, *, missing_ok=False):
+        nonlocal unlink_calls
+        if Path("adapters/generic/staging") in Path(relative).parents:
+            unlink_calls += 1
+        return original_unlink(lease, relative, missing_ok=missing_ok)
+
+    monkeypatch.setattr(
+        generic_adapter, "_prepare_versioned_artifacts", capture_artifacts
+    )
+    monkeypatch.setattr(
+        StateRootLease, "publish_directory_no_replace", add_conflict_then_fail
+    )
+    monkeypatch.setattr(StateRootLease, "unlink", count_unlinks)
+
+    with generic_adapter._state_operation(create=True):
+        with pytest.raises(ValueError, match="unexpected cleanup entry"):
+            generic_adapter._first_install(
+                skill_root, InstallOptions(output_dir=skill_root)
+            )
+
+    assert candidate is not None
+    stage = layout.staging / candidate.identifier
+    assert unlink_calls == 0
+    assert (stage / "unexpected.bin").read_bytes() == conflict_bytes
+    for relative, expected in candidate.files.items():
+        assert (stage / relative).read_bytes() == expected
+    assert layout.transaction.is_file()
+
+
 def test_each_status_transition_journals_exact_before_and_after_digests(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
