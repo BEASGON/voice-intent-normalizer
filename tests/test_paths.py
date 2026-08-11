@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from hashlib import sha256
 from pathlib import Path
@@ -9,6 +10,128 @@ import pytest
 
 import voice_intent_normalizer.paths as paths_module
 from voice_intent_normalizer.paths import StatePaths, guard_state_root
+
+
+def test_publish_file_no_replace_exact_moves_validated_identity(tmp_path):
+    """Catch identity-bound file publication degrading to check-then-rename."""
+    root = tmp_path / "state"
+    root.mkdir()
+    source = root / "source.bin"
+    source.write_bytes(b"exact owned bytes")
+    info = source.stat()
+    commits: list[str] = []
+
+    with guard_state_root(root) as lease:
+        lease.publish_file_no_replace_exact(
+            "source.bin",
+            "bound.bin",
+            expected_identity=(info.st_dev, info.st_ino),
+            expected_bytes=b"exact owned bytes",
+            limit=64,
+            on_committed=lambda: commits.append("committed"),
+        )
+
+    bound = root / "bound.bin"
+    assert not source.exists()
+    assert bound.read_bytes() == b"exact owned bytes"
+    assert (bound.stat().st_dev, bound.stat().st_ino) == (
+        info.st_dev,
+        info.st_ino,
+    )
+    assert commits == ["committed"]
+
+
+def test_publish_file_no_replace_exact_preserves_boundary_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """A source-name replacement at native move time must never be consumed."""
+    root = tmp_path / "state"
+    root.mkdir()
+    source = root / "source.bin"
+    displaced = root / "displaced-owned.bin"
+    source.write_bytes(b"exact owned bytes")
+    info = source.stat()
+
+    if os.name == "nt":
+        native = paths_module._move_windows_handle_no_replace
+
+        def replace_at_native_boundary(descriptor, destination):
+            source.rename(displaced)
+            source.write_bytes(b"replacement bytes")
+            native(descriptor, destination)
+
+        monkeypatch.setattr(
+            paths_module,
+            "_move_windows_handle_no_replace",
+            replace_at_native_boundary,
+        )
+    elif sys.platform.startswith("linux"):
+        native = paths_module._rename_linux_directory_no_replace
+
+        def replace_at_native_boundary(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        ):
+            source.rename(displaced)
+            source.write_bytes(b"replacement bytes")
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+
+        monkeypatch.setattr(
+            paths_module,
+            "_rename_linux_directory_no_replace",
+            replace_at_native_boundary,
+        )
+    elif sys.platform == "darwin":
+        native = paths_module._rename_darwin_directory_no_replace
+
+        def replace_at_native_boundary(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        ):
+            source.rename(displaced)
+            source.write_bytes(b"replacement bytes")
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+
+        monkeypatch.setattr(
+            paths_module,
+            "_rename_darwin_directory_no_replace",
+            replace_at_native_boundary,
+        )
+    else:
+        pytest.skip("native exclusive file moves are unsupported")
+
+    with guard_state_root(root) as lease:
+        with pytest.raises((OSError, ValueError)):
+            lease.publish_file_no_replace_exact(
+                "source.bin",
+                "bound.bin",
+                expected_identity=(info.st_dev, info.st_ino),
+                expected_bytes=b"exact owned bytes",
+                limit=64,
+            )
+
+    assert source.read_bytes() == b"replacement bytes"
+    surviving_owned = [
+        path
+        for path in (displaced, root / "bound.bin")
+        if path.exists() and path.read_bytes() == b"exact owned bytes"
+    ]
+    assert len(surviving_owned) == 1
 
 
 def test_voice_intent_home_overrides_default(tmp_path):

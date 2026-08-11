@@ -71,9 +71,12 @@ class _CleanupTree:
 class _JournalCleanupTree:
     identity: tuple[int, int]
     manifest_bytes: bytes | None
+    manifest_path: Path | None
+    binding_complete: bool
     directories: tuple[Path, ...]
     identities: Mapping[Path, tuple[int, int]]
     files: tuple[Path, ...]
+    sources: Mapping[Path, Path]
     file_identities: Mapping[Path, tuple[int, int]]
     file_bytes: Mapping[Path, bytes]
     children: Mapping[Path, frozenset[str]]
@@ -851,10 +854,29 @@ class GenericAdapter:
             raise ValueError(
                 "journal candidate exists at both staging and final names"
             )
-        selected = stage_relative if stage_exists else final_relative
-        if stage_exists or final_exists:
-            tree = self._preflight_journal_cleanup(selected, journal)
-            self._remove_journal_candidate(selected, tree)
+        if final_exists:
+            tree = self._preflight_journal_cleanup(final_relative, journal)
+            with guard_state_root(
+                self.state_paths.root,
+                retained_dirs=(_STAGING_RELATIVE, _GENERATIONS_RELATIVE),
+            ) as publication:
+                publication.publish_directory_no_replace(
+                    final_relative,
+                    stage_relative,
+                    tree.identity,
+                    on_committed=lambda: self._record_changes(
+                        (
+                            self.state_paths.root / final_relative,
+                            self.state_paths.root / stage_relative,
+                        )
+                    ),
+                )
+                publication.fsync_directory(_GENERATIONS_RELATIVE)
+                publication.fsync_directory(_STAGING_RELATIVE)
+            stage_exists = True
+        if stage_exists:
+            tree = self._preflight_journal_cleanup(stage_relative, journal)
+            self._remove_journal_candidate(stage_relative, tree, journal)
 
         # Conservatively make a prior successful rmdir durable before the
         # journal itself is retired, even when this process observed no name.
@@ -1856,6 +1878,16 @@ class GenericAdapter:
                 lease.rmdir(directory)
                 lease.fsync_directory(parent)
 
+    @staticmethod
+    def _journal_cleanup_bound_path(
+        relative: Path, source: Path, journal: OwnershipJournal
+    ) -> Path:
+        name = source.relative_to(relative).as_posix()
+        digest = hashlib.sha256(
+            f"{journal.transaction_id}\0{name}".encode()
+        ).hexdigest()[:32]
+        return source.parent / f".journal-clean-{digest}"
+
     def _preflight_journal_cleanup(
         self, relative: Path, journal: OwnershipJournal
     ) -> _JournalCleanupTree:
@@ -1875,18 +1907,38 @@ class GenericAdapter:
             return _JournalCleanupTree(
                 identity=root_identity,
                 manifest_bytes=None,
+                manifest_path=None,
+                binding_complete=False,
                 directories=(relative,),
                 identities={relative: root_identity},
                 files=(),
+                sources={},
                 file_identities={},
                 file_bytes={},
                 children={relative: frozenset()},
             )
-        if "generation.json" not in root_names:
-            raise ValueError("journal candidate content has no anchored manifest")
+        manifest_source = relative / "generation.json"
+        manifest_bound = self._journal_cleanup_bound_path(
+            relative, manifest_source, journal
+        )
+        manifest_names = {
+            path.name
+            for path in (manifest_source, manifest_bound)
+            if path.name in root_names
+        }
+        if len(manifest_names) != 1:
+            raise ValueError("journal candidate has no single cleanup manifest")
+        manifest_path = (
+            manifest_source
+            if manifest_source.name in manifest_names
+            else manifest_bound
+        )
+        binding_complete = manifest_path == manifest_bound
+        if binding_complete and not partial_staging:
+            raise ValueError("final journal candidate contains cleanup state")
         with guard_state_root(root, retained_dirs=(relative,)) as lease:
             manifest_bytes = lease.read_bytes(
-                relative / "generation.json",
+                manifest_path,
                 _MANIFEST_LIMIT,
                 "journal candidate manifest",
             )
@@ -1904,12 +1956,24 @@ class GenericAdapter:
         temporary_files = {
             path.parent / f".{path.name}.tmp" for path in declared_files
         }
-        allowed_files = declared_files | {relative / "generation.json"}
+        allowed_sources = declared_files | {manifest_source}
         if partial_staging:
-            allowed_files |= temporary_files
+            allowed_sources |= temporary_files
+        bound_paths = {
+            source: self._journal_cleanup_bound_path(relative, source, journal)
+            for source in allowed_sources
+        }
+        if len(set(bound_paths.values())) != len(bound_paths):
+            raise OSError("journal cleanup binding collision")
+        source_by_path = {
+            bound: source for source, bound in bound_paths.items()
+        }
+        allowed_paths = allowed_sources | set(source_by_path)
         identities: dict[Path, tuple[int, int]] = {}
         children: dict[Path, frozenset[str]] = {}
         files: list[Path] = []
+        sources: dict[Path, Path] = {manifest_path: manifest_source}
+        observed_sources = {manifest_source}
         pending = [relative]
         while pending:
             directory = pending.pop()
@@ -1929,9 +1993,14 @@ class GenericAdapter:
                             raise ValueError("unexpected journal cleanup directory")
                         pending.append(path)
                     elif stat.S_ISREG(info.st_mode) and not self._is_alias(info):
-                        if path not in allowed_files:
+                        if path not in allowed_paths:
                             raise ValueError("unexpected journal cleanup file")
-                        if path != relative / "generation.json":
+                        source = source_by_path.get(path, path)
+                        if path != manifest_path:
+                            if source in observed_sources:
+                                raise ValueError("journal cleanup file has two names")
+                            observed_sources.add(source)
+                            sources[path] = source
                             files.append(path)
                     else:
                         raise ValueError("unsafe journal cleanup entry")
@@ -1947,8 +2016,11 @@ class GenericAdapter:
         if not partial_staging and (
             set(directories) != expected_directories
             or set(files) != declared_files
+            or any(sources[path] != path for path in files)
         ):
             raise ValueError("final journal candidate is incomplete")
+        if binding_complete and any(sources[path] == path for path in files):
+            raise ValueError("bound journal cleanup regained an original file name")
         retained = tuple(
             sorted(
                 {relative.parent, *directories},
@@ -1967,10 +2039,10 @@ class GenericAdapter:
                     raise ValueError("journal cleanup directory identity changed")
                 if frozenset(lease.listdir(directory)) != children[directory]:
                     raise ValueError("journal cleanup tree changed during preflight")
-            for path in (*files, relative / "generation.json"):
+            for path in (*files, manifest_path):
                 limit = (
                     _MANIFEST_LIMIT
-                    if path == relative / "generation.json"
+                    if path == manifest_path
                     else _MANAGED_FILE_LIMIT
                 )
                 identity, data = self._read_leased_file_snapshot(
@@ -1978,34 +2050,163 @@ class GenericAdapter:
                 )
                 file_identities[path] = identity
                 file_bytes[path] = data
-                if path in declared_files:
-                    name = path.relative_to(relative).as_posix()
+                source = sources[path]
+                if source in declared_files:
+                    name = source.relative_to(relative).as_posix()
                     if hashlib.sha256(data).hexdigest() != hashes[name]:
                         raise ValueError("journal candidate file hash changed")
-            if (
-                lease.read_bytes(
-                    relative / "generation.json",
-                    _MANIFEST_LIMIT,
-                    "journal candidate manifest",
-                )
-                != manifest_bytes
-            ):
-                raise ValueError("journal candidate manifest changed")
         return _JournalCleanupTree(
             identity=root_identity,
             manifest_bytes=manifest_bytes,
+            manifest_path=manifest_path,
+            binding_complete=binding_complete,
             directories=directories,
             identities=identities,
             files=tuple(sorted(files, key=str)),
+            sources=sources,
             file_identities=file_identities,
             file_bytes=file_bytes,
             children=children,
         )
 
-    def _remove_journal_candidate(
-        self, relative: Path, tree: _JournalCleanupTree
+    def _bind_journal_cleanup_files(
+        self,
+        relative: Path,
+        tree: _JournalCleanupTree,
+        journal: OwnershipJournal,
+    ) -> _JournalCleanupTree:
+        if tree.binding_complete:
+            return tree
+        assert tree.manifest_path is not None
+        root = self.state_paths.root
+        retained = tuple(
+            sorted(
+                {relative.parent, *tree.directories},
+                key=lambda path: (len(path.parts), str(path)),
+            )
+        )
+        bound_entries = [
+            (
+                path,
+                tree.sources[path],
+                tree.file_identities[path],
+                tree.file_bytes[path],
+            )
+            for path in tree.files
+            if path != tree.sources[path]
+        ]
+        try:
+            with guard_state_root(root, retained_dirs=retained) as lease:
+                for directory in tree.directories:
+                    current = lease.stat(directory)
+                    self._require_direct_directory(current)
+                    if (
+                        self._directory_identity(current)
+                        != tree.identities[directory]
+                        or frozenset(lease.listdir(directory))
+                        != tree.children[directory]
+                    ):
+                        raise ValueError("journal cleanup changed before binding")
+                for path in (*tree.files, tree.manifest_path):
+                    self._require_journal_cleanup_file(lease, path, tree)
+                for source in (
+                    tree.sources[path]
+                    for path in tree.files
+                    if path == tree.sources[path]
+                ):
+                    bound = self._journal_cleanup_bound_path(
+                        relative, source, journal
+                    )
+                    identity = tree.file_identities[source]
+                    data = tree.file_bytes[source]
+                    lease.publish_file_no_replace_exact(
+                        source,
+                        bound,
+                        expected_identity=identity,
+                        expected_bytes=data,
+                        limit=_MANAGED_FILE_LIMIT,
+                        on_committed=lambda source=source, bound=bound: (
+                            self._record_changes((root / source, root / bound))
+                        ),
+                    )
+                    bound_entries.append((bound, source, identity, data))
+                manifest = tree.manifest_path
+                manifest_bound = self._journal_cleanup_bound_path(
+                    relative, tree.sources[manifest], journal
+                )
+                manifest_identity = tree.file_identities[manifest]
+                lease.publish_file_no_replace_exact(
+                    manifest,
+                    manifest_bound,
+                    expected_identity=manifest_identity,
+                    expected_bytes=tree.file_bytes[manifest],
+                    limit=_MANIFEST_LIMIT,
+                    on_committed=lambda: self._record_changes(
+                        (root / manifest, root / manifest_bound)
+                    ),
+                )
+                bound_entries.append(
+                    (
+                        manifest_bound,
+                        tree.sources[manifest],
+                        manifest_identity,
+                        tree.file_bytes[manifest],
+                    )
+                )
+                for directory in {path.parent for path, *_ in bound_entries}:
+                    lease.fsync_directory(directory)
+            bound_tree = self._preflight_journal_cleanup(relative, journal)
+            if not bound_tree.binding_complete:
+                raise ValueError("journal cleanup binding did not complete")
+            return bound_tree
+        except BaseException:
+            self._restore_journal_cleanup_bindings(relative, bound_entries)
+            raise
+
+    def _restore_journal_cleanup_bindings(
+        self,
+        relative: Path,
+        entries: Sequence[tuple[Path, Path, tuple[int, int], bytes]],
     ) -> None:
-        """Remove only one preflighted candidate, keeping its manifest last."""
+        if not entries:
+            return
+        root = self.state_paths.root
+        directories = {
+            relative,
+            *(path.parent for entry in entries for path in entry[:2]),
+        }
+        with guard_state_root(root, retained_dirs=tuple(directories)) as lease:
+            for bound, source, identity, data in reversed(entries):
+                if not lease.exists(bound):
+                    continue
+                if lease.exists(source):
+                    raise ValueError(
+                        "journal cleanup binding cannot be restored over a replacement"
+                    )
+                lease.publish_file_no_replace_exact(
+                    bound,
+                    source,
+                    expected_identity=identity,
+                    expected_bytes=data,
+                    limit=(
+                        _MANIFEST_LIMIT
+                        if source.name == "generation.json"
+                        else _MANAGED_FILE_LIMIT
+                    ),
+                    on_committed=lambda bound=bound, source=source: (
+                        self._record_changes((root / bound, root / source))
+                    ),
+                )
+            for directory in directories:
+                lease.fsync_directory(directory)
+
+    def _remove_journal_candidate(
+        self,
+        relative: Path,
+        tree: _JournalCleanupTree,
+        journal: OwnershipJournal,
+    ) -> None:
+        """Remove only one bound candidate, keeping its manifest last."""
         root = self.state_paths.root
         if tree.manifest_bytes is None:
             with guard_state_root(root, retained_dirs=(relative.parent,)) as lease:
@@ -2023,6 +2224,8 @@ class GenericAdapter:
                 lease.fsync_directory(relative.parent)
             return
 
+        tree = self._bind_journal_cleanup_files(relative, tree, journal)
+        assert tree.manifest_path is not None and tree.binding_complete
         retained = tuple(
             sorted(
                 {relative.parent, *tree.directories},
@@ -2036,11 +2239,10 @@ class GenericAdapter:
                 if self._directory_identity(current) != tree.identities[directory]:
                     raise ValueError("journal cleanup directory identity changed")
                 if frozenset(lease.listdir(directory)) != tree.children[directory]:
-                    raise ValueError("journal cleanup tree changed after preflight")
-            for path in (*tree.files, relative / "generation.json"):
+                    raise ValueError("journal cleanup tree changed after binding")
+            for path in (*tree.files, tree.manifest_path):
                 self._require_journal_cleanup_file(lease, path, tree)
             for path in tree.files:
-                self._require_journal_cleanup_file(lease, path, tree)
                 try:
                     lease.unlink(path)
                 except OSError:
@@ -2054,9 +2256,7 @@ class GenericAdapter:
             key=lambda path: (len(path.parts), str(path)),
             reverse=True,
         ):
-            with guard_state_root(
-                root, retained_dirs=(directory.parent,)
-            ) as lease:
+            with guard_state_root(root, retained_dirs=(directory.parent,)) as lease:
                 current = lease.stat(directory)
                 self._require_direct_directory(current)
                 if self._directory_identity(current) != tree.identities[directory]:
@@ -2070,13 +2270,13 @@ class GenericAdapter:
                 self._record_changes((root / directory,))
                 lease.fsync_directory(directory.parent)
 
-        manifest = relative / "generation.json"
+        manifest = tree.manifest_path
         with guard_state_root(root, retained_dirs=(relative,)) as lease:
             current = lease.stat(relative)
             self._require_direct_directory(current)
             if self._directory_identity(current) != tree.identity:
                 raise ValueError("journal candidate identity changed")
-            if frozenset(lease.listdir(relative)) != {"generation.json"}:
+            if frozenset(lease.listdir(relative)) != {manifest.name}:
                 raise ValueError("journal candidate changed before retirement")
             self._require_journal_cleanup_file(lease, manifest, tree)
             try:

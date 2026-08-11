@@ -348,6 +348,136 @@ class StateRootLease:
         self.write_bytes_exclusive(destination, data)
         return False
 
+    def publish_file_no_replace_exact(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        expected_identity: tuple[int, int],
+        expected_bytes: bytes,
+        limit: int,
+        on_committed: Callable[[], None] | None = None,
+    ) -> None:
+        """Move one exact regular-file identity to an absent bound name."""
+        if (
+            not isinstance(expected_identity, tuple)
+            or len(expected_identity) != 2
+            or any(type(value) is not int or value < 0 for value in expected_identity)
+            or not isinstance(expected_bytes, bytes)
+            or len(expected_bytes) > limit
+            or limit < 0
+        ):
+            raise ValueError("invalid exact file publication contract")
+        source_parts = _relative_path_parts(source)
+        destination_parts = _relative_path_parts(destination)
+        source_binding, source_name = self._file_binding(source_parts)
+        destination_binding, destination_name = self._file_binding(
+            destination_parts
+        )
+        if source_binding.path is not None and destination_binding.path is not None:
+            source_path = source_binding.path / source_name
+            destination_path = destination_binding.path / destination_name
+            with _open_windows_regular_file_for_move(source_path) as descriptor:
+                if (
+                    _stat_identity(os.fstat(descriptor)) != expected_identity
+                    or _read_descriptor_bytes(descriptor, limit) != expected_bytes
+                ):
+                    raise ValueError("exact file publication source changed")
+                try:
+                    _move_windows_handle_no_replace(descriptor, destination_path)
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) in {80, 183}:
+                        raise FileExistsError(
+                            getattr(exc, "winerror", 183),
+                            "exact file publication destination exists",
+                            destination_path,
+                        ) from exc
+                    raise
+                if on_committed is not None:
+                    on_committed()
+                if (
+                    _stat_identity(os.fstat(descriptor)) != expected_identity
+                    or _read_descriptor_bytes(descriptor, limit) != expected_bytes
+                ):
+                    raise OSError("published file handle changed")
+                try:
+                    os.lstat(source_path)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError(
+                        "exact file publication source name was replaced"
+                    )
+            published = _open_windows_regular_file(destination_path)
+            try:
+                if (
+                    _stat_identity(os.fstat(published)) != expected_identity
+                    or _read_descriptor_bytes(published, limit) != expected_bytes
+                ):
+                    raise OSError("published file identity does not match")
+            finally:
+                os.close(published)
+            return
+        if (
+            source_binding.descriptor is None
+            or destination_binding.descriptor is None
+        ):
+            raise OSError("retained directories have incompatible identities")
+        if sys.platform.startswith("linux"):
+            native_rename = _rename_linux_directory_no_replace
+        elif sys.platform == "darwin":
+            native_rename = _rename_darwin_directory_no_replace
+        else:
+            raise OSError("secure exact file publication is unsupported")
+        with self.open_regular(source, "exact file publication source") as descriptor:
+            if (
+                _stat_identity(os.fstat(descriptor)) != expected_identity
+                or _read_descriptor_bytes(descriptor, limit) != expected_bytes
+            ):
+                raise ValueError("exact file publication source changed")
+            native_rename(
+                source_binding.descriptor,
+                source_name,
+                destination_binding.descriptor,
+                destination_name,
+            )
+            if on_committed is not None:
+                on_committed()
+            try:
+                published = os.open(
+                    destination_name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=destination_binding.descriptor,
+                )
+                try:
+                    if (
+                        _stat_identity(os.fstat(published)) != expected_identity
+                        or _read_descriptor_bytes(published, limit) != expected_bytes
+                    ):
+                        raise ValueError("published file identity does not match")
+                finally:
+                    os.close(published)
+                try:
+                    os.stat(
+                        source_name,
+                        dir_fd=source_binding.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError(
+                        "exact file publication source name was replaced"
+                    )
+            except BaseException:
+                native_rename(
+                    destination_binding.descriptor,
+                    destination_name,
+                    source_binding.descriptor,
+                    source_name,
+                )
+                raise
+
     def publish_directory_no_replace(
         self,
         source: str | Path,

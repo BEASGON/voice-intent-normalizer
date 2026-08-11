@@ -251,6 +251,15 @@ def _dedupe_expected_paths(*groups: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(path for group in groups for path in group))
 
 
+def _journal_cleanup_bound_path(
+    candidate: Path, relative: Path, transaction_id: str
+) -> Path:
+    digest = hashlib.sha256(
+        f"{transaction_id}\0{relative.as_posix()}".encode()
+    ).hexdigest()[:32]
+    return candidate / relative.parent / f".journal-clean-{digest}"
+
+
 def _expected_initial_cleanup_paths(
     layout,
     candidate_id: str,
@@ -265,6 +274,9 @@ def _expected_initial_cleanup_paths(
         return candidate, *transaction
     directories, files = _tree_relative_entries(candidate)
     data_files = tuple(path for path in files if path.name != "generation.json")
+    cleanup_candidate = layout.staging / candidate_id
+    transaction_id = json.loads(layout.transaction.read_bytes())["transaction_id"]
+
     child_directories = tuple(
         sorted(
             (path for path in directories if path != Path(".")),
@@ -272,12 +284,30 @@ def _expected_initial_cleanup_paths(
             reverse=True,
         )
     )
-    return (
-        *(candidate / path for path in data_files),
-        *(candidate / path for path in child_directories),
-        candidate / "generation.json",
-        candidate,
-        *transaction,
+    publication = (
+        (candidate, cleanup_candidate) if state == "initial-final" else ()
+    )
+    binding = tuple(
+        path
+        for relative in data_files
+        for path in (
+            cleanup_candidate / relative,
+            _journal_cleanup_bound_path(
+                cleanup_candidate, relative, transaction_id
+            ),
+        )
+    ) + (
+        cleanup_candidate / "generation.json",
+        _journal_cleanup_bound_path(
+            cleanup_candidate, Path("generation.json"), transaction_id
+        ),
+    )
+    return _dedupe_expected_paths(
+        publication,
+        binding,
+        tuple(cleanup_candidate / path for path in child_directories),
+        (cleanup_candidate,),
+        transaction,
     )
 
 
@@ -2492,14 +2522,295 @@ def test_ownership_journal_review_round1_rechecks_file_identity_before_deletion(
     ) == before_paths
 
 
+@pytest.mark.parametrize("target_name", ("SKILL.md", "generation.json"))
+def test_ownership_journal_review_round2_preserves_replacement_at_move_boundary(
+    target_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Bind the exact owned file before a boundary-time replacement can delete it."""
+    scenario = _materialize_journal_state(tmp_path, "initial-complete-stage")
+    layout = generic_layout_paths(scenario.state_paths)
+    candidate = layout.staging / scenario.candidate_id
+    target = candidate / target_name
+    displaced = target.with_name(f".{target.name}.displaced-at-boundary")
+    original_bytes = target.read_bytes()
+    journal_bytes = layout.transaction.read_bytes()
+    transaction_id = json.loads(journal_bytes)["transaction_id"]
+    bound_target = _journal_cleanup_bound_path(
+        candidate, Path(target_name), transaction_id
+    )
+    expected_files = {
+        path.relative_to(candidate): path.read_bytes()
+        for path in candidate.rglob("*")
+        if path.is_file()
+    }
+    injected = False
+
+    def inject_replacement() -> None:
+        nonlocal injected
+        assert not injected
+        target.rename(displaced)
+        target.write_bytes(b"replacement at exact boundary")
+        injected = True
+
+    if os.name == "nt":
+        native = paths_module._move_windows_handle_no_replace
+
+        def move_with_boundary_replacement(descriptor, destination):
+            if Path(destination) == bound_target:
+                inject_replacement()
+            native(descriptor, destination)
+
+        monkeypatch.setattr(
+            paths_module,
+            "_move_windows_handle_no_replace",
+            move_with_boundary_replacement,
+        )
+    elif sys.platform.startswith("linux"):
+        native = paths_module._rename_linux_directory_no_replace
+
+        def move_with_boundary_replacement(
+            source_parent, source_name, destination_parent, destination_name
+        ):
+            if destination_name == bound_target.name:
+                inject_replacement()
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+
+        monkeypatch.setattr(
+            paths_module,
+            "_rename_linux_directory_no_replace",
+            move_with_boundary_replacement,
+        )
+    elif sys.platform == "darwin":
+        native = paths_module._rename_darwin_directory_no_replace
+
+        def move_with_boundary_replacement(
+            source_parent, source_name, destination_parent, destination_name
+        ):
+            if destination_name == bound_target.name:
+                inject_replacement()
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+
+        monkeypatch.setattr(
+            paths_module,
+            "_rename_darwin_directory_no_replace",
+            move_with_boundary_replacement,
+        )
+    else:
+        pytest.skip("native exclusive file moves are unsupported")
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert result.status == "degraded"
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert target.read_bytes() == b"replacement at exact boundary"
+    surviving_owned = [
+        path
+        for path in (displaced, bound_target)
+        if path.exists() and path.read_bytes() == original_bytes
+    ]
+    assert len(surviving_owned) == 1
+    for relative, data in expected_files.items():
+        if relative == Path(target_name):
+            continue
+        assert (candidate / relative).read_bytes() == data
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "data-unlink",
+        "child-rmdir",
+        "manifest-unlink",
+        "root-rmdir",
+        "parent-fsync",
+    ),
+)
+def test_ownership_journal_review_round2_final_cleanup_fault_retries_from_stage(
+    fault: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A complete final is relocated before any retryable partial cleanup."""
+    scenario = _materialize_journal_state(tmp_path, "initial-final")
+    layout = generic_layout_paths(scenario.state_paths)
+    final = layout.generations / scenario.candidate_id
+    stage = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    transaction_id = json.loads(journal_bytes)["transaction_id"]
+
+    stage_relative = (
+        Path("adapters/generic/staging") / scenario.candidate_id
+    )
+
+    def bound(relative: Path) -> Path:
+        return _journal_cleanup_bound_path(
+            stage_relative, relative, transaction_id
+        )
+
+    bound_data = bound(Path("SKILL.md"))
+    bound_manifest = bound(Path("generation.json"))
+    directories, files = _tree_relative_entries(final)
+    data_files = tuple(path for path in files if path.name != "generation.json")
+    binding_changes = _dedupe_expected_paths(
+        (final, stage),
+        tuple(
+            path
+            for relative in data_files
+            for path in (
+                stage / relative,
+                scenario.state_paths.root / bound(relative),
+            )
+        ),
+        (
+            stage / "generation.json",
+            scenario.state_paths.root / bound_manifest,
+        ),
+    )
+    child_directories = tuple(
+        stage / relative
+        for relative in sorted(
+            (path for path in directories if path != Path(".")),
+            key=lambda path: (len(path.parts), str(path)),
+            reverse=True,
+        )
+    )
+    first_direct_child = next(
+        index
+        for index, path in enumerate(child_directories)
+        if path.parent == stage
+    )
+    original_unlink = StateRootLease.unlink
+    original_rmdir = StateRootLease.rmdir
+    original_fsync = StateRootLease.fsync_directory
+    injected = False
+
+    def unlink_then_fail(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        relative = Path(relative)
+        original_unlink(lease, relative, missing_ok=missing_ok)
+        selected = (fault == "data-unlink" and relative == bound_data) or (
+            fault == "manifest-unlink" and relative == bound_manifest
+        )
+        if selected and not injected:
+            injected = True
+            raise OSError(f"injected post-commit {fault}")
+
+    def rmdir_then_fail(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        relative = Path(relative)
+        original_rmdir(lease, relative, missing_ok=missing_ok)
+        selected = (
+            fault == "child-rmdir"
+            and relative.parent.name == scenario.candidate_id
+        ) or (
+            fault == "root-rmdir"
+            and relative.name == scenario.candidate_id
+        )
+        if selected and not injected:
+            injected = True
+            raise OSError(f"injected post-commit {fault}")
+
+    def fsync_then_fail(lease, relative=Path(".")):
+        nonlocal injected
+        relative = Path(relative)
+        original_fsync(lease, relative)
+        if (
+            fault == "parent-fsync"
+            and relative
+            in {Path("adapters/generic/staging"), Path("adapters/generic/generations")}
+            and not final.exists()
+            and not stage.exists()
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected post-commit candidate-parent fsync")
+
+    monkeypatch.setattr(StateRootLease, "unlink", unlink_then_fail)
+    monkeypatch.setattr(StateRootLease, "rmdir", rmdir_then_fail)
+    monkeypatch.setattr(StateRootLease, "fsync_directory", fsync_then_fail)
+
+    first = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert first.status == "degraded"
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert not final.exists()
+    first_directories = (
+        child_directories[: first_direct_child + 1]
+        if fault == "child-rmdir"
+        else child_directories
+        if fault in {"manifest-unlink", "root-rmdir", "parent-fsync"}
+        else ()
+    )
+    assert first.changed_paths == _dedupe_expected_paths(
+        binding_changes, first_directories
+    )
+
+    second = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert second.status == "not-installed"
+    ordered_bound_files = tuple(
+        sorted((bound(relative) for relative in data_files), key=str)
+    )
+    data_fault_index = ordered_bound_files.index(bound_data)
+    remaining_files = (
+        tuple(
+            scenario.state_paths.root / path
+            for path in ordered_bound_files[data_fault_index + 1 :]
+        )
+        if fault == "data-unlink"
+        else ()
+    )
+    remaining_directories = {
+        "data-unlink": child_directories,
+        "child-rmdir": child_directories[first_direct_child + 1 :],
+        "manifest-unlink": (),
+        "root-rmdir": (),
+        "parent-fsync": (),
+    }[fault]
+    second_tail = (
+        (
+            scenario.state_paths.root / bound_manifest,
+            stage,
+            layout.transaction,
+        )
+        if fault in {"data-unlink", "child-rmdir", "manifest-unlink"}
+        else (layout.transaction,)
+    )
+    assert second.changed_paths == _dedupe_expected_paths(
+        remaining_files, remaining_directories, second_tail
+    )
+    assert not layout.transaction.exists()
+    assert not final.exists()
+    assert not stage.exists()
+
+
 @pytest.mark.parametrize(
     "fault,state,expected_first,expected_second",
     (
         (
             "file-unlink",
             "initial-partial-stage",
-            ("candidate/SKILL.md",),
-            ("candidate/generation.json", "candidate", "transaction"),
+            (
+                "candidate/SKILL.md",
+                "bound/SKILL.md",
+                "candidate/generation.json",
+                "bound/generation.json",
+            ),
+            ("bound/generation.json", "candidate", "transaction"),
         ),
         (
             "directory-removal",
@@ -2522,6 +2833,13 @@ def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
     layout = generic_layout_paths(scenario.state_paths)
     candidate = layout.staging / scenario.candidate_id
     journal_bytes = layout.transaction.read_bytes()
+    transaction_id = json.loads(journal_bytes)["transaction_id"]
+    bound_skill = _journal_cleanup_bound_path(
+        candidate, Path("SKILL.md"), transaction_id
+    )
+    bound_manifest = _journal_cleanup_bound_path(
+        candidate, Path("generation.json"), transaction_id
+    )
     original_unlink = StateRootLease.unlink
     original_rmdir = StateRootLease.rmdir
     injected = False
@@ -2530,7 +2848,11 @@ def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
         nonlocal injected
         relative = Path(relative)
         original_unlink(lease, relative, missing_ok=missing_ok)
-        if fault == "file-unlink" and relative.name == "SKILL.md" and not injected:
+        if (
+            fault == "file-unlink"
+            and relative == bound_skill.relative_to(scenario.state_paths.root)
+            and not injected
+        ):
             injected = True
             raise OSError("injected post-commit file unlink failure")
 
@@ -2555,6 +2877,8 @@ def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
         "candidate": candidate,
         "candidate/SKILL.md": candidate / "SKILL.md",
         "candidate/generation.json": candidate / "generation.json",
+        "bound/SKILL.md": bound_skill,
+        "bound/generation.json": bound_manifest,
         "transaction": layout.transaction,
     }
     assert first.status == "degraded"
@@ -2601,6 +2925,26 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
         layout, scenario.candidate_id, state
     )
     journal_bytes = layout.transaction.read_bytes()
+    transaction_id = json.loads(journal_bytes)["transaction_id"]
+    candidate = layout.staging / scenario.candidate_id
+    bound_skill = _journal_cleanup_bound_path(
+        candidate, Path("SKILL.md"), transaction_id
+    )
+    bound_manifest = _journal_cleanup_bound_path(
+        candidate, Path("generation.json"), transaction_id
+    )
+    binding_expected = (
+        candidate / "SKILL.md",
+        bound_skill,
+        candidate / "generation.json",
+        bound_manifest,
+    )
+    retry_success_expected = (
+        bound_skill,
+        bound_manifest,
+        candidate,
+        layout.transaction,
+    )
     original_unlink = StateRootLease.unlink
     original_rmdir = StateRootLease.rmdir
     original_fsync = StateRootLease.fsync_directory
@@ -2616,7 +2960,8 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
     def fail_unlink(lease, relative, *, missing_ok=False):
         relative = Path(relative)
         selected = (
-            fault == "file-unlink" and relative.name == "SKILL.md"
+            fault == "file-unlink"
+            and relative == bound_skill.relative_to(scenario.state_paths.root)
         ) or (
             fault == "transaction-unlink"
             and relative == Path("adapters/generic/transaction.json")
@@ -2662,6 +3007,9 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
     assert first.status == "degraded"
     assert layout.transaction.read_bytes() == journal_bytes
     first_expected = (
+        binding_expected
+        if fault == "file-unlink"
+        else
         (layout.transaction,)
         if fault in {"transaction-unlink", "generic-parent-fsync"}
         else ()
@@ -2673,13 +3021,19 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
     if repeated:
         assert second.status == "degraded"
         assert layout.transaction.read_bytes() == journal_bytes
-        assert second.changed_paths == first_expected
+        assert second.changed_paths == (
+            () if fault == "file-unlink" else first_expected
+        )
     else:
         assert second.status == "not-installed"
         assert not layout.transaction.exists()
         assert not (layout.staging / scenario.candidate_id).exists()
         assert not (layout.generations / scenario.candidate_id).exists()
-        assert second.changed_paths == success_expected
+        assert second.changed_paths == (
+            retry_success_expected
+            if fault == "file-unlink"
+            else success_expected
+        )
 
 
 @pytest.mark.parametrize(
