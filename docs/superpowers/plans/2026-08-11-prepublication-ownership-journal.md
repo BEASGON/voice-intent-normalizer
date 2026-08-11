@@ -488,7 +488,7 @@ git commit -m "fix: recover journal-owned adapter generations"
 
 ---
 
-### Task 3A: Private-Namespace Cleanup Boundary
+### Task 4: Private-Namespace Cleanup Boundary
 
 **Files:**
 - Modify: `src/voice_intent_normalizer/paths.py`
@@ -593,8 +593,8 @@ In `publish_file_no_replace_exact()`, add `O_NONBLOCK` to every POSIX destinatio
 Run:
 
 ```powershell
-python -m pytest tests/test_paths.py tests/test_installer.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task3a-green" -k "private_cleanup or exact_directory_move or raced_fifo or permanent_delete or cleanup_retry or ownership_journal"
-python -m pytest tests/test_installer.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_generic_layout.py tests/test_paths.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task3a-lifecycle"
+python -m pytest tests/test_paths.py tests/test_installer.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task4-green" -k "private_cleanup or exact_directory_move or raced_fifo or permanent_delete or cleanup_retry or ownership_journal"
+python -m pytest tests/test_installer.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_generic_layout.py tests/test_paths.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task4-lifecycle"
 python -m ruff check src/voice_intent_normalizer/paths.py src/voice_intent_normalizer/adapters/generic.py tests/test_paths.py tests/test_installer.py
 git diff --check
 ```
@@ -603,7 +603,7 @@ Expected: the Windows exact-handle tests, native directory replacement test, all
 
 - [ ] **Step 6: Review and commit the boundary revision**
 
-Give a fresh specification reviewer the approved threat boundary plus only the Task 3A diff. Require separate verdicts for Windows exact deletion, POSIX cooperative private cleanup, public-name replacement preservation, FIFO nonblocking behavior, crash retry, and unchanged public workflows. Give a different code-quality reviewer the four-file diff and focused evidence. Fix Critical or Important findings with a new RED test; if a finding would require adversarial exact POSIX unlink, reject it as outside the approved contract and cite the written design.
+Give a fresh specification reviewer the approved threat boundary plus only the Task 4 diff. Require separate verdicts for Windows exact deletion, POSIX cooperative private cleanup, public-name replacement preservation, FIFO nonblocking behavior, crash retry, and unchanged public workflows. Give a different code-quality reviewer the four-file diff and focused evidence. Fix Critical or Important findings with a new RED test; if a finding would require adversarial exact POSIX unlink, reject it as outside the approved contract and cite the written design.
 
 Commit only the four task files:
 
@@ -614,7 +614,7 @@ git commit -m "fix: isolate journal cleanup across platforms"
 
 ---
 
-### Task 4: Native CI Evidence and Task 11 Closure
+### Task 5: Native CI Evidence and Task 11 Closure
 
 **Files:**
 - Create: `.github/workflows/ci.yml`
@@ -645,7 +645,7 @@ assert "python -m build --no-isolation" in workflow
 Run:
 
 ```powershell
-python -m pytest tests/test_distribution_bundle.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task4-red" -k "ci_runs_native"
+python -m pytest tests/test_distribution_bundle.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task5-red" -k "ci_runs_native"
 ```
 
 Expected: FAIL because `.github/workflows/ci.yml` does not exist.
@@ -666,7 +666,7 @@ Set top-level `permissions: contents: read`. Use `actions/checkout@v6`, `actions
 Run fresh commands with external temp roots:
 
 ```powershell
-python -m pytest tests/test_distribution_bundle.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task4-green" -k "ci_runs_native"
+python -m pytest tests/test_distribution_bundle.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task5-green" -k "ci_runs_native"
 python -m pytest -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-full"
 python -m ruff check src tests setup.py scripts/voice_intent.py
 python -m build --no-isolation
@@ -678,7 +678,7 @@ Build a new virtual environment outside the repository, install the just-built w
 
 - [ ] **Step 4: Run independent review and commit CI**
 
-Give a fresh specification reviewer the approved design, this plan, Task 1-3 commits, and the residual whole-revision finding. Require an explicit verdict for every acceptance criterion. Then give a different fresh code-quality reviewer only the final Task 1-3 diff and test evidence. Fix Important or Critical findings with RED/GREEN and repeat only the affected review.
+Give a fresh specification reviewer the approved design, this plan, Task 1-4 commits, and the residual whole-revision finding. Require an explicit verdict for every acceptance criterion. Then give a different fresh code-quality reviewer only the final Task 1-4 diff and test evidence. Fix Important or Critical findings with RED/GREEN and repeat only the affected review.
 
 Commit the workflow and its contract test:
 
