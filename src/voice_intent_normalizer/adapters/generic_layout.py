@@ -16,19 +16,33 @@ from voice_intent_normalizer.adapters.generic_contract import (
     CapsuleRef,
     GenerationRef,
     StatusV5,
+    _validate_capsule,
+    _validate_generation_ref,
     build_manifest,
     canonical_json_bytes,
     manifest_digest,
+    status_skill_root,
     validate_manifest,
     validate_status_v5,
 )
-from voice_intent_normalizer.paths import StatePaths
+from voice_intent_normalizer.paths import StatePaths, validate_state_root
 
 _WINDOWS_REPARSE_POINT = 0x400
 _MAX_SOURCE_FILES = 4096
 _MAX_SOURCE_BYTES = 64 * 1024 * 1024
 _MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
 _MAX_SOURCE_DEPTH = 32
+_MAX_JOURNAL_BYTES = 8 * 1024 * 1024
+_OWNERSHIP_JOURNAL_FIELDS = {
+    "baseline_status_digest",
+    "candidate",
+    "capsule",
+    "format",
+    "operation",
+    "selected_skill_root",
+    "status_transition",
+    "transaction_id",
+}
 
 _CAPSULE_SOURCES = {
     "SKILL.md": "SKILL.md",
@@ -121,6 +135,29 @@ class VersionedArtifacts:
 
     capsule: VersionedArtifact
     generation: VersionedArtifact
+
+
+@dataclass(frozen=True, slots=True)
+class JournalTransition:
+    """The exact protected-status digest transition owned by one journal."""
+
+    before_digest: str | None
+    after_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class OwnershipJournal:
+    """The one clean-V1 prepublication ownership record."""
+
+    operation: str
+    transaction_id: str
+    selected_skill_root: Path
+    baseline_status_digest: str | None
+    transition: JournalTransition
+    capsule: CapsuleRef
+    candidate: GenerationRef
+    staging_root: Path
+    generation_root: Path
 
 
 def generic_layout_paths(state_paths: StatePaths) -> GenericLayoutPaths:
@@ -344,6 +381,293 @@ def validate_anchored_manifest(
     ):
         raise ValueError("artifact manifest is not anchored by adapter status")
     return manifest
+
+
+def ownership_journal_bytes(
+    *,
+    operation: str,
+    transaction_id: str,
+    skill_root: Path,
+    baseline_status_bytes: bytes | None,
+    before_status_bytes: bytes | None,
+    after_status_bytes: bytes,
+    capsule: CapsuleRef | VersionedArtifact,
+    candidate: GenerationRef | VersionedArtifact,
+) -> bytes:
+    """Build the sole canonical clean-V1 ownership journal."""
+    selected_skill_root = _validated_journal_skill_root(skill_root)
+    baseline_digest = _status_digest(baseline_status_bytes, "baseline status")
+    before_digest = _status_digest(before_status_bytes, "before status")
+    after_digest = _required_status_digest(after_status_bytes, "after status")
+    journal_capsule = _journal_capsule_ref(capsule)
+    journal_candidate = _journal_generation_ref(candidate)
+    _validate_journal_transition(
+        operation=operation,
+        transaction_id=transaction_id,
+        baseline_digest=baseline_digest,
+        before_digest=before_digest,
+        after_digest=after_digest,
+    )
+    return canonical_json_bytes(
+        _ownership_journal_payload(
+            operation=operation,
+            transaction_id=transaction_id,
+            selected_skill_root=selected_skill_root,
+            baseline_digest=baseline_digest,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            capsule=journal_capsule,
+            candidate=journal_candidate,
+        )
+    )
+
+
+def validate_ownership_journal(
+    payload: bytes,
+    *,
+    skill_root: Path,
+    generations_root: Path,
+) -> OwnershipJournal:
+    """Validate exact journal bytes and derive its only owned paths."""
+    if not isinstance(payload, bytes) or len(payload) > _MAX_JOURNAL_BYTES:
+        raise ValueError("invalid adapter ownership journal")
+    try:
+        value = json.loads(
+            payload,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid adapter ownership journal") from exc
+    if not isinstance(value, Mapping) or set(value) != _OWNERSHIP_JOURNAL_FIELDS:
+        raise ValueError("invalid adapter ownership journal fields")
+    if not isinstance(generations_root, Path):
+        raise ValueError("invalid generation root")
+    trusted_generations_root = _validated_journal_generation_root(generations_root)
+    selected_skill_root = _selected_journal_skill_root(value["selected_skill_root"])
+    trusted_skill_root = _validated_journal_skill_root(skill_root)
+    if not _same_journal_root(selected_skill_root, trusted_skill_root):
+        raise ValueError("selected skill root does not match trusted root")
+    operation = value["operation"]
+    transaction_id = value["transaction_id"]
+    baseline_digest = _journal_digest(
+        value["baseline_status_digest"], "baseline status digest", nullable=True
+    )
+    transition = _journal_transition(value["status_transition"])
+    capsule = _validate_capsule(value["capsule"])
+    candidate = _validate_generation_ref(value["candidate"], "candidate generation")
+    _validate_journal_transition(
+        operation=operation,
+        transaction_id=transaction_id,
+        baseline_digest=baseline_digest,
+        before_digest=transition.before_digest,
+        after_digest=transition.after_digest,
+    )
+    expected = canonical_json_bytes(
+        _ownership_journal_payload(
+            operation=operation,
+            transaction_id=transaction_id,
+            selected_skill_root=selected_skill_root,
+            baseline_digest=baseline_digest,
+            before_digest=transition.before_digest,
+            after_digest=transition.after_digest,
+            capsule=capsule,
+            candidate=candidate,
+        )
+    )
+    if payload != expected:
+        raise ValueError("adapter ownership journal is not canonical")
+    return OwnershipJournal(
+        operation=operation,
+        transaction_id=transaction_id,
+        selected_skill_root=selected_skill_root,
+        baseline_status_digest=baseline_digest,
+        transition=transition,
+        capsule=capsule,
+        candidate=candidate,
+        staging_root=trusted_generations_root.parent
+        / "staging"
+        / candidate.generation_id,
+        generation_root=trusted_generations_root / candidate.generation_id,
+    )
+
+
+def _ownership_journal_payload(
+    *,
+    operation: str,
+    transaction_id: str,
+    selected_skill_root: Path,
+    baseline_digest: str | None,
+    before_digest: str | None,
+    after_digest: str,
+    capsule: CapsuleRef,
+    candidate: GenerationRef,
+) -> dict[str, object]:
+    return {
+        "format": 1,
+        "operation": operation,
+        "transaction_id": transaction_id,
+        "selected_skill_root": os.fspath(selected_skill_root),
+        "baseline_status_digest": baseline_digest,
+        "status_transition": {
+            "before_digest": before_digest,
+            "after_digest": after_digest,
+        },
+        "capsule": {
+            "protocol": capsule.protocol,
+            "manifest_digest": capsule.manifest_digest,
+            "package_hash": capsule.package_hash,
+        },
+        "candidate": {
+            "generation_id": candidate.generation_id,
+            "manifest_digest": candidate.manifest_digest,
+            "package_hash": candidate.package_hash,
+            "package_version": candidate.package_version,
+        },
+    }
+
+
+def _journal_capsule_ref(value: CapsuleRef | VersionedArtifact) -> CapsuleRef:
+    if isinstance(value, VersionedArtifact):
+        if value.kind != "capsule" or value.identifier != "voice-intent-normalizer":
+            raise ValueError("invalid capsule reference")
+        value = CapsuleRef(
+            protocol=1,
+            manifest_digest=value.manifest_digest,
+            package_hash=value.package_hash,
+        )
+    return _validate_capsule(
+        {
+            "protocol": value.protocol,
+            "manifest_digest": value.manifest_digest,
+            "package_hash": value.package_hash,
+        }
+    )
+
+
+def _journal_generation_ref(value: GenerationRef | VersionedArtifact) -> GenerationRef:
+    if isinstance(value, VersionedArtifact):
+        if value.kind != "generation":
+            raise ValueError("invalid candidate generation")
+        value = GenerationRef(
+            generation_id=value.identifier,
+            manifest_digest=value.manifest_digest,
+            package_hash=value.package_hash,
+            package_version=value.package_version,
+        )
+    return _validate_generation_ref(
+        {
+            "generation_id": value.generation_id,
+            "manifest_digest": value.manifest_digest,
+            "package_hash": value.package_hash,
+            "package_version": value.package_version,
+        },
+        "candidate generation",
+    )
+
+
+def _status_digest(value: bytes | None, label: str) -> str | None:
+    if value is None:
+        return None
+    return _required_status_digest(value, label)
+
+
+def _required_status_digest(value: bytes, label: str) -> str:
+    if not isinstance(value, bytes):
+        raise ValueError(f"invalid {label}")
+    return hashlib.sha256(value).hexdigest()
+
+
+def _journal_digest(value: object, label: str, *, nullable: bool) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"invalid {label}")
+    return value
+
+
+def _journal_transition(value: object) -> JournalTransition:
+    if not isinstance(value, Mapping) or set(value) != {
+        "before_digest",
+        "after_digest",
+    }:
+        raise ValueError("invalid journal status transition")
+    return JournalTransition(
+        before_digest=_journal_digest(
+            value["before_digest"], "before status digest", nullable=True
+        ),
+        after_digest=_journal_digest(
+            value["after_digest"], "after status digest", nullable=False
+        ) or "",
+    )
+
+
+def _validate_journal_transition(
+    *,
+    operation: object,
+    transaction_id: object,
+    baseline_digest: str | None,
+    before_digest: str | None,
+    after_digest: str,
+) -> None:
+    if (
+        not isinstance(operation, str)
+        or operation not in {"first-install", "upgrade"}
+        or not isinstance(transaction_id, str)
+        or _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
+        or before_digest == after_digest
+    ):
+        raise ValueError("invalid ownership journal transition")
+    if operation == "first-install":
+        if baseline_digest is not None:
+            raise ValueError("first-install journal must not retain a baseline")
+    elif baseline_digest is None or before_digest is None:
+        raise ValueError("upgrade journal requires a baseline transition")
+
+
+def _selected_journal_skill_root(value: object) -> Path:
+    try:
+        selected = status_skill_root(
+            {
+                "format": 5,
+                "layout": "versioned-v1",
+                "selected_skill_root": value,
+                "capability": None,
+                "capsule": None,
+                "active": None,
+                "previous": None,
+                "transaction": None,
+            }
+        )
+    except ValueError as exc:
+        raise ValueError("invalid selected skill root") from exc
+    return _validated_journal_skill_root(selected)
+
+
+def _validated_journal_skill_root(value: object) -> Path:
+    if not isinstance(value, Path):
+        raise ValueError("invalid selected skill root")
+    try:
+        root = validate_state_root(value)
+        info = root.lstat()
+    except (OSError, ValueError) as exc:
+        raise ValueError("selected skill root must be a direct directory") from exc
+    if not stat.S_ISDIR(info.st_mode) or _is_alias(info):
+        raise ValueError("selected skill root must be a direct directory")
+    return root
+
+
+def _validated_journal_generation_root(value: Path) -> Path:
+    try:
+        return validate_state_root(value)
+    except ValueError as exc:
+        raise ValueError("invalid generation root") from exc
+
+
+def _same_journal_root(left: Path, right: Path) -> bool:
+    if os.name == "nt":
+        return os.path.normcase(os.fspath(left)) == os.path.normcase(os.fspath(right))
+    return os.fspath(left) == os.fspath(right)
 
 
 def recovery_marker_bytes(transaction_id: str, status_bytes: bytes) -> bytes:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ from voice_intent_normalizer.adapters.generic_contract import (
     GENERATION_FORMAT,
     LAYOUT_NAME,
     STATUS_FORMAT,
+    CapsuleRef,
+    GenerationRef,
     build_manifest,
     canonical_json_bytes,
     manifest_digest,
@@ -19,13 +22,21 @@ from voice_intent_normalizer.adapters.generic_contract import (
     validate_manifest,
     validate_status_v5,
 )
-from voice_intent_normalizer.adapters.generic_layout import generic_layout_paths
+from voice_intent_normalizer.adapters.generic_layout import (
+    JournalTransition,
+    OwnershipJournal,
+    VersionedArtifact,
+    generic_layout_paths,
+    ownership_journal_bytes,
+    validate_ownership_journal,
+)
 from voice_intent_normalizer.paths import StatePaths
 
 _DIGEST = "a" * 64
 _OTHER_DIGEST = "b" * 64
 _GENERATION_ID = f"g-{'d' * 64}-{'c' * 32}"
 _PREVIOUS_GENERATION_ID = f"g-{'f' * 64}-{'d' * 32}"
+_TRANSACTION_ID = f"t-{'0' * 32}"
 
 
 def _manifest() -> dict[str, object]:
@@ -68,6 +79,270 @@ def _status(skill_root: Path) -> dict[str, object]:
         },
         "transaction": {"id": f"t-{'0' * 32}", "phase": "activation-pending"},
     }
+
+
+def _journal_status(skill_root: Path, *, phase: str | None) -> bytes:
+    """Return exact V5 status bytes for one journal digest transition."""
+    status = _status(skill_root)
+    status["transaction"] = (
+        None if phase is None else {"id": _TRANSACTION_ID, "phase": phase}
+    )
+    return canonical_json_bytes(status)
+
+
+def _journal_references() -> tuple[CapsuleRef, GenerationRef]:
+    """Return independently literal, clean-V1 journal references."""
+    return (
+        CapsuleRef(protocol=1, manifest_digest=_DIGEST, package_hash="e" * 64),
+        GenerationRef(
+            generation_id=_GENERATION_ID,
+            manifest_digest=_DIGEST,
+            package_hash="d" * 64,
+            package_version="1.2.3",
+        ),
+    )
+
+
+def test_ownership_journal_upgrade_round_trip_uses_exact_canonical_bytes(
+    tmp_path: Path,
+):
+    """Catch journals that lose a terminal upgrade baseline or owned roots."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    capsule, candidate = _journal_references()
+    before = _journal_status(skill_root, phase=None)
+    after = _journal_status(skill_root, phase="generation-published")
+
+    payload = ownership_journal_bytes(
+        operation="upgrade",
+        transaction_id=_TRANSACTION_ID,
+        skill_root=skill_root,
+        baseline_status_bytes=before,
+        before_status_bytes=before,
+        after_status_bytes=after,
+        capsule=capsule,
+        candidate=candidate,
+    )
+    journal = validate_ownership_journal(
+        payload,
+        skill_root=skill_root,
+        generations_root=tmp_path / "state" / "generations",
+    )
+
+    assert payload == canonical_json_bytes(
+        {
+            "format": 1,
+            "operation": "upgrade",
+            "transaction_id": _TRANSACTION_ID,
+            "selected_skill_root": str(skill_root),
+            "baseline_status_digest": hashlib.sha256(before).hexdigest(),
+            "status_transition": {
+                "before_digest": hashlib.sha256(before).hexdigest(),
+                "after_digest": hashlib.sha256(after).hexdigest(),
+            },
+            "capsule": {
+                "protocol": 1,
+                "manifest_digest": _DIGEST,
+                "package_hash": "e" * 64,
+            },
+            "candidate": {
+                "generation_id": _GENERATION_ID,
+                "manifest_digest": _DIGEST,
+                "package_hash": "d" * 64,
+                "package_version": "1.2.3",
+            },
+        }
+    )
+    assert set(json.loads(payload)) == {
+        "baseline_status_digest",
+        "candidate",
+        "capsule",
+        "format",
+        "operation",
+        "selected_skill_root",
+        "status_transition",
+        "transaction_id",
+    }
+    assert journal == OwnershipJournal(
+        operation="upgrade",
+        transaction_id=_TRANSACTION_ID,
+        selected_skill_root=skill_root,
+        baseline_status_digest=hashlib.sha256(before).hexdigest(),
+        transition=JournalTransition(
+            before_digest=hashlib.sha256(before).hexdigest(),
+            after_digest=hashlib.sha256(after).hexdigest(),
+        ),
+        capsule=capsule,
+        candidate=candidate,
+        staging_root=tmp_path / "state" / "staging" / _GENERATION_ID,
+        generation_root=tmp_path / "state" / "generations" / _GENERATION_ID,
+    )
+
+
+def test_ownership_journal_first_install_retains_null_initial_baseline(tmp_path: Path):
+    """Catch a first-install journal that invents a status baseline."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    capsule, candidate = _journal_references()
+    after = _journal_status(skill_root, phase="generation-published")
+
+    journal = validate_ownership_journal(
+        ownership_journal_bytes(
+            operation="first-install",
+            transaction_id=_TRANSACTION_ID,
+            skill_root=skill_root,
+            baseline_status_bytes=None,
+            before_status_bytes=None,
+            after_status_bytes=after,
+            capsule=capsule,
+            candidate=candidate,
+        ),
+        skill_root=skill_root,
+        generations_root=tmp_path / "state" / "generations",
+    )
+
+    assert journal.baseline_status_digest is None
+    assert journal.transition.before_digest is None
+
+
+def test_ownership_journal_builder_accepts_prepared_artifacts(tmp_path: Path):
+    """Catch installer-prepared artifacts being rejected despite matching references."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    capsule, candidate = _journal_references()
+    after = _journal_status(skill_root, phase="generation-published")
+    capsule_artifact = VersionedArtifact(
+        kind="capsule",
+        identifier="voice-intent-normalizer",
+        package_version="1",
+        package_hash=capsule.package_hash,
+        manifest_digest=capsule.manifest_digest,
+        manifest_name="capsule.json",
+        files={},
+    )
+    candidate_artifact = VersionedArtifact(
+        kind="generation",
+        identifier=candidate.generation_id,
+        package_version=candidate.package_version,
+        package_hash=candidate.package_hash,
+        manifest_digest=candidate.manifest_digest,
+        manifest_name="generation.json",
+        files={},
+    )
+
+    journal = validate_ownership_journal(
+        ownership_journal_bytes(
+            operation="first-install",
+            transaction_id=_TRANSACTION_ID,
+            skill_root=skill_root,
+            baseline_status_bytes=None,
+            before_status_bytes=None,
+            after_status_bytes=after,
+            capsule=capsule_artifact,
+            candidate=candidate_artifact,
+        ),
+        skill_root=skill_root,
+        generations_root=tmp_path / "state" / "generations",
+    )
+
+    assert (journal.capsule, journal.candidate) == (capsule, candidate)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: {"status_digest": _DIGEST, "transaction_id": _TRANSACTION_ID},
+        lambda value: b'{"format":1,"format":1}',
+        lambda value: {**value, "unexpected": True},
+        lambda value: {**value, "format": 0},
+        lambda value: {**value, "format": 2},
+        lambda value: {**value, "operation": "remove"},
+        lambda value: {**value, "selected_skill_root": "relative/root"},
+        lambda value: {**value, "selected_skill_root": "/different/root"},
+        lambda value: {**value, "transaction_id": "t-" + "A" * 32},
+        lambda value: {
+            **value,
+            "candidate": {**value["candidate"], "generation_id": "g-invalid"},
+        },
+        lambda value: {**value, "capsule": {**value["capsule"], "protocol": 2}},
+        lambda value: {
+            **value,
+            "capsule": {**value["capsule"], "manifest_digest": "A" * 64},
+        },
+        lambda value: {
+            **value,
+            "operation": "first-install",
+            "baseline_status_digest": _DIGEST,
+        },
+        lambda value: {**value, "operation": "upgrade", "baseline_status_digest": None},
+        lambda value: {
+            **value,
+            "status_transition": {
+                **value["status_transition"],
+                "after_digest": value["status_transition"]["before_digest"],
+            },
+        },
+    ),
+)
+def test_validate_ownership_journal_rejects_untrusted_contract_values(
+    tmp_path: Path, mutate
+):
+    """Catch marker migration, aliases, and values that could widen ownership."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    capsule, candidate = _journal_references()
+    before = _journal_status(skill_root, phase=None)
+    after = _journal_status(skill_root, phase="generation-published")
+    payload = ownership_journal_bytes(
+        operation="upgrade",
+        transaction_id=_TRANSACTION_ID,
+        skill_root=skill_root,
+        baseline_status_bytes=before,
+        before_status_bytes=before,
+        after_status_bytes=after,
+        capsule=capsule,
+        candidate=candidate,
+    )
+    value = json.loads(payload)
+    altered = mutate(value)
+    if isinstance(altered, dict):
+        altered = canonical_json_bytes(altered)
+
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            altered,
+            skill_root=skill_root,
+            generations_root=tmp_path / "state" / "generations",
+        )
+
+
+def test_validate_ownership_journal_rejects_oversized_and_noncanonical_bytes(
+    tmp_path: Path,
+):
+    """Catch parser exhaustion or semantically valid JSON with another spelling."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    capsule, candidate = _journal_references()
+    before = _journal_status(skill_root, phase=None)
+    after = _journal_status(skill_root, phase="generation-published")
+    payload = ownership_journal_bytes(
+        operation="upgrade",
+        transaction_id=_TRANSACTION_ID,
+        skill_root=skill_root,
+        baseline_status_bytes=before,
+        before_status_bytes=before,
+        after_status_bytes=after,
+        capsule=capsule,
+        candidate=candidate,
+    )
+
+    for altered in (payload + b"\n", b" " * (8 * 1024 * 1024 + 1)):
+        with pytest.raises(ValueError):
+            validate_ownership_journal(
+                altered,
+                skill_root=skill_root,
+                generations_root=tmp_path / "state" / "generations",
+            )
 
 
 def test_generic_layout_paths_are_private_and_read_only(tmp_path: Path):
