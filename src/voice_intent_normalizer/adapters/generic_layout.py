@@ -422,6 +422,36 @@ def ownership_journal_bytes(
     )
 
 
+def ownership_journal_transition_bytes(
+    journal: OwnershipJournal,
+    *,
+    before_status_bytes: bytes | None,
+    after_status_bytes: bytes,
+) -> bytes:
+    """Rewrite one validated journal with an exact next status transition."""
+    before_digest = _status_digest(before_status_bytes, "before status")
+    after_digest = _required_status_digest(after_status_bytes, "after status")
+    _validate_journal_transition(
+        operation=journal.operation,
+        transaction_id=journal.transaction_id,
+        baseline_digest=journal.baseline_status_digest,
+        before_digest=before_digest,
+        after_digest=after_digest,
+    )
+    return canonical_json_bytes(
+        _ownership_journal_payload(
+            operation=journal.operation,
+            transaction_id=journal.transaction_id,
+            selected_skill_root=journal.selected_skill_root,
+            baseline_digest=journal.baseline_status_digest,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            capsule=journal.capsule,
+            candidate=journal.candidate,
+        )
+    )
+
+
 def validate_ownership_journal(
     payload: bytes,
     *,
@@ -681,42 +711,6 @@ def _same_journal_root(left: Path, right: Path) -> bool:
     if os.name == "nt":
         return os.path.normcase(os.fspath(left)) == os.path.normcase(os.fspath(right))
     return os.fspath(left) == os.fspath(right)
-
-
-def recovery_marker_bytes(transaction_id: str, status_bytes: bytes) -> bytes:
-    """Return the minimal independent marker for one status transaction."""
-    if _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None:
-        raise ValueError("invalid recovery transaction id")
-    return canonical_json_bytes(
-        {
-            "status_digest": hashlib.sha256(status_bytes).hexdigest(),
-            "transaction_id": transaction_id,
-        }
-    )
-
-
-def validate_recovery_marker(
-    payload: bytes, *, transaction_id: str, status_bytes: bytes
-) -> None:
-    """Require a canonical marker bound to the exact authoritative status."""
-    try:
-        value = json.loads(
-            payload,
-            object_pairs_hook=_unique_json_object,
-            parse_constant=_reject_json_constant,
-        )
-    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError("invalid adapter recovery marker") from exc
-    expected = recovery_marker_bytes(transaction_id, status_bytes)
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"status_digest", "transaction_id"}
-        or value.get("transaction_id") != transaction_id
-        or not isinstance(value.get("status_digest"), str)
-        or _SHA256_PATTERN.fullmatch(str(value["status_digest"])) is None
-        or payload != expected
-    ):
-        raise ValueError("adapter recovery marker is not status anchored")
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

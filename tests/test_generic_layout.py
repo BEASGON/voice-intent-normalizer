@@ -283,7 +283,6 @@ def test_ownership_journal_builder_accepts_prepared_artifacts(tmp_path: Path):
 @pytest.mark.parametrize(
     "mutate",
     (
-        lambda value: {"status_digest": _DIGEST, "transaction_id": _TRANSACTION_ID},
         lambda value: b'{"format":1,"format":1}',
         lambda value: {**value, "unexpected": True},
         lambda value: {**value, "format": 0},

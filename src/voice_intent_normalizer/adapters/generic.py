@@ -25,15 +25,17 @@ from .generic_contract import (
     status_skill_root,
 )
 from .generic_layout import (
+    OwnershipJournal,
     VersionedArtifact,
     VersionedArtifacts,
     canonical_status_v5,
     generic_layout_paths,
+    ownership_journal_bytes,
+    ownership_journal_transition_bytes,
     prepare_versioned_artifacts,
-    recovery_marker_bytes,
     status_v5_payload,
     validate_anchored_manifest,
-    validate_recovery_marker,
+    validate_ownership_journal,
 )
 
 _NAME = "voice-intent-normalizer"
@@ -104,8 +106,8 @@ class GenericAdapter:
         self._configured_skill_root = root
         status = self._read_versioned_status(root)
         if status is None:
-            if self._marker_exists():
-                return self._failed("unanchored recovery metadata requires review")
+            if self._journal_exists():
+                return self._failed("unanchored ownership journal requires review")
             if self._direct_entry_exists(root / _NAME):
                 return self._failed(
                     "existing skill capsule is not anchored by adapter status"
@@ -121,8 +123,8 @@ class GenericAdapter:
                         "incomplete installation could not be recovered"
                     )
                 return self._first_install(root, options)
-        elif self._marker_exists():
-            return self._failed("unanchored recovery metadata requires review")
+        elif self._journal_exists():
+            self._retire_redundant_terminal_journal(root, status)
 
         self._validate_complete_status(root, status, smoke=False)
         artifacts = self._prepare_versioned_artifacts(secrets.token_hex(16))
@@ -158,6 +160,9 @@ class GenericAdapter:
         transaction_id = f"t-{secrets.token_hex(16)}"
         artifacts = self._prepare_versioned_artifacts(secrets.token_hex(16))
         self._smoke_generation(artifacts.capsule, artifacts.generation)
+        baseline = self._read_status_bytes()
+        if baseline is not None:
+            raise ValueError("first-install baseline status appeared")
         payload = status_v5_payload(
             skill_root=root,
             capability=self._capability(options).value,
@@ -167,19 +172,52 @@ class GenericAdapter:
             transaction_id=transaction_id,
             transaction_phase="generation-published",
         )
+        journal_bytes = ownership_journal_bytes(
+            operation="first-install",
+            transaction_id=transaction_id,
+            skill_root=root,
+            baseline_status_bytes=baseline,
+            before_status_bytes=baseline,
+            after_status_bytes=canonical_json_bytes(payload),
+            capsule=artifacts.capsule,
+            candidate=artifacts.generation,
+        )
+        self._write_ownership_journal(journal_bytes)
+        journal = validate_ownership_journal(
+            journal_bytes,
+            skill_root=root,
+            generations_root=generic_layout_paths(self.state_paths).generations,
+        )
         self._stage_and_publish_generation(
             artifacts.generation,
             recovering=False,
-            on_published=lambda: self._write_transaction_status(root, payload),
-            publication_anchor=canonical_json_bytes(payload),
+            publication_anchor=journal_bytes,
+        )
+        journal = self._advance_transaction_status(
+            root,
+            journal=journal,
+            before_payload=None,
+            after_payload=payload,
         )
         self._ensure_capsule(
             root, artifacts.capsule, transaction_id, recovering=False
         )
-        payload = self._replace_phase(payload, "capsule-published")
-        self._write_transaction_status(root, payload)
-        payload = self._replace_phase(payload, "activation-pending")
-        self._write_transaction_status(root, payload)
+        next_payload = self._replace_phase(payload, "capsule-published")
+        journal = self._advance_transaction_status(
+            root,
+            journal=journal,
+            before_payload=payload,
+            after_payload=next_payload,
+        )
+        payload = next_payload
+        next_payload = self._replace_phase(payload, "activation-pending")
+        journal = self._advance_transaction_status(
+            root,
+            journal=journal,
+            before_payload=payload,
+            after_payload=next_payload,
+        )
+        payload = next_payload
         final = status_v5_payload(
             skill_root=root,
             capability=self._capability(options).value,
@@ -191,7 +229,13 @@ class GenericAdapter:
         self._validate_capsule_ref(root, pending)
         self._validate_generation_ref(pending.active)
         result = self._committed_result("installed", options)
-        self._write_terminal_status(root, final)
+        self._advance_transaction_status(
+            root,
+            journal=journal,
+            before_payload=payload,
+            after_payload=final,
+            terminal=True,
+        )
         self._record_install_commit(result, final)
         return result
 
@@ -204,6 +248,16 @@ class GenericAdapter:
     ) -> AdapterResult:
         self._smoke_generation(artifacts.capsule, artifacts.generation)
         transaction_id = f"t-{secrets.token_hex(16)}"
+        baseline = self._read_status_bytes()
+        if baseline is None:
+            raise ValueError("upgrade baseline status is missing")
+        baseline_payload = status_v5_payload(
+            skill_root=status.selected_skill_root,
+            capability=status.capability,
+            capsule=status.capsule,
+            active=status.active,
+            previous=status.previous,
+        )
         payload = status_v5_payload(
             skill_root=status.selected_skill_root,
             capability=self._capability(options).value,
@@ -213,15 +267,42 @@ class GenericAdapter:
             transaction_id=transaction_id,
             transaction_phase="generation-published",
         )
+        journal_bytes = ownership_journal_bytes(
+            operation="upgrade",
+            transaction_id=transaction_id,
+            skill_root=root,
+            baseline_status_bytes=baseline,
+            before_status_bytes=baseline,
+            after_status_bytes=canonical_json_bytes(payload),
+            capsule=artifacts.capsule,
+            candidate=artifacts.generation,
+        )
         try:
+            self._write_ownership_journal(journal_bytes)
+            journal = validate_ownership_journal(
+                journal_bytes,
+                skill_root=root,
+                generations_root=generic_layout_paths(self.state_paths).generations,
+            )
             self._stage_and_publish_generation(
                 artifacts.generation,
                 recovering=False,
-                on_published=lambda: self._write_transaction_status(root, payload),
-                publication_anchor=canonical_json_bytes(payload),
+                publication_anchor=journal_bytes,
             )
-            payload = self._replace_phase(payload, "activation-pending")
-            self._write_transaction_status(root, payload)
+            journal = self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=baseline_payload,
+                after_payload=payload,
+            )
+            next_payload = self._replace_phase(payload, "activation-pending")
+            journal = self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=payload,
+                after_payload=next_payload,
+            )
+            payload = next_payload
             final = status_v5_payload(
                 skill_root=status.selected_skill_root,
                 capability=self._capability(options).value,
@@ -235,7 +316,13 @@ class GenericAdapter:
             assert pending.previous is not None
             self._validate_generation_ref(pending.previous)
             result = self._committed_result("upgraded", options)
-            self._write_terminal_status(root, final)
+            self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=payload,
+                after_payload=final,
+                terminal=True,
+            )
             self._record_install_commit(result, final)
             return result
         except Exception:
@@ -311,22 +398,24 @@ class GenericAdapter:
             "transaction": {"id": transaction["id"], "phase": phase},
         }
 
-    def _write_transaction_status(
-        self, root: Path, payload: dict[str, object]
-    ) -> None:
-        status_bytes = canonical_json_bytes(payload)
-        status, canonical = canonical_status_v5(
-            status_bytes,
-            skill_root=root,
-            generations_root=generic_layout_paths(self.state_paths).generations,
+    @staticmethod
+    def _status_payload(status: StatusV5) -> dict[str, object]:
+        return status_v5_payload(
+            skill_root=status.selected_skill_root,
+            capability=status.capability,
+            capsule=status.capsule,
+            active=status.active,
+            previous=status.previous,
+            transaction_id=status.transaction_id,
+            transaction_phase=status.transaction_phase,
         )
-        if status.transaction_id is None:
-            raise ValueError("transaction status is missing its transaction")
-        self._write_status_payload(payload)
-        marker = recovery_marker_bytes(status.transaction_id, canonical)
+
+    def _write_ownership_journal(self, payload: bytes) -> None:
+        """Commit exact journal bytes or prove that the same bytes committed."""
         lease = self._state_lease()
         try:
-            lease.write_bytes_atomic(_TRANSACTION_RELATIVE, marker)
+            lease.write_bytes_atomic(_TRANSACTION_RELATIVE, payload)
+            lease.fsync_directory(_GENERIC_RELATIVE)
         except OSError:
             committed = False
             try:
@@ -334,27 +423,133 @@ class GenericAdapter:
                     lease.read_bytes(
                         _TRANSACTION_RELATIVE,
                         _MANIFEST_LIMIT,
-                        "adapter recovery marker",
+                        "adapter ownership journal",
                     )
-                    == marker
+                    == payload
                 )
             except (OSError, ValueError):
                 pass
             if not committed:
                 raise
         self._record_changes((generic_layout_paths(self.state_paths).transaction,))
-        lease.fsync_directory(_GENERIC_RELATIVE)
 
-    def _write_terminal_status(
-        self, root: Path, payload: dict[str, object]
-    ) -> None:
-        canonical_status_v5(
-            canonical_json_bytes(payload),
+    def _advance_transaction_status(
+        self,
+        root: Path,
+        *,
+        journal: OwnershipJournal,
+        before_payload: dict[str, object] | None,
+        after_payload: dict[str, object],
+        terminal: bool = False,
+    ) -> OwnershipJournal:
+        """Journal one exact status transition, commit status, then retire metadata."""
+        before_bytes = (
+            None if before_payload is None else canonical_json_bytes(before_payload)
+        )
+        if before_bytes is not None:
+            canonical_status_v5(
+                before_bytes,
+                skill_root=root,
+                generations_root=generic_layout_paths(self.state_paths).generations,
+            )
+        after_bytes = canonical_json_bytes(after_payload)
+        after_status, _ = canonical_status_v5(
+            after_bytes,
             skill_root=root,
             generations_root=generic_layout_paths(self.state_paths).generations,
         )
-        self._remove_recovery_marker(missing_ok=True)
-        self._write_status_payload(payload)
+        if after_status.transaction_id not in {journal.transaction_id, None}:
+            raise ValueError("status transaction does not match ownership journal")
+        if terminal != (after_status.transaction_id is None):
+            raise ValueError("terminal journal transition has an invalid status")
+        current = self._read_status_bytes()
+        if current != before_bytes:
+            raise ValueError("protected status changed before journal transition")
+        if terminal:
+            self._validate_terminal_transition(
+                root, journal, after_status, require_committed=False
+            )
+        journal_bytes = ownership_journal_transition_bytes(
+            journal,
+            before_status_bytes=before_bytes,
+            after_status_bytes=after_bytes,
+        )
+        if not self._journal_bytes_are_active(journal_bytes):
+            self._write_ownership_journal(journal_bytes)
+        advanced = validate_ownership_journal(
+            journal_bytes,
+            skill_root=root,
+            generations_root=generic_layout_paths(self.state_paths).generations,
+        )
+        self._write_status_payload(after_payload)
+        if terminal:
+            self._require_exact_terminal_status(after_status)
+            try:
+                self._remove_ownership_journal(missing_ok=False)
+            except OSError:
+                self._validate_terminal_transition(
+                    root, advanced, after_status, require_committed=True
+                )
+        return advanced
+
+    def _validate_terminal_transition(
+        self,
+        root: Path,
+        journal: OwnershipJournal,
+        status: StatusV5,
+        *,
+        require_committed: bool,
+    ) -> None:
+        expected = canonical_json_bytes(
+            status_v5_payload(
+                skill_root=status.selected_skill_root,
+                capability=status.capability,
+                capsule=status.capsule,
+                active=status.active,
+                previous=status.previous,
+            )
+        )
+        current = self._read_status_bytes()
+        if require_committed and current != expected:
+            raise ValueError("terminal status is not exact")
+        self._validate_capsule_ref(root, status)
+        self._validate_generation_ref(status.active)
+        if status.previous is not None:
+            self._validate_generation_ref(status.previous)
+        if journal.capsule != status.capsule:
+            raise ValueError("terminal status capsule differs from ownership journal")
+        candidates = (status.active, status.previous)
+        if journal.candidate not in candidates:
+            raise ValueError("terminal status does not retain the journal candidate")
+
+    def _require_exact_terminal_status(self, status: StatusV5) -> None:
+        expected = canonical_json_bytes(
+            status_v5_payload(
+                skill_root=status.selected_skill_root,
+                capability=status.capability,
+                capsule=status.capsule,
+                active=status.active,
+                previous=status.previous,
+            )
+        )
+        if self._read_status_bytes() != expected:
+            raise ValueError("terminal status is not exact")
+
+    def _journal_bytes_are_active(self, expected: bytes) -> bool:
+        try:
+            lease = self._state_lease()
+            return (
+                lease.root_exists
+                and lease.available(_GENERIC_RELATIVE)
+                and lease.read_bytes(
+                    _TRANSACTION_RELATIVE,
+                    _MANIFEST_LIMIT,
+                    "adapter ownership journal",
+                )
+                == expected
+            )
+        except (OSError, ValueError):
+            return False
 
     def _write_status_payload(self, payload: dict[str, object]) -> None:
         data = canonical_json_bytes(payload)
@@ -396,7 +591,7 @@ class GenericAdapter:
         except (OSError, ValueError):
             return False
 
-    def _marker_exists(self) -> bool:
+    def _journal_exists(self) -> bool:
         lease = self._state_lease()
         return (
             lease.root_exists
@@ -404,44 +599,41 @@ class GenericAdapter:
             and lease.exists(_TRANSACTION_RELATIVE)
         )
 
-    def _ensure_recovery_marker(self, root: Path, status: StatusV5) -> None:
-        if status.transaction_id is None:
-            if self._marker_exists():
-                raise ValueError("recovery marker is not status anchored")
-            return
-        status_payload = status_v5_payload(
-            skill_root=status.selected_skill_root,
-            capability=status.capability,
-            capsule=status.capsule,
-            active=status.active,
-            previous=status.previous,
-            transaction_id=status.transaction_id,
-            transaction_phase=status.transaction_phase,
-        )
-        status_bytes = canonical_json_bytes(status_payload)
+    def _read_ownership_journal(self, root: Path) -> OwnershipJournal:
         lease = self._state_lease()
-        if lease.exists(_TRANSACTION_RELATIVE):
-            marker = lease.read_bytes(
-                _TRANSACTION_RELATIVE,
-                _MANIFEST_LIMIT,
-                "adapter recovery marker",
-            )
-            validate_recovery_marker(
-                marker,
-                transaction_id=status.transaction_id,
-                status_bytes=status_bytes,
-            )
-            return
-        marker = recovery_marker_bytes(status.transaction_id, status_bytes)
-        lease.write_bytes_atomic(_TRANSACTION_RELATIVE, marker)
-        self._record_changes((generic_layout_paths(self.state_paths).transaction,))
+        payload = lease.read_bytes(
+            _TRANSACTION_RELATIVE,
+            _MANIFEST_LIMIT,
+            "adapter ownership journal",
+        )
+        return validate_ownership_journal(
+            payload,
+            skill_root=root,
+            generations_root=generic_layout_paths(self.state_paths).generations,
+        )
 
-    def _remove_recovery_marker(self, *, missing_ok: bool) -> None:
+    def _retire_redundant_terminal_journal(
+        self, root: Path, status: StatusV5
+    ) -> None:
+        journal = self._read_ownership_journal(root)
+        status_bytes = self._read_status_bytes()
+        if (
+            status_bytes is None
+            or journal.transition.after_digest
+            != hashlib.sha256(status_bytes).hexdigest()
+        ):
+            raise ValueError("ownership journal does not match terminal status")
+        self._validate_terminal_transition(
+            root, journal, status, require_committed=True
+        )
+        self._remove_ownership_journal(missing_ok=False)
+
+    def _remove_ownership_journal(self, *, missing_ok: bool) -> None:
         lease = self._state_lease()
         if not lease.exists(_TRANSACTION_RELATIVE):
             if missing_ok:
                 return
-            raise FileNotFoundError("adapter recovery marker is missing")
+            raise FileNotFoundError("adapter ownership journal is missing")
         lease.unlink(_TRANSACTION_RELATIVE)
         lease.fsync_directory(_GENERIC_RELATIVE)
         self._record_changes((generic_layout_paths(self.state_paths).transaction,))
@@ -453,19 +645,28 @@ class GenericAdapter:
             status = self._read_required_status(root)
             phase = status.transaction_phase
             if phase is None:
-                if self._marker_exists():
-                    raise ValueError("recovery marker is not status anchored")
+                if self._journal_exists():
+                    self._retire_redundant_terminal_journal(root, status)
                 return
-            self._ensure_recovery_marker(root, status)
             if phase in {
                 "generation-published",
                 "capsule-published",
                 "activation-pending",
                 "rollback-pending",
             }:
+                journal = self._read_ownership_journal(root)
+                status_bytes = self._read_status_bytes()
+                if (
+                    status_bytes is None
+                    or journal.transaction_id != status.transaction_id
+                    or journal.transition.after_digest
+                    != hashlib.sha256(status_bytes).hexdigest()
+                ):
+                    raise ValueError("ownership journal does not anchor status")
                 self._recover_activation(
                     root,
                     status,
+                    journal,
                     allow_capsule_publication=allow_capsule_publication,
                 )
             elif phase in {
@@ -484,6 +685,7 @@ class GenericAdapter:
         self,
         root: Path,
         status: StatusV5,
+        journal: OwnershipJournal,
         *,
         allow_capsule_publication: bool,
     ) -> None:
@@ -528,7 +730,12 @@ class GenericAdapter:
                     transaction_id=status.transaction_id,
                     transaction_phase="capsule-published",
                 )
-                self._write_transaction_status(root, payload)
+                self._advance_transaction_status(
+                    root,
+                    journal=journal,
+                    before_payload=self._status_payload(status),
+                    after_payload=payload,
+                )
                 return
             self._validate_capsule_ref(root, status)
             try:
@@ -543,7 +750,12 @@ class GenericAdapter:
                     transaction_id=status.transaction_id,
                     transaction_phase="rollback-pending",
                 )
-                self._write_transaction_status(root, payload)
+                self._advance_transaction_status(
+                    root,
+                    journal=journal,
+                    before_payload=self._status_payload(status),
+                    after_payload=payload,
+                )
                 return
             payload = status_v5_payload(
                 skill_root=status.selected_skill_root,
@@ -554,7 +766,12 @@ class GenericAdapter:
                 transaction_id=status.transaction_id,
                 transaction_phase="activation-pending",
             )
-            self._write_transaction_status(root, payload)
+            self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=self._status_payload(status),
+                after_payload=payload,
+            )
             return
 
         if phase == "capsule-published":
@@ -571,7 +788,12 @@ class GenericAdapter:
                 transaction_id=status.transaction_id,
                 transaction_phase="activation-pending",
             )
-            self._write_transaction_status(root, payload)
+            self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=self._status_payload(status),
+                after_payload=payload,
+            )
             return
 
         if phase == "activation-pending":
@@ -593,7 +815,12 @@ class GenericAdapter:
                         transaction_id=status.transaction_id,
                         transaction_phase="rollback-pending",
                     )
-                    self._write_transaction_status(root, payload)
+                    self._advance_transaction_status(
+                        root,
+                        journal=journal,
+                        before_payload=self._status_payload(status),
+                        after_payload=payload,
+                    )
                     return
                 active = status.previous
                 previous = status.active
@@ -604,7 +831,13 @@ class GenericAdapter:
                 active=active,
                 previous=previous,
             )
-            self._write_terminal_status(root, final)
+            self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=self._status_payload(status),
+                after_payload=final,
+                terminal=True,
+            )
             return
 
         if phase == "rollback-pending":
@@ -617,14 +850,20 @@ class GenericAdapter:
                 active=status.active,
                 previous=None,
             )
-            self._write_terminal_status(root, final)
+            self._advance_transaction_status(
+                root,
+                journal=journal,
+                before_payload=self._status_payload(status),
+                after_payload=final,
+                terminal=True,
+            )
             return
         raise ValueError("invalid activation recovery phase")
 
     def _rollback_first_install(self, root: Path, status: StatusV5) -> None:
         assert status.transaction_id is not None
         self._retire_generation(status.active, status.transaction_id)
-        self._remove_recovery_marker(missing_ok=True)
+        self._remove_ownership_journal(missing_ok=True)
         self._remove_status()
 
     def doctor(self) -> AdapterResult:
@@ -644,7 +883,7 @@ class GenericAdapter:
     def _doctor_locked(self) -> AdapterResult:
         root = self._configured_skill_root
         if root is None:
-            if not self._status_exists() and not self._marker_exists():
+            if not self._status_exists() and not self._journal_exists():
                 return AdapterResult(
                     self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
                 )
@@ -654,7 +893,7 @@ class GenericAdapter:
         root = self._safe_skill_root(root)
         status = self._read_versioned_status(root)
         if status is None:
-            if self._marker_exists() or self._direct_entry_exists(root / _NAME):
+            if self._journal_exists() or self._direct_entry_exists(root / _NAME):
                 return AdapterResult(
                     self.platform,
                     "degraded",
@@ -677,8 +916,8 @@ class GenericAdapter:
                 return AdapterResult(
                     self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
                 )
-        elif self._marker_exists():
-            raise ValueError("recovery marker is not status anchored")
+        elif self._journal_exists():
+            self._retire_redundant_terminal_journal(root, status)
         try:
             self._validate_complete_status(root, status, smoke=True)
         except Exception:
@@ -738,7 +977,7 @@ class GenericAdapter:
         self._configured_skill_root = root
         status = self._read_versioned_status(root)
         if status is None:
-            if self._marker_exists() or self._direct_entry_exists(root / _NAME):
+            if self._journal_exists() or self._direct_entry_exists(root / _NAME):
                 return self._failed("managed ownership cannot be verified")
             return AdapterResult(
                 self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
@@ -753,8 +992,8 @@ class GenericAdapter:
                     CapabilityLevel.MANUAL,
                     ("shared personal and project data were preserved",),
                 )
-        elif self._marker_exists():
-            return self._failed("unanchored recovery metadata requires review")
+        elif self._journal_exists():
+            self._retire_redundant_terminal_journal(root, status)
 
         self._validate_complete_status(root, status, smoke=False)
         transaction_id = f"t-{secrets.token_hex(16)}"
@@ -767,12 +1006,12 @@ class GenericAdapter:
             transaction_id=transaction_id,
             transaction_phase="deactivation-pending",
         )
-        self._write_transaction_status(root, payload)
+        self._write_status_payload(payload)
         self._recover_pending(root, allow_capsule_publication=False)
         if self._read_versioned_status(root) is not None:
             raise OSError("uninstall status removal did not complete")
-        if self._direct_entry_exists(root / _NAME) or self._marker_exists():
-            raise OSError("uninstall left a discoverable capsule or marker")
+        if self._direct_entry_exists(root / _NAME) or self._journal_exists():
+            raise OSError("uninstall left a discoverable capsule or journal")
         return AdapterResult(
             self.platform,
             "uninstalled",
@@ -798,7 +1037,7 @@ class GenericAdapter:
                 transaction_id=status.transaction_id,
                 transaction_phase="capsule-retired",
             )
-            self._write_transaction_status(root, payload)
+            self._write_status_payload(payload)
             return
         if phase == "capsule-retired":
             if self._direct_entry_exists(root / _NAME):
@@ -813,7 +1052,7 @@ class GenericAdapter:
                 transaction_id=status.transaction_id,
                 transaction_phase="cleanup-pending",
             )
-            self._write_transaction_status(root, payload)
+            self._write_status_payload(payload)
             return
         if phase == "cleanup-pending":
             if self._direct_entry_exists(root / _NAME):
@@ -822,7 +1061,6 @@ class GenericAdapter:
             self._retire_generation(status.active, status.transaction_id)
             if status.previous is not None:
                 self._retire_generation(status.previous, status.transaction_id)
-            self._remove_recovery_marker(missing_ok=True)
             self._remove_status()
             return
         raise ValueError("invalid uninstall recovery phase")
@@ -927,8 +1165,8 @@ class GenericAdapter:
     ) -> None:
         if status.transaction_phase is not None:
             raise ValueError("adapter transaction is incomplete")
-        if self._marker_exists():
-            raise ValueError("recovery marker is not status anchored")
+        if self._journal_exists():
+            raise ValueError("ownership journal is not status anchored")
         self._validate_capsule_ref(root, status)
         self._validate_generation_ref(status.active)
         if status.previous is not None:
@@ -1113,7 +1351,6 @@ class GenericAdapter:
         artifact: VersionedArtifact,
         *,
         recovering: bool,
-        on_published: Callable[[], None] | None = None,
         publication_anchor: bytes | None = None,
     ) -> Path:
         final_relative = _GENERATIONS_RELATIVE / artifact.identifier
@@ -1129,8 +1366,6 @@ class GenericAdapter:
 
         def record_publication() -> None:
             self._record_changes(self._artifact_changed_paths(final, artifact))
-            if on_published is not None:
-                on_published()
 
         self._stage_and_publish_artifact(
             self.state_paths.root,
@@ -1141,7 +1376,7 @@ class GenericAdapter:
             preserve_published=(
                 None
                 if publication_anchor is None
-                else lambda: self._status_bytes_are_active(publication_anchor)
+                else lambda: self._journal_bytes_are_active(publication_anchor)
             ),
         )
         self._validate_generation_directory(
@@ -1213,17 +1448,17 @@ class GenericAdapter:
                 expected_identity = self._directory_identity(
                     lease.stat(stage_relative)
                 )
+                lease.write_bytes_exclusive(
+                    stage_relative / artifact.manifest_name,
+                    artifact.files[artifact.manifest_name],
+                )
+                lease.fsync_directory(stage_relative)
                 for relative, data in artifact.files.items():
                     if relative == artifact.manifest_name:
                         continue
                     self._write_staged_file(
                         lease, stage_relative / Path(relative), data
                     )
-                self._write_staged_file(
-                    lease,
-                    stage_relative / artifact.manifest_name,
-                    artifact.files[artifact.manifest_name],
-                )
                 for directory in sorted(
                     self._artifact_directories(stage_relative, artifact),
                     key=lambda path: (len(path.parts), str(path)),

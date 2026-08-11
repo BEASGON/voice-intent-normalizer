@@ -26,7 +26,10 @@ from voice_intent_normalizer.adapters.generic_contract import (
     validate_manifest,
     validate_status_v5,
 )
-from voice_intent_normalizer.adapters.generic_layout import generic_layout_paths
+from voice_intent_normalizer.adapters.generic_layout import (
+    generic_layout_paths,
+    validate_ownership_journal,
+)
 from voice_intent_normalizer.installer import Installer
 from voice_intent_normalizer.paths import (
     StatePaths,
@@ -704,43 +707,205 @@ def test_real_smoke_runs_before_any_final_runtime_name(
     _validated_installed_layout(generic_adapter, skill_root)
 
 
-def test_first_install_status_callback_failure_removes_unanchored_generation(
+def test_first_install_journals_before_candidate_stage_exists(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """Catch managed staging or publication beginning before journal durability."""
     skill_root = tmp_path / "skills"
     skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    events: list[str] = []
+    original_smoke = generic_adapter._smoke_generation
+    original_stage = generic_adapter._stage_and_publish_generation
+    original_exclusive = StateRootLease.write_bytes_exclusive
+    original_atomic = StateRootLease.write_bytes_atomic
+    original_fsync = StateRootLease.fsync_directory
+    original_publish = StateRootLease.publish_directory_no_replace
 
+    def observe_smoke(capsule, generation):
+        original_smoke(capsule, generation)
+        events.append("smoke-complete")
+
+    def observe_stage(*args, **kwargs):
+        events.append("stage-created")
+        return original_stage(*args, **kwargs)
+
+    def observe_exclusive(lease, relative, data):
+        if Path(relative).name == "generation.json":
+            events.append("manifest-written")
+        return original_exclusive(lease, relative, data)
+
+    def observe_atomic(lease, relative, data):
+        relative = Path(relative)
+        if relative == Path("adapters/generic/transaction.json"):
+            events.append("journal-write")
+        elif relative == Path("adapters/generic/status.json"):
+            value = json.loads(data)
+            transaction = value.get("transaction")
+            if (
+                isinstance(transaction, dict)
+                and transaction.get("phase") == "generation-published"
+            ):
+                events.append("status-generation-published")
+        return original_atomic(lease, relative, data)
+
+    def observe_fsync(lease, relative=Path(".")):
+        result = original_fsync(lease, relative)
+        if (
+            Path(relative) == Path("adapters/generic")
+            and events
+            and events[-1] == "journal-write"
+        ):
+            events.append("journal-parent-fsync")
+        return result
+
+    def observe_publish(
+        lease, source, destination, expected_identity, *, on_committed=None
+    ):
+        result = original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=on_committed,
+        )
+        if Path(destination).parent == Path("adapters/generic/generations"):
+            events.append("generation-published")
+        return result
+
+    monkeypatch.setattr(generic_adapter, "_smoke_generation", observe_smoke)
     monkeypatch.setattr(
-        generic_adapter,
-        "_write_status_payload",
-        lambda payload: (_ for _ in ()).throw(OSError("injected status failure")),
+        generic_adapter, "_stage_and_publish_generation", observe_stage
+    )
+    monkeypatch.setattr(StateRootLease, "write_bytes_exclusive", observe_exclusive)
+    monkeypatch.setattr(StateRootLease, "write_bytes_atomic", observe_atomic)
+    monkeypatch.setattr(StateRootLease, "fsync_directory", observe_fsync)
+    monkeypatch.setattr(
+        StateRootLease, "publish_directory_no_replace", observe_publish
     )
 
     result = generic_adapter.install(InstallOptions(output_dir=skill_root))
-    layout = generic_layout_paths(generic_adapter.state_paths)
-    generations = tuple(layout.generations.glob("g-*"))
 
-    assert result.status == "failed"
-    assert not layout.status.exists()
+    assert result.status == "installed"
+    assert events[:7] == [
+        "smoke-complete",
+        "journal-write",
+        "journal-parent-fsync",
+        "stage-created",
+        "manifest-written",
+        "generation-published",
+        "status-generation-published",
+    ]
     assert not layout.transaction.exists()
-    assert not (skill_root / "voice-intent-normalizer").exists()
-    assert generations == ()
 
 
-def test_transaction_parent_fsync_failure_reports_committed_marker(
+def test_upgrade_keeps_old_terminal_status_until_candidate_publication(
+    generic_adapter: GenericAdapter,
+    repository_v2: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch upgrade preparation making a nonterminal status public too early."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    baseline = layout.status.read_bytes()
+    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
+    original_publish = StateRootLease.publish_directory_no_replace
+    observed: list[bytes] = []
+
+    def observe_publish(
+        lease, source, destination, expected_identity, *, on_committed=None
+    ):
+        if Path(destination).parent != Path("adapters/generic/generations"):
+            return original_publish(
+                lease,
+                source,
+                destination,
+                expected_identity,
+                on_committed=on_committed,
+            )
+
+        def observe_commit():
+            observed.append(layout.status.read_bytes())
+            if on_committed is not None:
+                on_committed()
+
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=observe_commit,
+        )
+
+    monkeypatch.setattr(
+        StateRootLease, "publish_directory_no_replace", observe_publish
+    )
+
+    result = upgraded.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "upgraded"
+    assert observed == [baseline]
+
+
+def test_journal_write_failure_publishes_no_stage_or_generation(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """Catch a failed prepublication journal write leaving a managed candidate."""
     skill_root = tmp_path / "skills"
     skill_root.mkdir()
     layout = generic_layout_paths(generic_adapter.state_paths)
-    original = StateRootLease.fsync_directory
+    original_atomic = StateRootLease.write_bytes_atomic
+    stage_started = False
+
+    def fail_journal(lease, relative, data):
+        if Path(relative) == Path("adapters/generic/transaction.json"):
+            raise OSError("injected journal write failure")
+        return original_atomic(lease, relative, data)
+
+    original_stage = generic_adapter._stage_and_publish_generation
+
+    def observe_stage(*args, **kwargs):
+        nonlocal stage_started
+        stage_started = True
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(StateRootLease, "write_bytes_atomic", fail_journal)
+    monkeypatch.setattr(
+        generic_adapter, "_stage_and_publish_generation", observe_stage
+    )
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "failed"
+    assert not stage_started
+    assert not layout.status.exists()
+    assert not layout.transaction.exists()
+    assert not tuple(layout.staging.iterdir())
+    assert not tuple(layout.generations.iterdir())
+
+
+def test_reported_journal_fsync_failure_proceeds_only_with_exact_committed_bytes(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch a reported journal fsync error aborting despite exact committed bytes."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_fsync = StateRootLease.fsync_directory
     injected = False
 
-    def fail_after_transaction_write(lease, relative=Path(".")):
+    def fail_once(lease, relative=Path(".")):
         nonlocal injected
         if (
             not injected
@@ -748,11 +913,60 @@ def test_transaction_parent_fsync_failure_reports_committed_marker(
             and layout.transaction.is_file()
         ):
             injected = True
-            raise OSError("injected transaction-parent fsync failure")
-        return original(lease, relative)
+            raise OSError("reported journal fsync failure")
+        return original_fsync(lease, relative)
+
+    monkeypatch.setattr(StateRootLease, "fsync_directory", fail_once)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert injected
+    assert result.status == "installed"
+    _validated_installed_layout(generic_adapter, skill_root)
+    assert not layout.transaction.exists()
+
+
+def test_generation_publication_callback_failure_never_removes_journal_anchor(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch callback cleanup deleting a generation already owned by the journal."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_publish = StateRootLease.publish_directory_no_replace
+    injected = False
+
+    def fail_after_commit(
+        lease, source, destination, expected_identity, *, on_committed=None
+    ):
+        if Path(destination).parent != Path("adapters/generic/generations"):
+            return original_publish(
+                lease,
+                source,
+                destination,
+                expected_identity,
+                on_committed=on_committed,
+            )
+
+        def callback_then_fail():
+            nonlocal injected
+            if on_committed is not None:
+                on_committed()
+            injected = True
+            raise OSError("injected generation publication callback failure")
+
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=callback_then_fail,
+        )
 
     monkeypatch.setattr(
-        StateRootLease, "fsync_directory", fail_after_transaction_write
+        StateRootLease, "publish_directory_no_replace", fail_after_commit
     )
 
     result = generic_adapter.install(InstallOptions(output_dir=skill_root))
@@ -760,15 +974,161 @@ def test_transaction_parent_fsync_failure_reports_committed_marker(
     assert injected
     assert result.status == "failed"
     assert layout.transaction.is_file()
-    assert result.changed_paths.count(layout.transaction) == 1
-    assert len(tuple(layout.generations.glob("g-*"))) == 1
-    status = validate_status_v5(
-        layout.status.read_bytes(),
+    journal = validate_ownership_journal(
+        layout.transaction.read_bytes(),
         skill_root=skill_root,
         generations_root=layout.generations,
     )
-    assert status.transaction_phase == "generation-published"
-    assert not (skill_root / "voice-intent-normalizer").exists()
+    assert journal.generation_root.is_dir()
+    assert not layout.status.exists()
+    assert result.changed_paths.count(layout.transaction) == 1
+
+
+def test_each_status_transition_journals_exact_before_and_after_digests(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch any status transition being committed before its exact digest pair."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    writes: list[tuple[Path, bytes]] = []
+    original_atomic = StateRootLease.write_bytes_atomic
+
+    def record_writes(lease, relative, data):
+        relative = Path(relative)
+        if relative in {
+            Path("adapters/generic/transaction.json"),
+            Path("adapters/generic/status.json"),
+        }:
+            writes.append((relative, data))
+        return original_atomic(lease, relative, data)
+
+    monkeypatch.setattr(StateRootLease, "write_bytes_atomic", record_writes)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "installed"
+    before: bytes | None = None
+    status_writes = 0
+    for index, (relative, after) in enumerate(writes):
+        if relative != Path("adapters/generic/status.json"):
+            continue
+        status_writes += 1
+        assert index > 0
+        journal_relative, journal_bytes = writes[index - 1]
+        assert journal_relative == Path("adapters/generic/transaction.json")
+        journal = validate_ownership_journal(
+            journal_bytes,
+            skill_root=skill_root,
+            generations_root=generic_layout_paths(
+                generic_adapter.state_paths
+            ).generations,
+        )
+        assert journal.transition.before_digest == (
+            None if before is None else hashlib.sha256(before).hexdigest()
+        )
+        assert journal.transition.after_digest == hashlib.sha256(after).hexdigest()
+        before = after
+    assert status_writes == 4
+
+
+def test_terminal_status_commits_before_journal_retirement(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch journal retirement exposing a preterminal protected status."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_unlink = StateRootLease.unlink
+    terminal_observed = False
+
+    def observe_unlink(lease, relative):
+        nonlocal terminal_observed
+        if Path(relative) == Path("adapters/generic/transaction.json"):
+            terminal_observed = (
+                json.loads(layout.status.read_bytes())["transaction"] is None
+            )
+        return original_unlink(lease, relative)
+
+    monkeypatch.setattr(StateRootLease, "unlink", observe_unlink)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "installed"
+    assert terminal_observed
+    assert not layout.transaction.exists()
+
+
+def test_terminal_journal_unlink_failure_returns_validated_committed_result(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch a redundant journal unlink error hiding a durable terminal install."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_unlink = StateRootLease.unlink
+
+    def fail_journal_unlink(lease, relative):
+        if Path(relative) == Path("adapters/generic/transaction.json"):
+            raise OSError("injected terminal journal unlink failure")
+        return original_unlink(lease, relative)
+
+    monkeypatch.setattr(StateRootLease, "unlink", fail_journal_unlink)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert result.status == "installed"
+    _validated_installed_layout(generic_adapter, skill_root)
+    assert layout.transaction.is_file()
+    assert result.changed_paths.count(layout.transaction) == 1
+
+
+def test_terminal_journal_parent_fsync_failure_is_restart_recoverable(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch a post-terminal parent-fsync error rolling back a committed install."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    original_unlink = StateRootLease.unlink
+    original_fsync = StateRootLease.fsync_directory
+    retired = False
+    injected = False
+
+    def observe_unlink(lease, relative):
+        nonlocal retired
+        result = original_unlink(lease, relative)
+        if Path(relative) == Path("adapters/generic/transaction.json"):
+            retired = True
+        return result
+
+    def fail_after_retirement(lease, relative=Path(".")):
+        nonlocal injected
+        if (
+            retired
+            and not injected
+            and Path(relative) == Path("adapters/generic")
+        ):
+            injected = True
+            raise OSError("injected terminal journal parent fsync failure")
+        return original_fsync(lease, relative)
+
+    monkeypatch.setattr(StateRootLease, "unlink", observe_unlink)
+    monkeypatch.setattr(StateRootLease, "fsync_directory", fail_after_retirement)
+
+    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert injected
+    assert result.status == "installed"
+    _validated_installed_layout(generic_adapter, skill_root)
+    restarted = GenericAdapter(generic_adapter.repository, generic_adapter.state_paths)
+    assert restarted.doctor().status == "installed"
 
 
 def test_generation_parent_fsync_failure_preserves_recovery_anchor(
@@ -804,21 +1164,16 @@ def test_generation_parent_fsync_failure_preserves_recovery_anchor(
     assert failed.status == "failed"
     assert len(published) == 1
     assert layout.transaction.is_file()
-    pending = validate_status_v5(
-        layout.status.read_bytes(),
+    journal = validate_ownership_journal(
+        layout.transaction.read_bytes(),
         skill_root=skill_root,
         generations_root=layout.generations,
     )
-    assert pending.transaction_phase == "generation-published"
+    assert journal.generation_root == published[0]
+    assert not layout.status.exists()
     published_paths = {published[0], *published[0].rglob("*")}
     assert published_paths <= set(failed.changed_paths)
     assert all(failed.changed_paths.count(path) == 1 for path in published_paths)
-
-    recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
-
-    assert recovered.status in {"installed", "already-installed"}
-    assert tuple(layout.generations.glob("g-*")) == published
-    assert not layout.transaction.exists()
 
 
 def test_generation_post_rename_validation_failure_reports_complete_publication(
@@ -841,12 +1196,13 @@ def test_generation_post_rename_validation_failure_reports_complete_publication(
     assert len(published) == 1
     assert (published[0] / "generation.json").is_file()
     assert layout.transaction.is_file()
-    pending = validate_status_v5(
-        layout.status.read_bytes(),
+    journal = validate_ownership_journal(
+        layout.transaction.read_bytes(),
         skill_root=skill_root,
         generations_root=layout.generations,
     )
-    assert pending.transaction_phase == "generation-published"
+    assert journal.generation_root == published[0]
+    assert not layout.status.exists()
     published_paths = {published[0], *published[0].rglob("*")}
     assert published_paths <= set(result.changed_paths)
     assert all(result.changed_paths.count(path) == 1 for path in published_paths)
@@ -1008,50 +1364,6 @@ def test_transaction_parent_fsync_failure_after_activation_is_committed(
     ).status == "already-installed"
 
 
-def test_pre_activation_marker_cleanup_failure_leaves_recoverable_transaction(
-    tmp_path: Path,
-    generic_adapter: GenericAdapter,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    skill_root = tmp_path / "skills"
-    skill_root.mkdir()
-    layout = generic_layout_paths(generic_adapter.state_paths)
-    original = generic_adapter._remove_recovery_marker
-    injected = False
-
-    def fail_cleanup(*, missing_ok: bool):
-        nonlocal injected
-        assert missing_ok
-        assert layout.status.is_file()
-        assert layout.transaction.is_file()
-        injected = True
-        raise OSError("injected pre-activation marker cleanup failure")
-
-    monkeypatch.setattr(
-        generic_adapter, "_remove_recovery_marker", fail_cleanup
-    )
-
-    result = generic_adapter.install(InstallOptions(output_dir=skill_root))
-    pending = validate_status_v5(
-        layout.status.read_bytes(),
-        skill_root=skill_root,
-        generations_root=layout.generations,
-    )
-
-    assert injected
-    assert result.status == "failed"
-    assert pending.transaction_phase == "activation-pending"
-    assert layout.transaction.is_file()
-
-    monkeypatch.setattr(
-        generic_adapter, "_remove_recovery_marker", original
-    )
-    recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
-
-    assert recovered.status in {"installed", "already-installed"}
-    assert not layout.transaction.exists()
-
-
 def test_no_fallible_artifact_validation_runs_after_status_activation(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
@@ -1182,41 +1494,6 @@ def test_outer_state_operation_teardown_failure_before_activation_is_failed(
     assert not layout.status.exists()
 
 
-def test_first_install_callback_failure_retry_and_uninstall_leave_no_generation(
-    tmp_path: Path,
-    generic_adapter: GenericAdapter,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    skill_root = tmp_path / "skills"
-    skill_root.mkdir()
-    original = generic_adapter._write_status_payload
-    monkeypatch.setattr(
-        generic_adapter,
-        "_write_status_payload",
-        lambda payload: (_ for _ in ()).throw(OSError("injected status failure")),
-    )
-    failed = generic_adapter.install(InstallOptions(output_dir=skill_root))
-    monkeypatch.setattr(generic_adapter, "_write_status_payload", original)
-
-    recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
-    capsule, generation, _ = _validated_installed_layout(generic_adapter, skill_root)
-    layout = generic_layout_paths(generic_adapter.state_paths)
-
-    assert failed.status == "failed"
-    assert recovered.status == "installed"
-    assert capsule.is_dir()
-    assert generation.is_dir()
-    generations = tuple(layout.generations.glob("g-*"))
-    assert len(generations) == 1
-    assert generation in generations
-    assert not layout.transaction.exists()
-
-    uninstalled = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
-
-    assert uninstalled.status == "uninstalled"
-    assert not tuple(layout.generations.glob("g-*"))
-
-
 def test_callback_failure_cleanup_preserves_replaced_generation_without_adopting_it(
     tmp_path: Path,
     generic_adapter: GenericAdapter,
@@ -1251,20 +1528,18 @@ def test_callback_failure_cleanup_preserves_replaced_generation_without_adopting
     assert marker.read_text(encoding="utf-8") == "replacement"
 
     monkeypatch.setattr(generic_adapter, "_write_status_payload", original)
+    journal_before = layout.transaction.read_bytes()
     recovered = generic_adapter.install(InstallOptions(output_dir=skill_root))
-    status = validate_status_v5(
-        layout.status.read_bytes(),
-        skill_root=skill_root,
-        generations_root=layout.generations,
-    )
 
-    assert recovered.status == "installed"
-    assert status.active.generation_id != replacement.name
+    assert recovered.status == "failed"
+    assert not layout.status.exists()
+    assert layout.transaction.read_bytes() == journal_before
     assert marker.read_text(encoding="utf-8") == "replacement"
 
     uninstalled = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
 
-    assert uninstalled.status == "uninstalled"
+    assert uninstalled.status == "failed"
+    assert layout.transaction.read_bytes() == journal_before
     assert marker.read_text(encoding="utf-8") == "replacement"
 
 
@@ -1512,60 +1787,6 @@ def test_failed_upgrade_smoke_leaves_status_and_generations_unchanged(
     assert result.status == "failed"
     assert layout.status.read_bytes() == status_before
     assert tuple(layout.generations.iterdir()) == generations_before
-
-
-def test_upgrade_status_callback_failure_retry_and_uninstall_leave_only_anchors(
-    generic_adapter: GenericAdapter,
-    repository_v2: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    skill_root = tmp_path / "skills"
-    skill_root.mkdir()
-    assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
-        "installed"
-    )
-    layout = generic_layout_paths(generic_adapter.state_paths)
-    status_before = layout.status.read_bytes()
-    generations_before = set(layout.generations.glob("g-*"))
-    upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
-    original = upgraded._write_status_payload
-
-    def fail_candidate_anchor(payload: dict[str, object]) -> None:
-        transaction = payload.get("transaction")
-        if (
-            isinstance(transaction, dict)
-            and transaction.get("phase") == "generation-published"
-        ):
-            raise OSError("injected upgrade status callback failure")
-        original(payload)
-
-    monkeypatch.setattr(upgraded, "_write_status_payload", fail_candidate_anchor)
-    failed = upgraded.install(InstallOptions(output_dir=skill_root))
-
-    assert failed.status == "failed"
-    assert layout.status.read_bytes() == status_before
-    assert set(layout.generations.glob("g-*")) == generations_before
-
-    monkeypatch.setattr(upgraded, "_write_status_payload", original)
-    retried = upgraded.install(InstallOptions(output_dir=skill_root))
-    status = validate_status_v5(
-        layout.status.read_bytes(),
-        skill_root=skill_root,
-        generations_root=layout.generations,
-    )
-
-    assert retried.status == "upgraded"
-    assert status.previous is not None
-    assert set(layout.generations.glob("g-*")) == {
-        layout.generations / status.active.generation_id,
-        layout.generations / status.previous.generation_id,
-    }
-
-    uninstalled = upgraded.uninstall(UninstallOptions(output_dir=skill_root))
-
-    assert uninstalled.status == "uninstalled"
-    assert not tuple(layout.generations.glob("g-*"))
 
 
 def test_doctor_validates_active_previous_and_capsule_anchors(
@@ -2074,13 +2295,26 @@ def test_first_install_recovery_is_idempotent_after_each_activation_phase(
 ):
     skill_root = tmp_path / "skills"
     skill_root.mkdir()
-    original = generic_adapter._write_transaction_status
+    original = generic_adapter._advance_transaction_status
     interrupted = False
 
-    def interrupt_after_phase(root: Path, payload: dict[str, object]) -> None:
+    def interrupt_after_phase(
+        root: Path,
+        *,
+        journal,
+        before_payload,
+        after_payload,
+        terminal=False,
+    ):
         nonlocal interrupted
-        original(root, payload)
-        transaction = payload.get("transaction")
+        result = original(
+            root,
+            journal=journal,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            terminal=terminal,
+        )
+        transaction = after_payload.get("transaction")
         if (
             not interrupted
             and isinstance(transaction, dict)
@@ -2088,13 +2322,14 @@ def test_first_install_recovery_is_idempotent_after_each_activation_phase(
         ):
             interrupted = True
             raise OSError(f"injected interruption after {phase}")
+        return result
 
     monkeypatch.setattr(
-        generic_adapter, "_write_transaction_status", interrupt_after_phase
+        generic_adapter, "_advance_transaction_status", interrupt_after_phase
     )
     failed = generic_adapter.install(InstallOptions(output_dir=skill_root))
     monkeypatch.setattr(
-        generic_adapter, "_write_transaction_status", original
+        generic_adapter, "_advance_transaction_status", original
     )
 
     assert interrupted
@@ -2128,13 +2363,26 @@ def test_upgrade_recovery_completes_only_a_fully_anchored_candidate(
         "installed"
     )
     upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
-    original = upgraded._write_transaction_status
+    original = upgraded._advance_transaction_status
     interrupted = False
 
-    def interrupt_after_phase(root: Path, payload: dict[str, object]) -> None:
+    def interrupt_after_phase(
+        root: Path,
+        *,
+        journal,
+        before_payload,
+        after_payload,
+        terminal=False,
+    ):
         nonlocal interrupted
-        original(root, payload)
-        transaction = payload.get("transaction")
+        result = original(
+            root,
+            journal=journal,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            terminal=terminal,
+        )
+        transaction = after_payload.get("transaction")
         if (
             not interrupted
             and isinstance(transaction, dict)
@@ -2142,10 +2390,11 @@ def test_upgrade_recovery_completes_only_a_fully_anchored_candidate(
         ):
             interrupted = True
             raise OSError(f"injected interruption after {phase}")
+        return result
 
-    monkeypatch.setattr(upgraded, "_write_transaction_status", interrupt_after_phase)
+    monkeypatch.setattr(upgraded, "_advance_transaction_status", interrupt_after_phase)
     assert upgraded.install(InstallOptions(output_dir=skill_root)).status == "failed"
-    monkeypatch.setattr(upgraded, "_write_transaction_status", original)
+    monkeypatch.setattr(upgraded, "_advance_transaction_status", original)
 
     assert interrupted
     assert upgraded.doctor().status == "installed"
@@ -2161,7 +2410,7 @@ def test_upgrade_recovery_completes_only_a_fully_anchored_candidate(
     assert status.transaction_id is None
 
 
-def test_recovery_rolls_back_a_tampered_candidate_through_rollback_pending(
+def test_recovery_preserves_a_tampered_journal_candidate_as_a_conflict(
     generic_adapter: GenericAdapter,
     repository_v2: Path,
     tmp_path: Path,
@@ -2173,17 +2422,31 @@ def test_recovery_rolls_back_a_tampered_candidate_through_rollback_pending(
         "installed"
     )
     upgraded = GenericAdapter(repository_v2, generic_adapter.state_paths)
-    original = upgraded._write_transaction_status
+    original = upgraded._advance_transaction_status
 
-    def stop_activation(root: Path, payload: dict[str, object]) -> None:
-        original(root, payload)
-        transaction = payload.get("transaction")
+    def stop_activation(
+        root: Path,
+        *,
+        journal,
+        before_payload,
+        after_payload,
+        terminal=False,
+    ):
+        result = original(
+            root,
+            journal=journal,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            terminal=terminal,
+        )
+        transaction = after_payload.get("transaction")
         if isinstance(transaction, dict) and transaction.get("phase") == (
             "activation-pending"
         ):
             raise OSError("injected activation interruption")
+        return result
 
-    monkeypatch.setattr(upgraded, "_write_transaction_status", stop_activation)
+    monkeypatch.setattr(upgraded, "_advance_transaction_status", stop_activation)
     assert upgraded.install(InstallOptions(output_dir=skill_root)).status == "failed"
     layout = generic_layout_paths(generic_adapter.state_paths)
     pending = validate_status_v5(
@@ -2198,29 +2461,40 @@ def test_recovery_rolls_back_a_tampered_candidate_through_rollback_pending(
     candidate_file.write_bytes(b"tampered candidate")
     rollback_seen = False
 
-    def stop_rollback(root: Path, payload: dict[str, object]) -> None:
+    def stop_rollback(
+        root: Path,
+        *,
+        journal,
+        before_payload,
+        after_payload,
+        terminal=False,
+    ):
         nonlocal rollback_seen
-        original(root, payload)
-        transaction = payload.get("transaction")
+        result = original(
+            root,
+            journal=journal,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            terminal=terminal,
+        )
+        transaction = after_payload.get("transaction")
         if isinstance(transaction, dict) and transaction.get("phase") == (
             "rollback-pending"
         ):
             rollback_seen = True
             raise OSError("injected rollback interruption")
+        return result
 
-    monkeypatch.setattr(upgraded, "_write_transaction_status", stop_rollback)
+    monkeypatch.setattr(upgraded, "_advance_transaction_status", stop_rollback)
     assert upgraded.doctor().status == "degraded"
-    monkeypatch.setattr(upgraded, "_write_transaction_status", original)
+    monkeypatch.setattr(upgraded, "_advance_transaction_status", original)
     assert rollback_seen
-    assert upgraded.doctor().status == "installed"
-    restored = validate_status_v5(
-        layout.status.read_bytes(),
-        skill_root=skill_root,
-        generations_root=layout.generations,
-    )
-    assert restored.active.package_version == "0.1.0"
-    assert restored.previous is None
-    assert restored.transaction_id is None
+    status_before = layout.status.read_bytes()
+    journal_before = layout.transaction.read_bytes()
+    assert upgraded.doctor().status == "degraded"
+    assert layout.status.read_bytes() == status_before
+    assert layout.transaction.read_bytes() == journal_before
+    assert candidate_file.read_bytes() == b"tampered candidate"
 
 
 @pytest.mark.parametrize(
@@ -2237,12 +2511,12 @@ def test_uninstall_recovery_completes_each_deactivation_phase(
     assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
         "installed"
     )
-    original = generic_adapter._write_transaction_status
+    original = generic_adapter._write_status_payload
     interrupted = False
 
-    def interrupt_after_phase(root: Path, payload: dict[str, object]) -> None:
+    def interrupt_after_phase(payload: dict[str, object]) -> None:
         nonlocal interrupted
-        original(root, payload)
+        original(payload)
         transaction = payload.get("transaction")
         if (
             not interrupted
@@ -2253,11 +2527,11 @@ def test_uninstall_recovery_completes_each_deactivation_phase(
             raise OSError(f"injected interruption after {phase}")
 
     monkeypatch.setattr(
-        generic_adapter, "_write_transaction_status", interrupt_after_phase
+        generic_adapter, "_write_status_payload", interrupt_after_phase
     )
     first = generic_adapter.uninstall(UninstallOptions(output_dir=skill_root))
     monkeypatch.setattr(
-        generic_adapter, "_write_transaction_status", original
+        generic_adapter, "_write_status_payload", original
     )
 
     assert interrupted
@@ -2317,7 +2591,7 @@ def test_uninstall_recovery_finishes_generation_cleanup_and_status_removal(
     assert upgraded.doctor().status == "not-installed"
 
 
-def test_doctor_rejects_unanchored_recovery_marker_without_mutating_it(
+def test_doctor_rejects_invalid_ownership_journal_without_mutating_it(
     generic_adapter: GenericAdapter,
     tmp_path: Path,
 ):
@@ -2326,20 +2600,14 @@ def test_doctor_rejects_unanchored_recovery_marker_without_mutating_it(
     assert generic_adapter.install(InstallOptions(output_dir=skill_root)).status == (
         "installed"
     )
-    marker = generic_layout_paths(generic_adapter.state_paths).transaction
-    bad_marker = (
-        b'{"status_digest":"'
-        + b"0" * 64
-        + b'","transaction_id":"t-'
-        + b"1" * 32
-        + b'"}'
-    )
-    marker.write_bytes(bad_marker)
+    journal = generic_layout_paths(generic_adapter.state_paths).transaction
+    bad_journal = b'{"format":2}'
+    journal.write_bytes(bad_journal)
 
     result = generic_adapter.doctor()
 
     assert result.status == "degraded"
-    assert marker.read_bytes() == bad_marker
+    assert journal.read_bytes() == bad_journal
 
 
 def test_versioned_strict_mode_fails_before_any_mutation(
@@ -2498,7 +2766,7 @@ def test_generic_refuses_to_overwrite_unmanaged_directory(tmp_path: Path):
     assert marker.read_text(encoding="utf-8") == "do not replace"
 
 
-def test_generic_removes_identity_bound_package_when_status_recording_fails(
+def test_generic_preserves_journal_owned_package_when_status_recording_fails(
     tmp_path: Path, monkeypatch
 ):
     repository = Path(__file__).resolve().parents[1]
@@ -2523,8 +2791,14 @@ def test_generic_removes_identity_bound_package_when_status_recording_fails(
     layout = generic_layout_paths(state)
     assert result.status == "failed"
     assert not (root / "voice-intent-normalizer").exists()
-    assert not tuple(layout.generations.glob("g-*"))
-    assert not layout.transaction.exists()
+    generations = tuple(layout.generations.glob("g-*"))
+    assert len(generations) == 1
+    journal = validate_ownership_journal(
+        layout.transaction.read_bytes(),
+        skill_root=root,
+        generations_root=layout.generations,
+    )
+    assert journal.generation_root == generations[0]
     assert not layout.status.exists()
 
 
