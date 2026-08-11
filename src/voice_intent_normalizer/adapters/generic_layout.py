@@ -459,18 +459,7 @@ def validate_ownership_journal(
     generations_root: Path,
 ) -> OwnershipJournal:
     """Validate exact journal bytes and derive its only owned paths."""
-    if not isinstance(payload, bytes) or len(payload) > _MAX_JOURNAL_BYTES:
-        raise ValueError("invalid adapter ownership journal")
-    try:
-        value = json.loads(
-            payload,
-            object_pairs_hook=_unique_json_object,
-            parse_constant=_reject_json_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError("invalid adapter ownership journal") from exc
-    if not isinstance(value, Mapping) or set(value) != _OWNERSHIP_JOURNAL_FIELDS:
-        raise ValueError("invalid adapter ownership journal fields")
+    value = _parse_ownership_journal(payload)
     if not isinstance(generations_root, Path):
         raise ValueError("invalid generation root")
     trusted_generations_root = _validated_journal_generation_root(generations_root)
@@ -520,6 +509,39 @@ def validate_ownership_journal(
         / candidate.generation_id,
         generation_root=trusted_generations_root / candidate.generation_id,
     )
+
+
+def ownership_journal_skill_root(payload: bytes) -> Path:
+    """Select only the direct canonical root from strict journal bytes."""
+    value = _parse_ownership_journal(payload)
+    return _selected_journal_skill_root(value["selected_skill_root"])
+
+
+def _parse_ownership_journal(payload: bytes) -> Mapping[str, object]:
+    """Parse the sole bounded, duplicate-free, canonical journal object."""
+    if not isinstance(payload, bytes) or len(payload) > _MAX_JOURNAL_BYTES:
+        raise ValueError("invalid adapter ownership journal")
+    try:
+        value = json.loads(
+            payload,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid adapter ownership journal") from exc
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _OWNERSHIP_JOURNAL_FIELDS
+        or value.get("format") != 1
+    ):
+        raise ValueError("invalid adapter ownership journal fields")
+    try:
+        canonical = canonical_json_bytes(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid adapter ownership journal") from exc
+    if payload != canonical:
+        raise ValueError("adapter ownership journal is not canonical")
+    return value
 
 
 def _ownership_journal_payload(

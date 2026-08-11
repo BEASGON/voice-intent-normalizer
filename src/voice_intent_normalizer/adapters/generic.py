@@ -31,6 +31,7 @@ from .generic_layout import (
     canonical_status_v5,
     generic_layout_paths,
     ownership_journal_bytes,
+    ownership_journal_skill_root,
     ownership_journal_transition_bytes,
     prepare_versioned_artifacts,
     status_v5_payload,
@@ -60,6 +61,16 @@ class _ValidatedTree:
 
 @dataclass(frozen=True, slots=True)
 class _CleanupTree:
+    directories: tuple[Path, ...]
+    identities: Mapping[Path, tuple[int, int]]
+    files: tuple[Path, ...]
+    children: Mapping[Path, frozenset[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class _JournalCleanupTree:
+    identity: tuple[int, int]
+    manifest_bytes: bytes | None
     directories: tuple[Path, ...]
     identities: Mapping[Path, tuple[int, int]]
     files: tuple[Path, ...]
@@ -112,27 +123,16 @@ class GenericAdapter:
             return self._failed("a skill root is required")
         root = self._safe_skill_root(options.output_dir)
         self._configured_skill_root = root
+        self._recover_ownership_journal(
+            root, allow_capsule_publication=True
+        )
         status = self._read_versioned_status(root)
         if status is None:
-            if self._journal_exists():
-                return self._failed("unanchored ownership journal requires review")
             if self._direct_entry_exists(root / _NAME):
                 return self._failed(
                     "existing skill capsule is not anchored by adapter status"
                 )
             return self._first_install(root, options)
-
-        if status.transaction_phase is not None:
-            self._recover_pending(root, allow_capsule_publication=True)
-            status = self._read_versioned_status(root)
-            if status is None:
-                if self._direct_entry_exists(root / _NAME):
-                    return self._failed(
-                        "incomplete installation could not be recovered"
-                    )
-                return self._first_install(root, options)
-        elif self._journal_exists():
-            self._retire_redundant_terminal_journal(root, status)
 
         self._validate_complete_status(root, status, smoke=False)
         artifacts = self._prepare_versioned_artifacts(secrets.token_hex(16))
@@ -677,52 +677,271 @@ class GenericAdapter:
             if missing_ok:
                 return
             raise FileNotFoundError("adapter ownership journal is missing")
-        lease.unlink(_TRANSACTION_RELATIVE)
-        lease.fsync_directory(_GENERIC_RELATIVE)
+        payload = lease.read_bytes(
+            _TRANSACTION_RELATIVE,
+            _MANIFEST_LIMIT,
+            "adapter ownership journal",
+        )
+        try:
+            lease.unlink(_TRANSACTION_RELATIVE)
+            lease.fsync_directory(_GENERIC_RELATIVE)
+        except OSError:
+            if not lease.exists(_TRANSACTION_RELATIVE):
+                lease.write_bytes_exclusive(_TRANSACTION_RELATIVE, payload)
+                try:
+                    lease.fsync_directory(_GENERIC_RELATIVE)
+                except OSError:
+                    pass
+                self._record_changes(
+                    (generic_layout_paths(self.state_paths).transaction,)
+                )
+            raise
         self._record_changes((generic_layout_paths(self.state_paths).transaction,))
 
-    def _recover_pending(
-        self, root: Path, *, allow_capsule_publication: bool
+    def _recover_ownership_journal(
+        self,
+        root: Path,
+        *,
+        allow_capsule_publication: bool,
     ) -> None:
+        """Resolve one exact journal under the global lock within eight transitions."""
+        generations_root = generic_layout_paths(self.state_paths).generations
         for _ in range(8):
-            status = self._read_required_status(root)
-            phase = status.transaction_phase
-            if phase is None:
-                if self._journal_exists():
-                    self._retire_redundant_terminal_journal(root, status)
-                return
-            if phase in {
-                "generation-published",
-                "capsule-published",
-                "activation-pending",
-                "rollback-pending",
-            }:
-                journal = self._read_ownership_journal(root)
-                status_bytes = self._read_status_bytes()
+            status_bytes = self._read_status_bytes()
+            if not self._journal_exists():
+                if status_bytes is None:
+                    return
+                status, _ = canonical_status_v5(
+                    status_bytes,
+                    skill_root=root,
+                    generations_root=generations_root,
+                )
+                phase = status.transaction_phase
+                if phase is None:
+                    return
+                if phase not in {
+                    "deactivation-pending",
+                    "capsule-retired",
+                    "cleanup-pending",
+                }:
+                    raise ValueError(
+                        "activation status is missing its ownership journal"
+                    )
+                self._recover_uninstall(root, status)
+                continue
+
+            journal_bytes = self._state_lease().read_bytes(
+                _TRANSACTION_RELATIVE,
+                _MANIFEST_LIMIT,
+                "adapter ownership journal",
+            )
+            journal = validate_ownership_journal(
+                journal_bytes,
+                skill_root=root,
+                generations_root=generations_root,
+            )
+            status_digest = (
+                None
+                if status_bytes is None
+                else hashlib.sha256(status_bytes).hexdigest()
+            )
+            if (
+                journal.transition.before_digest
+                == journal.baseline_status_digest
+                == status_digest
+            ):
+                self._recover_initial_journal(
+                    root, journal, journal_bytes, status_bytes
+                )
+                continue
+            if status_digest == journal.transition.before_digest:
+                if status_bytes is None:
+                    raise ValueError("journal transition status is missing")
+                status, _ = canonical_status_v5(
+                    status_bytes,
+                    skill_root=root,
+                    generations_root=generations_root,
+                )
+                self._validate_journal_status(journal, status)
+                expected = self._expected_activation_after(status, journal)
                 if (
-                    status_bytes is None
-                    or journal.transaction_id != status.transaction_id
-                    or journal.transition.after_digest
-                    != hashlib.sha256(status_bytes).hexdigest()
+                    hashlib.sha256(canonical_json_bytes(expected)).hexdigest()
+                    != journal.transition.after_digest
                 ):
-                    raise ValueError("ownership journal does not anchor status")
+                    raise ValueError(
+                        "ownership journal does not bind the next status"
+                    )
                 self._recover_activation(
                     root,
                     status,
                     journal,
                     allow_capsule_publication=allow_capsule_publication,
                 )
-            elif phase in {
-                "deactivation-pending",
-                "capsule-retired",
-                "cleanup-pending",
-            }:
-                self._recover_uninstall(root, status)
-            else:
-                raise ValueError("unsupported adapter transaction phase")
-            if self._read_versioned_status(root) is None:
-                return
+                continue
+            if status_digest == journal.transition.after_digest:
+                if status_bytes is None:
+                    raise ValueError("journal after-status is missing")
+                status, _ = canonical_status_v5(
+                    status_bytes,
+                    skill_root=root,
+                    generations_root=generations_root,
+                )
+                self._validate_journal_status(journal, status)
+                if status.transaction_phase is None:
+                    self._retire_redundant_terminal_journal(root, status)
+                else:
+                    self._recover_activation(
+                        root,
+                        status,
+                        journal,
+                        allow_capsule_publication=allow_capsule_publication,
+                    )
+                continue
+            raise ValueError("ownership journal conflicts with protected status")
         raise OSError("adapter recovery exceeded its transition bound")
+
+    def _recover_initial_journal(
+        self,
+        root: Path,
+        journal: OwnershipJournal,
+        journal_bytes: bytes,
+        status_bytes: bytes | None,
+    ) -> None:
+        if status_bytes is None:
+            if journal.operation != "first-install":
+                raise ValueError("upgrade journal baseline status is missing")
+            if self._direct_entry_exists(root / _NAME):
+                raise ValueError("first-install journal conflicts with a capsule")
+        else:
+            if journal.operation != "upgrade":
+                raise ValueError("first-install journal has a baseline status")
+            status, _ = canonical_status_v5(
+                status_bytes,
+                skill_root=root,
+                generations_root=generic_layout_paths(
+                    self.state_paths
+                ).generations,
+            )
+            if status.transaction_phase is not None:
+                raise ValueError("journal baseline status is not terminal")
+            if status.capsule != journal.capsule:
+                raise ValueError("journal capsule differs from its baseline")
+            self._validate_capsule_ref(root, status)
+            self._validate_generation_ref(status.active)
+            if status.previous is not None:
+                self._validate_generation_ref(status.previous)
+
+        stage_relative = _STAGING_RELATIVE / journal.candidate.generation_id
+        final_relative = _GENERATIONS_RELATIVE / journal.candidate.generation_id
+        lease = self._state_lease()
+        stage_exists = lease.exists(stage_relative)
+        final_exists = lease.exists(final_relative)
+        if stage_exists and final_exists:
+            raise ValueError(
+                "journal candidate exists at both staging and final names"
+            )
+        selected = stage_relative if stage_exists else final_relative
+        if stage_exists or final_exists:
+            tree = self._preflight_journal_cleanup(selected, journal)
+            self._remove_journal_candidate(selected, tree)
+
+        # Conservatively make a prior successful rmdir durable before the
+        # journal itself is retired, even when this process observed no name.
+        lease.fsync_directory(_STAGING_RELATIVE)
+        lease.fsync_directory(_GENERATIONS_RELATIVE)
+        current = lease.read_bytes(
+            _TRANSACTION_RELATIVE,
+            _MANIFEST_LIMIT,
+            "adapter ownership journal",
+        )
+        if current != journal_bytes:
+            raise ValueError("adapter ownership journal changed during cleanup")
+        self._remove_ownership_journal(missing_ok=False)
+
+    def _validate_journal_status(
+        self, journal: OwnershipJournal, status: StatusV5
+    ) -> None:
+        if (
+            not self._same_selected_root(
+                status.selected_skill_root, journal.selected_skill_root
+            )
+            or status.capsule != journal.capsule
+        ):
+            raise ValueError("ownership journal status references differ")
+        if status.transaction_phase is None:
+            if journal.operation == "first-install":
+                if status.active != journal.candidate or status.previous is not None:
+                    raise ValueError("terminal status has the wrong journal operation")
+            elif (
+                status.active != journal.candidate
+                or status.previous is None
+                or status.previous == journal.candidate
+            ):
+                raise ValueError("terminal upgrade status differs from its journal")
+            return
+        if status.transaction_id != journal.transaction_id:
+            raise ValueError("status transaction does not match ownership journal")
+        if status.transaction_phase not in {
+            "generation-published",
+            "capsule-published",
+            "activation-pending",
+            "rollback-pending",
+        }:
+            raise ValueError("journal has an invalid activation phase")
+        if journal.operation == "first-install":
+            if status.active != journal.candidate or status.previous is not None:
+                raise ValueError("first-install journal candidate differs")
+        elif (
+            status.previous != journal.candidate
+            or status.active == journal.candidate
+        ):
+            raise ValueError("upgrade journal candidate differs")
+
+    def _expected_activation_after(
+        self, status: StatusV5, journal: OwnershipJournal
+    ) -> dict[str, object]:
+        phase = status.transaction_phase
+        if phase == "generation-published":
+            return self._replace_phase(
+                self._status_payload(status),
+                "capsule-published"
+                if journal.operation == "first-install"
+                else "activation-pending",
+            )
+        if phase == "capsule-published":
+            if journal.operation != "first-install":
+                raise ValueError("upgrade journal has a capsule publication phase")
+            return self._replace_phase(
+                self._status_payload(status), "activation-pending"
+            )
+        if phase == "activation-pending":
+            active = (
+                status.active if status.previous is None else status.previous
+            )
+            previous = None if status.previous is None else status.active
+            return status_v5_payload(
+                skill_root=status.selected_skill_root,
+                capability=status.capability,
+                capsule=status.capsule,
+                active=active,
+                previous=previous,
+            )
+        if phase == "rollback-pending":
+            return status_v5_payload(
+                skill_root=status.selected_skill_root,
+                capability=status.capability,
+                capsule=status.capsule,
+                active=status.active,
+                previous=None,
+            )
+        raise ValueError("invalid activation recovery phase")
+
+    def _recover_pending(
+        self, root: Path, *, allow_capsule_publication: bool
+    ) -> None:
+        self._recover_ownership_journal(
+            root, allow_capsule_publication=allow_capsule_publication
+        )
 
     def _recover_activation(
         self,
@@ -932,11 +1151,19 @@ class GenericAdapter:
                 )
             root = self._protected_skill_root()
             if root is None:
-                raise ValueError("selected skill root is unavailable")
+                payload = self._state_lease().read_bytes(
+                    _TRANSACTION_RELATIVE,
+                    _MANIFEST_LIMIT,
+                    "adapter ownership journal",
+                )
+                root = ownership_journal_skill_root(payload)
         root = self._safe_skill_root(root)
+        self._recover_ownership_journal(
+            root, allow_capsule_publication=False
+        )
         status = self._read_versioned_status(root)
         if status is None:
-            if self._journal_exists() or self._direct_entry_exists(root / _NAME):
+            if self._direct_entry_exists(root / _NAME):
                 return AdapterResult(
                     self.platform,
                     "degraded",
@@ -952,15 +1179,6 @@ class GenericAdapter:
                     "shared personal and project data were preserved",
                 ),
             )
-        if status.transaction_phase is not None:
-            self._recover_pending(root, allow_capsule_publication=False)
-            status = self._read_versioned_status(root)
-            if status is None:
-                return AdapterResult(
-                    self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
-                )
-        elif self._journal_exists():
-            self._retire_redundant_terminal_journal(root, status)
         try:
             self._validate_complete_status(root, status, smoke=True)
         except Exception:
@@ -1018,26 +1236,16 @@ class GenericAdapter:
             return self._failed("skill root is required for safe uninstall")
         root = self._safe_skill_root(root_value)
         self._configured_skill_root = root
+        self._recover_ownership_journal(
+            root, allow_capsule_publication=False
+        )
         status = self._read_versioned_status(root)
         if status is None:
-            if self._journal_exists() or self._direct_entry_exists(root / _NAME):
+            if self._direct_entry_exists(root / _NAME):
                 return self._failed("managed ownership cannot be verified")
             return AdapterResult(
                 self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
             )
-        if status.transaction_phase is not None:
-            self._recover_pending(root, allow_capsule_publication=False)
-            status = self._read_versioned_status(root)
-            if status is None:
-                return AdapterResult(
-                    self.platform,
-                    "uninstalled",
-                    CapabilityLevel.MANUAL,
-                    ("shared personal and project data were preserved",),
-                )
-        elif self._journal_exists():
-            self._retire_redundant_terminal_journal(root, status)
-
         self._validate_complete_status(root, status, smoke=False)
         transaction_id = f"t-{secrets.token_hex(16)}"
         payload = status_v5_payload(
@@ -1637,6 +1845,220 @@ class GenericAdapter:
                 lease.rmdir(directory)
                 lease.fsync_directory(parent)
 
+    def _preflight_journal_cleanup(
+        self, relative: Path, journal: OwnershipJournal
+    ) -> _JournalCleanupTree:
+        """Anchor one exact partial candidate before any recovery deletion."""
+        root = self.state_paths.root
+        absolute = root / relative
+        root_info = absolute.lstat()
+        self._require_direct_directory(root_info)
+        root_identity = self._directory_identity(root_info)
+        root_names = frozenset(os.listdir(absolute))
+        if not root_names:
+            return _JournalCleanupTree(
+                identity=root_identity,
+                manifest_bytes=None,
+                directories=(relative,),
+                identities={relative: root_identity},
+                files=(),
+                children={relative: frozenset()},
+            )
+        if "generation.json" not in root_names:
+            raise ValueError("journal candidate content has no anchored manifest")
+        with guard_state_root(root, retained_dirs=(relative,)) as lease:
+            manifest_bytes = lease.read_bytes(
+                relative / "generation.json",
+                _MANIFEST_LIMIT,
+                "journal candidate manifest",
+            )
+        manifest = validate_anchored_manifest(
+            manifest_bytes,
+            kind="generation",
+            identifier=journal.candidate.generation_id,
+            expected_manifest_digest=journal.candidate.manifest_digest,
+            expected_package_hash=journal.candidate.package_hash,
+            expected_package_version=journal.candidate.package_version,
+        )
+        names = tuple(str(value) for value in manifest["files"])
+        expected_directories = set(self._manifest_directories(relative, names))
+        declared_files = {relative / Path(name) for name in names}
+        temporary_files = {
+            path.parent / f".{path.name}.tmp" for path in declared_files
+        }
+        allowed_files = declared_files | temporary_files | {
+            relative / "generation.json"
+        }
+        identities: dict[Path, tuple[int, int]] = {}
+        children: dict[Path, frozenset[str]] = {}
+        files: list[Path] = []
+        pending = [relative]
+        while pending:
+            directory = pending.pop()
+            directory_path = root / directory
+            before = directory_path.lstat()
+            self._require_direct_directory(before)
+            identity = self._directory_identity(before)
+            identities[directory] = identity
+            observed: set[str] = set()
+            with os.scandir(directory_path) as entries:
+                for entry in entries:
+                    observed.add(entry.name)
+                    path = directory / entry.name
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode) and not self._is_alias(info):
+                        if path not in expected_directories:
+                            raise ValueError("unexpected journal cleanup directory")
+                        pending.append(path)
+                    elif stat.S_ISREG(info.st_mode) and not self._is_alias(info):
+                        if path not in allowed_files:
+                            raise ValueError("unexpected journal cleanup file")
+                        if path != relative / "generation.json":
+                            files.append(path)
+                    else:
+                        raise ValueError("unsafe journal cleanup entry")
+            after = directory_path.lstat()
+            self._require_direct_directory(after)
+            if self._directory_identity(after) != identity:
+                raise ValueError("journal cleanup directory identity changed")
+            children[directory] = frozenset(observed)
+
+        directories = tuple(
+            sorted(identities, key=lambda path: (len(path.parts), str(path)))
+        )
+        retained = tuple(
+            sorted(
+                {relative.parent, *directories},
+                key=lambda path: (len(path.parts), str(path)),
+            )
+        )
+        hashes = manifest["file_hashes"]
+        assert isinstance(hashes, Mapping)
+        with guard_state_root(root, retained_dirs=retained) as lease:
+            for directory in directories:
+                current = lease.stat(directory)
+                self._require_direct_directory(current)
+                if self._directory_identity(current) != identities[directory]:
+                    raise ValueError("journal cleanup directory identity changed")
+                if frozenset(lease.listdir(directory)) != children[directory]:
+                    raise ValueError("journal cleanup tree changed during preflight")
+            for path in files:
+                info = lease.stat(path)
+                if not stat.S_ISREG(info.st_mode) or self._is_alias(info):
+                    raise ValueError("unsafe journal cleanup file")
+                data = lease.read_bytes(
+                    path, _MANAGED_FILE_LIMIT, "journal candidate file"
+                )
+                if path in declared_files:
+                    name = path.relative_to(relative).as_posix()
+                    if hashlib.sha256(data).hexdigest() != hashes[name]:
+                        raise ValueError("journal candidate file hash changed")
+            if (
+                lease.read_bytes(
+                    relative / "generation.json",
+                    _MANIFEST_LIMIT,
+                    "journal candidate manifest",
+                )
+                != manifest_bytes
+            ):
+                raise ValueError("journal candidate manifest changed")
+        return _JournalCleanupTree(
+            identity=root_identity,
+            manifest_bytes=manifest_bytes,
+            directories=directories,
+            identities=identities,
+            files=tuple(sorted(files, key=str)),
+            children=children,
+        )
+
+    def _remove_journal_candidate(
+        self, relative: Path, tree: _JournalCleanupTree
+    ) -> None:
+        """Remove only one preflighted candidate, keeping its manifest last."""
+        root = self.state_paths.root
+        if tree.manifest_bytes is None:
+            with guard_state_root(root, retained_dirs=(relative.parent,)) as lease:
+                current = lease.stat(relative)
+                self._require_direct_directory(current)
+                if self._directory_identity(current) != tree.identity:
+                    raise ValueError("journal candidate identity changed")
+                lease.rmdir(relative)
+                lease.fsync_directory(relative.parent)
+            self._record_changes((root / relative,))
+            return
+
+        retained = tuple(
+            sorted(
+                {relative.parent, *tree.directories},
+                key=lambda path: (len(path.parts), str(path)),
+            )
+        )
+        with guard_state_root(root, retained_dirs=retained) as lease:
+            for directory in tree.directories:
+                current = lease.stat(directory)
+                self._require_direct_directory(current)
+                if self._directory_identity(current) != tree.identities[directory]:
+                    raise ValueError("journal cleanup directory identity changed")
+                if frozenset(lease.listdir(directory)) != tree.children[directory]:
+                    raise ValueError("journal cleanup tree changed after preflight")
+            for path in tree.files:
+                lease.unlink(path)
+                self._record_changes((root / path,))
+
+        for directory in sorted(
+            (path for path in tree.directories if path != relative),
+            key=lambda path: (len(path.parts), str(path)),
+            reverse=True,
+        ):
+            with guard_state_root(
+                root, retained_dirs=(directory.parent,)
+            ) as lease:
+                current = lease.stat(directory)
+                self._require_direct_directory(current)
+                if self._directory_identity(current) != tree.identities[directory]:
+                    raise ValueError("journal cleanup directory identity changed")
+                lease.rmdir(directory)
+                lease.fsync_directory(directory.parent)
+            self._record_changes((root / directory,))
+
+        manifest = relative / "generation.json"
+        with guard_state_root(root, retained_dirs=(relative,)) as lease:
+            current = lease.stat(relative)
+            self._require_direct_directory(current)
+            if self._directory_identity(current) != tree.identity:
+                raise ValueError("journal candidate identity changed")
+            if frozenset(lease.listdir(relative)) != {"generation.json"}:
+                raise ValueError("journal candidate changed before retirement")
+            try:
+                lease.unlink(manifest)
+            except OSError:
+                if not lease.exists(manifest):
+                    lease.write_bytes_exclusive(manifest, tree.manifest_bytes)
+                    lease.fsync_directory(relative)
+                raise
+        self._record_changes((root / manifest,))
+        try:
+            with guard_state_root(root, retained_dirs=(relative.parent,)) as lease:
+                current = lease.stat(relative)
+                self._require_direct_directory(current)
+                if self._directory_identity(current) != tree.identity:
+                    raise ValueError("journal candidate identity changed")
+                lease.rmdir(relative)
+                lease.fsync_directory(relative.parent)
+        except OSError:
+            if self._direct_directory_exists(root / relative):
+                with guard_state_root(root, retained_dirs=(relative,)) as lease:
+                    current = lease.stat(relative)
+                    self._require_direct_directory(current)
+                    if self._directory_identity(current) != tree.identity:
+                        raise ValueError("journal candidate identity changed")
+                    if lease.listdir(relative):
+                        raise ValueError("journal candidate changed after cleanup")
+                    lease.write_bytes_exclusive(manifest, tree.manifest_bytes)
+                    lease.fsync_directory(relative)
+            raise
+        self._record_changes((root / relative,))
+
     def _preflight_staged_cleanup(
         self,
         root: Path,
@@ -2018,6 +2440,20 @@ class GenericAdapter:
             & _WINDOWS_REPARSE_POINT
         ):
             raise ValueError("artifact root must be a direct directory")
+
+    @staticmethod
+    def _is_alias(info: os.stat_result) -> bool:
+        return stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+        )
+
+    @staticmethod
+    def _same_selected_root(left: Path, right: Path) -> bool:
+        if os.name == "nt":
+            return os.path.normcase(os.fspath(left)) == os.path.normcase(
+                os.fspath(right)
+            )
+        return os.fspath(left) == os.fspath(right)
 
     @staticmethod
     def _directory_identity(info: os.stat_result) -> tuple[int, int]:

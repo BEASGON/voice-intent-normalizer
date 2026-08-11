@@ -486,6 +486,20 @@ def test_capsule_bootstrap_ignores_ambient_pythonpath_package(
     assert not built_runtime.marker.exists()
 
 
+def test_capsule_bootstrap_ignores_ownership_journal_metadata(
+    built_runtime: BuiltRuntime,
+):
+    """Catch bootstrap consulting non-public transaction metadata."""
+    transaction = built_runtime.status.parent / "transaction.json"
+    transaction.write_bytes(b'{"candidate":"untrusted"}')
+
+    result = _run_bootstrap(built_runtime)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "ok"
+    assert transaction.read_bytes() == b'{"candidate":"untrusted"}'
+
+
 def test_capsule_bootstrap_discards_preloaded_package(
     built_runtime: BuiltRuntime, tmp_path: Path
 ):

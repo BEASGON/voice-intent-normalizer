@@ -8,7 +8,9 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,9 @@ from voice_intent_normalizer.adapters.generic_contract import (
 )
 from voice_intent_normalizer.adapters.generic_layout import (
     generic_layout_paths,
+    ownership_journal_bytes,
+    ownership_journal_transition_bytes,
+    status_v5_payload,
     validate_ownership_journal,
 )
 from voice_intent_normalizer.installer import Installer
@@ -79,7 +84,9 @@ def repository_v2(tmp_path: Path) -> Path:
             ".worktrees",
             ".pytest_cache",
             ".ruff_cache",
+            ".superpowers",
             "__pycache__",
+            "dist",
         ),
     )
     pyproject = repository / "pyproject.toml"
@@ -122,6 +129,231 @@ def _validated_installed_layout(
         generation / "generation.json"
     ).read_bytes()
     return capsule, generation, json.loads(raw_status)
+
+
+@dataclass(frozen=True)
+class _JournalScenario:
+    state_paths: StatePaths
+    repository: Path
+    skill_root: Path
+    candidate_id: str
+
+    def restart(
+        self, operation: str
+    ) -> tuple[GenericAdapter, Callable[[], AdapterResult]]:
+        adapter = GenericAdapter(self.repository, self.state_paths)
+        if operation == "install":
+            return adapter, lambda: adapter.install(
+                InstallOptions(output_dir=self.skill_root)
+            )
+        if operation == "doctor":
+            return adapter, adapter.doctor
+        return adapter, lambda: adapter.uninstall(
+            UninstallOptions(output_dir=self.skill_root)
+        )
+
+
+def _write_test_artifact(root: Path, files: object) -> None:
+    assert hasattr(files, "items")
+    for relative, data in files.items():
+        target = root / Path(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+
+def _file_snapshot(*roots: Path) -> dict[Path, bytes]:
+    return {
+        path: path.read_bytes()
+        for root in roots
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _materialize_journal_state(
+    tmp_path: Path, state: str
+) -> _JournalScenario:
+    repository = Path(__file__).resolve().parents[1]
+    state_paths = StatePaths.resolve(
+        environ={"VOICE_INTENT_HOME": str(tmp_path / "state")}
+    )
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    builder = GenericAdapter(repository, state_paths)
+    artifacts = builder._prepare_versioned_artifacts("6" * 32)
+    layout = generic_layout_paths(state_paths)
+    transaction_id = f"t-{'7' * 32}"
+    generation_published = status_v5_payload(
+        skill_root=skill_root,
+        capability="manual",
+        capsule=artifacts.capsule,
+        active=artifacts.generation,
+        previous=None,
+        transaction_id=transaction_id,
+        transaction_phase="generation-published",
+    )
+    capsule_published = status_v5_payload(
+        skill_root=skill_root,
+        capability="manual",
+        capsule=artifacts.capsule,
+        active=artifacts.generation,
+        previous=None,
+        transaction_id=transaction_id,
+        transaction_phase="capsule-published",
+    )
+    activation_pending = status_v5_payload(
+        skill_root=skill_root,
+        capability="manual",
+        capsule=artifacts.capsule,
+        active=artifacts.generation,
+        previous=None,
+        transaction_id=transaction_id,
+        transaction_phase="activation-pending",
+    )
+    terminal = status_v5_payload(
+        skill_root=skill_root,
+        capability="manual",
+        capsule=artifacts.capsule,
+        active=artifacts.generation,
+        previous=None,
+    )
+    initial_bytes = ownership_journal_bytes(
+        operation="first-install",
+        transaction_id=transaction_id,
+        skill_root=skill_root,
+        baseline_status_bytes=None,
+        before_status_bytes=None,
+        after_status_bytes=canonical_json_bytes(generation_published),
+        capsule=artifacts.capsule,
+        candidate=artifacts.generation,
+    )
+
+    with builder._state_operation(create=True):
+        builder._write_ownership_journal(initial_bytes)
+        initial = validate_ownership_journal(
+            initial_bytes,
+            skill_root=skill_root,
+            generations_root=layout.generations,
+        )
+        if state == "initial-empty-stage":
+            initial.staging_root.mkdir()
+        elif state == "initial-partial-stage":
+            initial.staging_root.mkdir()
+            (initial.staging_root / "generation.json").write_bytes(
+                artifacts.generation.files["generation.json"]
+            )
+            (initial.staging_root / "SKILL.md").write_bytes(
+                artifacts.generation.files["SKILL.md"]
+            )
+        elif state == "initial-complete-stage":
+            _write_test_artifact(
+                initial.staging_root, artifacts.generation.files
+            )
+        elif state == "initial-final":
+            _write_test_artifact(
+                initial.generation_root, artifacts.generation.files
+            )
+        elif state in {
+            "later-before",
+            "matching-nonterminal-after",
+            "matching-terminal-after",
+        }:
+            _write_test_artifact(
+                initial.generation_root, artifacts.generation.files
+            )
+            _write_test_artifact(
+                skill_root / "voice-intent-normalizer",
+                artifacts.capsule.files,
+            )
+            if state == "matching-terminal-after":
+                before = canonical_json_bytes(activation_pending)
+                after = canonical_json_bytes(terminal)
+            else:
+                before = canonical_json_bytes(generation_published)
+                after = canonical_json_bytes(capsule_published)
+            advanced_bytes = ownership_journal_transition_bytes(
+                initial,
+                before_status_bytes=before,
+                after_status_bytes=after,
+            )
+            builder._replace_ownership_journal(
+                skill_root,
+                current_journal=initial,
+                payload=advanced_bytes,
+            )
+            builder._write_status_payload(
+                terminal
+                if state == "matching-terminal-after"
+                else (
+                    capsule_published
+                    if state == "matching-nonterminal-after"
+                    else generation_published
+                )
+            )
+    return _JournalScenario(
+        state_paths=state_paths,
+        repository=repository,
+        skill_root=skill_root,
+        candidate_id=artifacts.generation.identifier,
+    )
+
+
+def _materialize_upgrade_initial_state(
+    tmp_path: Path, repository_v2: Path
+) -> _JournalScenario:
+    repository = Path(__file__).resolve().parents[1]
+    state_paths = StatePaths.resolve(
+        environ={"VOICE_INTENT_HOME": str(tmp_path / "upgrade-state")}
+    )
+    skill_root = tmp_path / "upgrade-skills"
+    skill_root.mkdir()
+    installed = GenericAdapter(repository, state_paths)
+    assert installed.install(InstallOptions(output_dir=skill_root)).status == (
+        "installed"
+    )
+    layout = generic_layout_paths(state_paths)
+    baseline_bytes = layout.status.read_bytes()
+    baseline = validate_status_v5(
+        baseline_bytes,
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    builder = GenericAdapter(repository_v2, state_paths)
+    artifacts = builder._prepare_versioned_artifacts("9" * 32)
+    transaction_id = f"t-{'a' * 32}"
+    pending = status_v5_payload(
+        skill_root=skill_root,
+        capability="manual",
+        capsule=baseline.capsule,
+        active=baseline.active,
+        previous=artifacts.generation,
+        transaction_id=transaction_id,
+        transaction_phase="generation-published",
+    )
+    journal_bytes = ownership_journal_bytes(
+        operation="upgrade",
+        transaction_id=transaction_id,
+        skill_root=skill_root,
+        baseline_status_bytes=baseline_bytes,
+        before_status_bytes=baseline_bytes,
+        after_status_bytes=canonical_json_bytes(pending),
+        capsule=baseline.capsule,
+        candidate=artifacts.generation,
+    )
+    with builder._state_operation(create=True):
+        builder._write_ownership_journal(journal_bytes)
+        journal = validate_ownership_journal(
+            journal_bytes,
+            skill_root=skill_root,
+            generations_root=layout.generations,
+        )
+        _write_test_artifact(journal.generation_root, artifacts.generation.files)
+    return _JournalScenario(
+        state_paths=state_paths,
+        repository=repository_v2,
+        skill_root=skill_root,
+        candidate_id=artifacts.generation.identifier,
+    )
 
 
 def _inject_post_rename_identity_validation_fault(
@@ -1644,10 +1876,15 @@ def test_transaction_parent_fsync_failure_after_activation_is_committed(
 
     assert injected
     assert result.status == "installed"
+    assert layout.transaction.is_file()
+    validate_ownership_journal(
+        layout.transaction.read_bytes(),
+        skill_root=skill_root,
+        generations_root=layout.generations,
+    )
+    restarted = GenericAdapter(generic_adapter.repository, generic_adapter.state_paths)
+    assert restarted.doctor().status == "installed"
     assert not layout.transaction.exists()
-    assert generic_adapter.install(
-        InstallOptions(output_dir=skill_root)
-    ).status == "already-installed"
 
 
 def test_no_fallible_artifact_validation_runs_after_status_activation(
@@ -1827,6 +2064,348 @@ def test_callback_failure_cleanup_preserves_replaced_generation_without_adopting
     assert uninstalled.status == "failed"
     assert layout.transaction.read_bytes() == journal_before
     assert marker.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.parametrize("operation", ("install", "doctor", "uninstall"))
+@pytest.mark.parametrize(
+    "state",
+    (
+        "initial-journal-only",
+        "initial-empty-stage",
+        "initial-partial-stage",
+        "initial-complete-stage",
+        "initial-final",
+        "later-before",
+        "matching-nonterminal-after",
+        "matching-terminal-after",
+    ),
+)
+def test_ownership_journal_fresh_process_matrix(
+    operation: str,
+    state: str,
+    tmp_path: Path,
+):
+    """Catch a fresh public adapter stranding an exactly journal-owned state."""
+    scenario = _materialize_journal_state(tmp_path, state)
+    layout = generic_layout_paths(scenario.state_paths)
+    adapter, invoke = scenario.restart(operation)
+
+    result = invoke()
+
+    initial = state.startswith("initial-")
+    expected_status = {
+        (True, "install"): "installed",
+        (True, "doctor"): "not-installed",
+        (True, "uninstall"): "not-installed",
+        (False, "install"): "already-installed",
+        (False, "doctor"): "installed",
+        (False, "uninstall"): "uninstalled",
+    }[(initial, operation)]
+    assert result.status == expected_status
+    assert not layout.transaction.exists()
+    assert not (layout.staging / scenario.candidate_id).exists()
+    assert len(result.changed_paths) == len(set(result.changed_paths))
+    if initial:
+        assert not (layout.generations / scenario.candidate_id).exists()
+    if operation in {"doctor", "uninstall"} and initial or operation == "uninstall":
+        assert not layout.status.exists()
+        assert not (scenario.skill_root / "voice-intent-normalizer").exists()
+        return
+    status = validate_status_v5(
+        layout.status.read_bytes(),
+        skill_root=scenario.skill_root,
+        generations_root=layout.generations,
+    )
+    assert status.transaction_id is None
+    anchored = {status.active.generation_id}
+    if status.previous is not None:
+        anchored.add(status.previous.generation_id)
+    assert {path.name for path in layout.generations.iterdir()} == anchored
+
+
+@pytest.mark.parametrize("operation", ("install", "doctor", "uninstall"))
+def test_ownership_journal_fresh_process_preserves_upgrade_baseline(
+    operation: str,
+    tmp_path: Path,
+    repository_v2: Path,
+):
+    """Catch initial upgrade cleanup replacing the old terminal installation."""
+    scenario = _materialize_upgrade_initial_state(tmp_path, repository_v2)
+    layout = generic_layout_paths(scenario.state_paths)
+    baseline_bytes = layout.status.read_bytes()
+    adapter, invoke = scenario.restart(operation)
+
+    result = invoke()
+
+    assert result.status == {
+        "install": "upgraded",
+        "doctor": "installed",
+        "uninstall": "uninstalled",
+    }[operation]
+    assert not layout.transaction.exists()
+    assert not (layout.generations / scenario.candidate_id).exists()
+    if operation == "doctor":
+        assert layout.status.read_bytes() == baseline_bytes
+    elif operation == "uninstall":
+        assert not layout.status.exists()
+    assert len(result.changed_paths) == len(set(result.changed_paths))
+
+
+@pytest.mark.parametrize("repeated", (False, True), ids=("fail-once", "repeated"))
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "file-unlink",
+        "directory-removal",
+        "transaction-unlink",
+        "staging-parent-fsync",
+        "generations-parent-fsync",
+        "generic-parent-fsync",
+    ),
+)
+def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
+    fault: str,
+    repeated: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch cleanup faults losing the durable retry anchor."""
+    state = (
+        "initial-partial-stage"
+        if fault == "file-unlink"
+        else "initial-empty-stage"
+        if fault == "directory-removal"
+        else "initial-journal-only"
+    )
+    scenario = _materialize_journal_state(tmp_path, state)
+    layout = generic_layout_paths(scenario.state_paths)
+    journal_bytes = layout.transaction.read_bytes()
+    original_unlink = StateRootLease.unlink
+    original_rmdir = StateRootLease.rmdir
+    original_fsync = StateRootLease.fsync_directory
+    failures = 0
+
+    def should_fail() -> bool:
+        nonlocal failures
+        if repeated or failures == 0:
+            failures += 1
+            return True
+        return False
+
+    def fail_unlink(lease, relative, *, missing_ok=False):
+        relative = Path(relative)
+        selected = (
+            fault == "file-unlink" and relative.name == "SKILL.md"
+        ) or (
+            fault == "transaction-unlink"
+            and relative == Path("adapters/generic/transaction.json")
+        )
+        if selected and should_fail():
+            if fault == "transaction-unlink":
+                original_unlink(lease, relative, missing_ok=missing_ok)
+            raise OSError(f"injected {fault}")
+        return original_unlink(lease, relative, missing_ok=missing_ok)
+
+    def fail_rmdir(lease, relative, *, missing_ok=False):
+        relative = Path(relative)
+        if (
+            fault == "directory-removal"
+            and relative.name == scenario.candidate_id
+            and should_fail()
+        ):
+            raise OSError(f"injected {fault}")
+        return original_rmdir(lease, relative, missing_ok=missing_ok)
+
+    fsync_targets = {
+        "staging-parent-fsync": Path("adapters/generic/staging"),
+        "generations-parent-fsync": Path("adapters/generic/generations"),
+        "generic-parent-fsync": Path("adapters/generic"),
+    }
+
+    def fail_fsync(lease, relative=Path(".")):
+        relative = Path(relative)
+        if (
+            fault in fsync_targets
+            and relative == fsync_targets[fault]
+            and should_fail()
+        ):
+            raise OSError(f"injected {fault}")
+        return original_fsync(lease, relative)
+
+    monkeypatch.setattr(StateRootLease, "unlink", fail_unlink)
+    monkeypatch.setattr(StateRootLease, "rmdir", fail_rmdir)
+    monkeypatch.setattr(StateRootLease, "fsync_directory", fail_fsync)
+
+    first = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert first.status == "degraded"
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert len(first.changed_paths) == len(set(first.changed_paths))
+
+    second = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    if repeated:
+        assert second.status == "degraded"
+        assert layout.transaction.read_bytes() == journal_bytes
+    else:
+        assert second.status == "not-installed"
+        assert not layout.transaction.exists()
+        assert not (layout.staging / scenario.candidate_id).exists()
+        assert not (layout.generations / scenario.candidate_id).exists()
+    assert len(second.changed_paths) == len(set(second.changed_paths))
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    (
+        "status-digest",
+        "baseline-mismatch",
+        "operation",
+        "terminal-operation",
+        "selected-root",
+        "transaction",
+        "capsule",
+        "generation-reference",
+        "staging-manifest",
+        "final-manifest",
+        "both-names",
+        "extra-direct-entry",
+        "unknown-format",
+        "old-marker",
+        "oversized",
+        "directory-identity",
+    ),
+)
+def test_ownership_journal_conflict_preserves_all_observed_objects(
+    conflict: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Catch a digest, reference, tree, or identity conflict being adopted."""
+    later = {
+        "status-digest",
+        "operation",
+        "terminal-operation",
+        "transaction",
+        "capsule",
+        "generation-reference",
+    }
+    state = (
+        "matching-terminal-after"
+        if conflict == "terminal-operation"
+        else "later-before"
+        if conflict in later
+        else "initial-final"
+        if conflict in {"final-manifest", "both-names"}
+        else "initial-partial-stage"
+        if conflict in {"staging-manifest", "extra-direct-entry"}
+        else "initial-empty-stage"
+        if conflict == "directory-identity"
+        else "initial-journal-only"
+    )
+    scenario = _materialize_journal_state(tmp_path, state)
+    layout = generic_layout_paths(scenario.state_paths)
+    if conflict == "status-digest":
+        payload = json.loads(layout.status.read_bytes())
+        payload["capability"] = "implicit"
+        layout.status.write_bytes(canonical_json_bytes(payload))
+    elif conflict in {
+        "operation",
+        "terminal-operation",
+        "baseline-mismatch",
+        "selected-root",
+        "transaction",
+        "capsule",
+        "generation-reference",
+        "unknown-format",
+    }:
+        payload = json.loads(layout.transaction.read_bytes())
+        if conflict == "baseline-mismatch":
+            payload["operation"] = "upgrade"
+            payload["baseline_status_digest"] = "8" * 64
+            payload["status_transition"]["before_digest"] = "8" * 64
+        elif conflict == "terminal-operation":
+            payload["operation"] = "upgrade"
+            payload["baseline_status_digest"] = "8" * 64
+        elif conflict == "operation":
+            payload["operation"] = "upgrade"
+            payload["baseline_status_digest"] = payload["status_transition"][
+                "before_digest"
+            ]
+        elif conflict == "selected-root":
+            alternate = tmp_path / "alternate-skills"
+            alternate.mkdir()
+            payload["selected_skill_root"] = str(alternate)
+        elif conflict == "transaction":
+            payload["transaction_id"] = f"t-{'8' * 32}"
+        elif conflict == "capsule":
+            payload["capsule"]["package_hash"] = "8" * 64
+        elif conflict == "generation-reference":
+            package_hash = payload["candidate"]["package_hash"]
+            payload["candidate"]["generation_id"] = (
+                f"g-{package_hash}-{'8' * 32}"
+            )
+        else:
+            payload["format"] = 2
+        layout.transaction.write_bytes(canonical_json_bytes(payload))
+    elif conflict == "staging-manifest":
+        (layout.staging / scenario.candidate_id / "generation.json").write_bytes(
+            b"{}"
+        )
+    elif conflict == "final-manifest":
+        (
+            layout.generations / scenario.candidate_id / "generation.json"
+        ).write_bytes(b"{}")
+    elif conflict == "both-names":
+        (layout.staging / scenario.candidate_id).mkdir()
+    elif conflict == "extra-direct-entry":
+        (layout.staging / scenario.candidate_id / "unexpected.bin").write_bytes(
+            b"preserve"
+        )
+    elif conflict == "old-marker":
+        layout.transaction.write_bytes(
+            canonical_json_bytes(
+                {"before_digest": None, "after_digest": "8" * 64}
+            )
+        )
+    elif conflict == "oversized":
+        layout.transaction.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+    else:
+        original = GenericAdapter._preflight_journal_cleanup
+
+        def replace_after_preflight(adapter, relative, journal):
+            tree = original(adapter, relative, journal)
+            candidate = adapter.state_paths.root / relative
+            displaced = candidate.parent / "displaced-owned-candidate"
+            candidate.rename(displaced)
+            candidate.mkdir()
+            (candidate / "keep.txt").write_bytes(b"replacement")
+            displaced.rmdir()
+            return tree
+
+        monkeypatch.setattr(
+            GenericAdapter,
+            "_preflight_journal_cleanup",
+            replace_after_preflight,
+        )
+
+    before = _file_snapshot(scenario.state_paths.root, scenario.skill_root)
+    journal_bytes = layout.transaction.read_bytes()
+
+    result = GenericAdapter(
+        scenario.repository, scenario.state_paths
+    ).install(InstallOptions(output_dir=scenario.skill_root))
+
+    assert result.status == "failed"
+    assert layout.transaction.read_bytes() == journal_bytes
+    if conflict == "directory-identity":
+        replacement = layout.staging / scenario.candidate_id / "keep.txt"
+        assert replacement.read_bytes() == b"replacement"
+    else:
+        assert _file_snapshot(
+            scenario.state_paths.root, scenario.skill_root
+        ) == before
+    assert len(result.changed_paths) == len(set(result.changed_paths))
 
 
 @pytest.mark.parametrize("operation", ("first-install", "upgrade"))
@@ -3399,6 +3978,7 @@ def _copy_runtime_repository(source: Path, destination: Path) -> None:
             ".worktrees",
             ".pytest_cache",
             ".ruff_cache",
+            ".superpowers",
             "__pycache__",
             "*.pyc",
             "dist",

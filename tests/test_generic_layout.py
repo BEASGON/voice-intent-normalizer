@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import voice_intent_normalizer.adapters.generic_layout as generic_layout_module
 import voice_intent_normalizer.paths as paths_module
 from voice_intent_normalizer.adapters.generic_contract import (
     CAPSULE_PROTOCOL,
@@ -133,6 +134,26 @@ def _journal_with_selected_root(payload: bytes, selected_root: str) -> bytes:
     value = json.loads(payload)
     value["selected_skill_root"] = selected_root
     return canonical_json_bytes(value)
+
+
+def test_ownership_journal_root_selector_reuses_strict_canonical_contract(
+    tmp_path: Path,
+):
+    """Catch fresh doctor using a permissive shadow parse of journal roots."""
+    payload, skill_root, _ = _valid_ownership_journal(tmp_path)
+    selector = getattr(
+        generic_layout_module, "ownership_journal_skill_root", None
+    )
+
+    assert callable(selector)
+    assert selector(payload) == skill_root
+    duplicate = payload.replace(
+        b'"format":1', b'"format":1,"format":1', 1
+    )
+    with pytest.raises(ValueError):
+        selector(duplicate)
+    with pytest.raises(ValueError):
+        selector(payload + b" ")
 
 
 def test_ownership_journal_upgrade_round_trip_uses_exact_canonical_bytes(
