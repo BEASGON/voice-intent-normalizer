@@ -4,7 +4,7 @@
 
 **Goal:** Make every staged or published generic-adapter generation durably owned before its managed-state name can exist, and make restart recovery exact, bounded, and fail-closed.
 
-**Architecture:** Replace the unreleased status-digest marker with a canonical clean-V1 write-ahead ownership journal. The journal binds the baseline status, one candidate generation, one capsule contract, and the exact before/after digests for every status transition; the installer writes it before creating candidate state paths and retains it until a terminal status is durable. Public bootstrap continues to trust only terminal `status.json`, while `install`, `doctor`, and `uninstall` recover the journal under the existing global adapter lock.
+**Architecture:** Replace the unreleased status-digest marker with a canonical clean-V1 write-ahead ownership journal. The journal binds the baseline status, one candidate generation, one capsule contract, and the exact before/after digests for every status transition; the installer writes it before creating candidate state paths and retains it until a terminal status is durable. Cleanup first moves the retained exact candidate into the journal-derived private staging namespace; Windows removes retained file handles exactly, while Linux and macOS remove validated private names under the cooperative global-lock contract. Public bootstrap continues to trust only terminal `status.json`, while `install`, `doctor`, and `uninstall` recover the journal under the existing global adapter lock.
 
 **Tech Stack:** Python 3.10+, standard library only at runtime, pytest, Ruff, setuptools/build, GitHub Actions.
 
@@ -17,6 +17,9 @@
 - Derive staging and final names only from the validated direct-local state root, selected skill root, transaction ID, and generation ID. Never serialize or scan arbitrary paths.
 - Keep first install unavailable until terminal activation and keep the old terminal generation launchable throughout upgrade preparation.
 - A mismatch, alias, replacement, extra entry, non-canonical document, duplicate key, size overflow, or unsupported format fails closed without deleting or activating the object.
+- Recheck that a public final name remains absent after its exact candidate is moved into private staging. A raced replacement preserves both objects and the journal.
+- Windows permanent file deletion must use the retained exact handle. Linux and macOS may use name-based unlink only inside the installer-owned private staging namespace while holding the global lock; do not claim protection from a hostile same-identity process that bypasses that lock.
+- POSIX validation opens potentially raced objects with `O_NONBLOCK` and `O_NOFOLLOW` before type checks, so a FIFO cannot hang a public operation.
 - Preserve personal, project, preference, negative, and downloaded hotword data on recovery and normal uninstall.
 - Use no new runtime dependency. Python 3.10 syntax remains the floor.
 - Run pytest with a repository-external `--basetemp` and `-p no:cacheprovider`; do not recreate `.pytest_cache` inside the worktree.
@@ -485,6 +488,132 @@ git commit -m "fix: recover journal-owned adapter generations"
 
 ---
 
+### Task 3A: Private-Namespace Cleanup Boundary
+
+**Files:**
+- Modify: `src/voice_intent_normalizer/paths.py`
+- Modify: `src/voice_intent_normalizer/adapters/generic.py`
+- Modify: `tests/test_paths.py`
+- Modify: `tests/test_installer.py`
+
+**Interfaces:**
+- Consumes: Task 3's journal-derived staging path, retained `StateRootLease` directories, `publish_directory_no_replace()`, `publish_file_no_replace_exact()`, and bound `.journal-clean-*` names.
+- Produces: `StateRootLease.remove_private_file(relative_path: Path, *, expected_bytes: bytes) -> None`, source-absence validation after exact directory moves, nonblocking POSIX destination validation, and journal-preserving conflict results.
+
+- [ ] **Step 1: Keep the recorded RED boundary reproductions**
+
+Retain the already recorded failing tests and split their expectations by the approved platform contract:
+
+```python
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact-handle deletion")
+@pytest.mark.parametrize("relative_path", (Path("SKILL.md"), Path("generation.json")))
+def test_windows_private_cleanup_deletes_only_retained_file_handle(
+    relative_path: Path,
+    journal_scenario: _JournalScenario,
+):
+    result, replacement = _replace_bound_name_at_permanent_delete(
+        journal_scenario,
+        relative_path,
+    )
+    assert replacement.exists()
+    assert replacement.read_bytes() == b"replacement"
+    assert journal_scenario.transaction_path.exists()
+    assert result.status in {"failed", "degraded"}
+```
+
+```python
+def test_exact_directory_move_preserves_raced_public_replacement(
+    journal_scenario: _JournalScenario,
+):
+    result, isolated, replacement = _replace_final_at_native_move(
+        journal_scenario
+    )
+    assert isolated.is_dir()
+    assert replacement.is_dir()
+    assert journal_scenario.transaction_path.exists()
+    assert result.status in {"failed", "degraded"}
+```
+
+```python
+@pytest.mark.skipif(os.name == "nt", reason="POSIX nonblocking open contract")
+def test_posix_exact_publication_rejects_raced_fifo_without_blocking(
+    tmp_path: Path,
+):
+    completed = subprocess.run(
+        [sys.executable, "-c", _POSIX_FIFO_RACE_SCRIPT, str(tmp_path)],
+        check=False,
+        timeout=10,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+```
+
+The production mutations caught are: reverting Windows deletion to name-based `unlink`, omitting the post-move public-name absence check, and omitting `O_NONBLOCK` before POSIX destination type validation. Expected RED on the current Windows checkout: the two exact-handle cases delete the replacement, and the final-move case retires the journal while leaving the raced public replacement. The FIFO case is a real Linux/macOS gate and must time out or fail before the fix when run there.
+
+- [ ] **Step 2: Implement exact Windows private-file removal**
+
+Add this lease boundary without exposing raw paths:
+
+```python
+def remove_private_file(
+    self,
+    relative_path: Path,
+    *,
+    expected_bytes: bytes,
+) -> None:
+    """Remove one validated file inside an already isolated private tree."""
+```
+
+On Windows, open the direct file with `GENERIC_READ | DELETE`, `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`, and `FILE_FLAG_OPEN_REPARSE_POINT`. Reject reparse points and non-regular objects, compare the complete bytes and retained file identity, then call `SetFileInformationByHandle(..., FileDispositionInfo, ...)` while the same handle remains open. Close the handle only after the disposition commit. If the bound name was replaced, the retained original may be deleted but the replacement must remain; the caller's complete-tree revalidation detects it, preserves the journal, and returns conflict.
+
+On Linux and macOS, resolve only relative to the retained private-stage parent descriptor. Open with `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC`, reject non-regular `fstat`, compare exact bytes, close, and call `unlinkat` for that same private name while the global adapter lock remains held. This is the approved cooperative same-identity boundary; no check-then-unlink claim is made outside the private namespace.
+
+Replace the final name-based deletion loop in `_remove_journal_candidate()` with `remove_private_file()` for every bound data file and the bound manifest. Preserve data-first and manifest-last order, exact/deduplicated `changed_paths`, and journal-byte restitution after a committed cleanup error.
+
+- [ ] **Step 3: Make exact directory moves preserve raced public replacements**
+
+Strengthen `publish_directory_no_replace()` on every platform:
+
+```python
+self._native_move_retained_directory_no_replace(source, destination)
+self._require_destination_identity(destination, retained_source_identity)
+if self._entry_exists(source):
+    raise StateRootBoundaryError("source name replaced during exact move")
+```
+
+The source check is not permission to undo the move or delete either object. In journal recovery, catch this boundary result only after recording the isolated staging path, leave both staging and final names untouched, retain exact journal bytes, and return the existing conflict diagnostic. On POSIX, destination identity mismatch after `renameat2`/`renamex_np` must use the existing no-replace restitution path before raising; on Windows, the retained handle remains the identity authority.
+
+- [ ] **Step 4: Make POSIX destination validation nonblocking**
+
+In `publish_file_no_replace_exact()`, add `O_NONBLOCK` to every POSIX destination open that occurs before `fstat` proves a regular file. Keep `O_NOFOLLOW` and the exact descriptor byte/identity checks. A raced FIFO, socket, device, directory, or alias raises `StateRootBoundaryError`; it must not wait for another process and must not remove the unexpected destination.
+
+- [ ] **Step 5: Verify focused GREEN and restart safety**
+
+Run:
+
+```powershell
+python -m pytest tests/test_paths.py tests/test_installer.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task3a-green" -k "private_cleanup or exact_directory_move or raced_fifo or permanent_delete or cleanup_retry or ownership_journal"
+python -m pytest tests/test_installer.py tests/test_capsule_bootstrap.py tests/test_cli.py tests/test_generic_layout.py tests/test_paths.py -q -p no:cacheprovider --basetemp "$env:TEMP\vin-journal-task3a-lifecycle"
+python -m ruff check src/voice_intent_normalizer/paths.py src/voice_intent_normalizer/adapters/generic.py tests/test_paths.py tests/test_installer.py
+git diff --check
+```
+
+Expected: the Windows exact-handle tests, native directory replacement test, all restart/cleanup/conflict matrices, and adjacent lifecycle tests pass; POSIX-only cases remain legitimate local skips on Windows and run in Task 4 CI.
+
+- [ ] **Step 6: Review and commit the boundary revision**
+
+Give a fresh specification reviewer the approved threat boundary plus only the Task 3A diff. Require separate verdicts for Windows exact deletion, POSIX cooperative private cleanup, public-name replacement preservation, FIFO nonblocking behavior, crash retry, and unchanged public workflows. Give a different code-quality reviewer the four-file diff and focused evidence. Fix Critical or Important findings with a new RED test; if a finding would require adversarial exact POSIX unlink, reject it as outside the approved contract and cite the written design.
+
+Commit only the four task files:
+
+```powershell
+git add src/voice_intent_normalizer/paths.py src/voice_intent_normalizer/adapters/generic.py tests/test_paths.py tests/test_installer.py
+git commit -m "fix: isolate journal cleanup across platforms"
+```
+
+---
+
 ### Task 4: Native CI Evidence and Task 11 Closure
 
 **Files:**
@@ -572,9 +701,12 @@ The follow-up is complete only when:
 2. a journal is durable before any managed candidate path exists;
 3. every status write uses an exact write-ahead before/after digest pair;
 4. initial-baseline recovery never activates the candidate and preserves the old upgrade terminal status;
-5. later, after, terminal, cleanup-failure, restart, and tamper branches pass the exhaustive matrix;
-6. public bootstrap remains terminal-status-only and shared data is untouched;
-7. full tests, Ruff, build, skill validation, fresh-wheel lifecycle, and diff checks pass;
-8. independent specification and code-quality reviews are clean;
-9. native Windows, Linux, and macOS GitHub Actions jobs pass on the same pushed commit;
-10. the original Task 11 ledger is closed and Task 12 resumes without another user decision.
+5. an exact public candidate moves into private staging before permanent cleanup, and a raced public replacement preserves both objects plus the journal;
+6. Windows permanent file removal targets the retained exact handle, while POSIX cleanup stays inside the private namespace under the cooperative global-lock contract;
+7. POSIX destination validation rejects FIFOs and other unsafe objects without blocking;
+8. later, after, terminal, cleanup-failure, restart, and tamper branches pass the exhaustive matrix;
+9. public bootstrap remains terminal-status-only and shared data is untouched;
+10. full tests, Ruff, build, skill validation, fresh-wheel lifecycle, and diff checks pass;
+11. independent specification and code-quality reviews are clean;
+12. native Windows, Linux, and macOS GitHub Actions jobs pass on the same pushed commit;
+13. the original Task 11 ledger is closed and Task 12 resumes without another user decision.
