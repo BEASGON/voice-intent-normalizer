@@ -649,6 +649,7 @@ def _validated_journal_skill_root(value: object) -> Path:
         raise ValueError("invalid selected skill root")
     try:
         root = validate_state_root(value)
+        _reject_journal_windows_ads(root)
         info = root.lstat()
     except (OSError, ValueError) as exc:
         raise ValueError("selected skill root must be a direct directory") from exc
@@ -659,9 +660,21 @@ def _validated_journal_skill_root(value: object) -> Path:
 
 def _validated_journal_generation_root(value: Path) -> Path:
     try:
-        return validate_state_root(value)
+        root = validate_state_root(value)
+        _reject_journal_windows_ads(root)
+        return root
     except ValueError as exc:
         raise ValueError("invalid generation root") from exc
+
+
+def _reject_journal_windows_ads(root: Path) -> None:
+    if os.name != "nt":
+        return
+    import ntpath
+
+    _, tail = ntpath.splitdrive(os.fspath(root).replace("/", "\\"))
+    if ":" in tail:
+        raise ValueError("journal root must not contain an ADS")
 
 
 def _same_journal_root(left: Path, right: Path) -> bool:

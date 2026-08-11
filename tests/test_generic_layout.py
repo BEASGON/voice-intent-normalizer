@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+import voice_intent_normalizer.paths as paths_module
 from voice_intent_normalizer.adapters.generic_contract import (
     CAPSULE_PROTOCOL,
     GENERATION_FORMAT,
@@ -101,6 +103,36 @@ def _journal_references() -> tuple[CapsuleRef, GenerationRef]:
             package_version="1.2.3",
         ),
     )
+
+
+def _valid_ownership_journal(tmp_path: Path) -> tuple[bytes, Path, Path]:
+    """Build one valid upgrade journal and its trusted direct roots."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    capsule, candidate = _journal_references()
+    before = _journal_status(skill_root, phase=None)
+    after = _journal_status(skill_root, phase="generation-published")
+    return (
+        ownership_journal_bytes(
+            operation="upgrade",
+            transaction_id=_TRANSACTION_ID,
+            skill_root=skill_root,
+            baseline_status_bytes=before,
+            before_status_bytes=before,
+            after_status_bytes=after,
+            capsule=capsule,
+            candidate=candidate,
+        ),
+        skill_root,
+        tmp_path / "state" / "generations",
+    )
+
+
+def _journal_with_selected_root(payload: bytes, selected_root: str) -> bytes:
+    """Return canonical journal bytes with only its serialized root replaced."""
+    value = json.loads(payload)
+    value["selected_skill_root"] = selected_root
+    return canonical_json_bytes(value)
 
 
 def test_ownership_journal_upgrade_round_trip_uses_exact_canonical_bytes(
@@ -343,6 +375,130 @@ def test_validate_ownership_journal_rejects_oversized_and_noncanonical_bytes(
                 skill_root=skill_root,
                 generations_root=tmp_path / "state" / "generations",
             )
+
+
+def test_validate_ownership_journal_rejects_selected_and_generation_symlinks(
+    tmp_path: Path,
+):
+    """Catch either owned root following a filesystem alias after journal parse."""
+    payload, skill_root, generations_root = _valid_ownership_journal(tmp_path)
+    generation_target = tmp_path / "generation-target"
+    generation_target.mkdir()
+    skill_alias = tmp_path / "skill-alias"
+    generations_alias = tmp_path / "generations-alias"
+    try:
+        skill_alias.symlink_to(skill_root, target_is_directory=True)
+        generations_alias.symlink_to(generation_target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            payload, skill_root=skill_alias, generations_root=generations_root
+        )
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            payload, skill_root=skill_root, generations_root=generations_alias
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows direct-root contract")
+def test_validate_ownership_journal_accepts_case_equivalent_windows_roots(
+    tmp_path: Path,
+):
+    """Catch journal trust treating an equivalent Windows root as a mismatch."""
+    payload, skill_root, generations_root = _valid_ownership_journal(tmp_path)
+
+    journal = validate_ownership_journal(
+        payload,
+        skill_root=Path(str(skill_root).swapcase()),
+        generations_root=Path(str(generations_root).swapcase()),
+    )
+
+    assert journal.selected_skill_root == skill_root
+    assert journal.generation_root == generations_root / _GENERATION_ID
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows local-path contract")
+@pytest.mark.parametrize(
+    "unsafe_root",
+    (
+        r"\\server\share\generations",
+        r"\\.\C:\generations",
+        r"C:\generations:journal",
+    ),
+)
+def test_validate_ownership_journal_rejects_windows_network_device_and_ads_roots(
+    tmp_path: Path, unsafe_root: str
+):
+    """Catch journal ownership escaping to UNC, devices, or an ADS."""
+    payload, skill_root, _ = _valid_ownership_journal(tmp_path)
+
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            payload, skill_root=skill_root, generations_root=Path(unsafe_root)
+        )
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            _journal_with_selected_root(payload, unsafe_root),
+            skill_root=skill_root,
+            generations_root=tmp_path / "state" / "generations",
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive classification")
+def test_validate_ownership_journal_rejects_mapped_drive_roots(
+    tmp_path: Path, monkeypatch
+):
+    """Catch journal validation accepting a drive reclassified as mapped."""
+    payload, skill_root, generations_root = _valid_ownership_journal(tmp_path)
+    monkeypatch.setattr(
+        paths_module, "_windows_drive_type", lambda _root: 4, raising=False
+    )
+
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            payload, skill_root=skill_root, generations_root=generations_root
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows canonical handle paths")
+def test_validate_ownership_journal_rejects_windows_reparse_or_junction_roots(
+    tmp_path: Path, monkeypatch
+):
+    """Catch a junction, reparse point, short name, or SUBST alias in a journal root."""
+    payload, skill_root, generations_root = _valid_ownership_journal(tmp_path)
+    monkeypatch.setattr(
+        paths_module,
+        "_windows_final_path",
+        lambda _path: tmp_path / "different-root",
+        raising=False,
+    )
+
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            payload, skill_root=skill_root, generations_root=generations_root
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX direct-root contract")
+def test_validate_ownership_journal_rejects_posix_double_slash_aliases(
+    tmp_path: Path,
+):
+    """Catch implementation-defined POSIX aliases becoming owned roots."""
+    payload, skill_root, _ = _valid_ownership_journal(tmp_path)
+    alias = "//tmp/voice-intent-journal"
+
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            payload, skill_root=skill_root, generations_root=Path(alias)
+        )
+    with pytest.raises(ValueError):
+        validate_ownership_journal(
+            _journal_with_selected_root(payload, alias),
+            skill_root=skill_root,
+            generations_root=tmp_path / "state" / "generations",
+        )
 
 
 def test_generic_layout_paths_are_private_and_read_only(tmp_path: Path):
