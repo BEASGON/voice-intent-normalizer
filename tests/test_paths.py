@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import textwrap
 import threading
 from hashlib import sha256
 from pathlib import Path
@@ -132,6 +134,99 @@ def test_publish_file_no_replace_exact_preserves_boundary_replacement(
         if path.exists() and path.read_bytes() == b"exact owned bytes"
     ]
     assert len(surviving_owned) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX nonblocking open contract")
+def test_posix_exact_publication_rejects_raced_fifo_without_blocking(
+    tmp_path,
+):
+    """Catch destination validation blocking forever on a raced FIFO."""
+    script = textwrap.dedent(
+        r"""
+        import os
+        import stat
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, sys.argv[2])
+        import voice_intent_normalizer.paths as paths_module
+        from voice_intent_normalizer.paths import (
+            StateRootBoundaryError,
+            guard_state_root,
+        )
+
+        root = Path(sys.argv[1])
+        root.mkdir()
+        source = root / "source.bin"
+        displaced = root / "displaced-owned.bin"
+        source.write_bytes(b"exact owned bytes")
+        info = source.stat()
+
+        if sys.platform.startswith("linux"):
+            native = paths_module._rename_linux_directory_no_replace
+            attribute = "_rename_linux_directory_no_replace"
+        elif sys.platform == "darwin":
+            native = paths_module._rename_darwin_directory_no_replace
+            attribute = "_rename_darwin_directory_no_replace"
+        else:
+            raise AssertionError("POSIX native test ran on an unsupported host")
+
+        def swap_destination_for_fifo(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        ):
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+            os.rename(
+                destination_name,
+                displaced.name,
+                src_dir_fd=destination_parent,
+                dst_dir_fd=destination_parent,
+            )
+            os.mkfifo(destination_name, dir_fd=destination_parent)
+
+        setattr(paths_module, attribute, swap_destination_for_fifo)
+        try:
+            with guard_state_root(root) as lease:
+                lease.publish_file_no_replace_exact(
+                    "source.bin",
+                    "bound.bin",
+                    expected_identity=(info.st_dev, info.st_ino),
+                    expected_bytes=b"exact owned bytes",
+                    limit=64,
+                )
+        except StateRootBoundaryError:
+            assert stat.S_ISFIFO(source.stat().st_mode)
+            assert displaced.read_bytes() == b"exact owned bytes"
+            print("failed-closed")
+        else:
+            raise AssertionError("FIFO destination was accepted")
+        """
+    )
+    source_root = Path(__file__).resolve().parents[1] / "src"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / "fifo-child"),
+            str(source_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "failed-closed"
 
 
 def test_voice_intent_home_overrides_default(tmp_path):
@@ -462,7 +557,7 @@ def test_posix_capability_check_uses_renameat_signal_for_replace(monkeypatch):
         "supports_fd",
         {paths_module.os.listdir},
     )
-    for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+    for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NONBLOCK", "O_NOFOLLOW"):
         monkeypatch.setattr(paths_module.os, flag, 1, raising=False)
 
     paths_module._require_posix_dir_fd_support()

@@ -15,7 +15,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..paths import StatePaths, StateRootLease, guard_state_root, validate_state_root
+from ..paths import (
+    StatePaths,
+    StateRootBoundaryError,
+    StateRootLease,
+    guard_state_root,
+    validate_state_root,
+)
 from ..updater import _retained_lease_update_lock
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
 from .generic_contract import (
@@ -2242,14 +2248,39 @@ class GenericAdapter:
                     raise ValueError("journal cleanup tree changed after binding")
             for path in (*tree.files, tree.manifest_path):
                 self._require_journal_cleanup_file(lease, path, tree)
-            for path in tree.files:
+            remaining_children = {
+                directory: set(children)
+                for directory, children in tree.children.items()
+            }
+            for index, path in enumerate(tree.files):
                 try:
-                    lease.unlink(path)
+                    lease.remove_private_file(
+                        path,
+                        expected_bytes=tree.file_bytes[path],
+                    )
                 except OSError:
                     if not lease.exists(path):
                         self._record_changes((root / path,))
                     raise
                 self._record_changes((root / path,))
+                remaining_children[path.parent].remove(path.name)
+                for directory in tree.directories:
+                    current = lease.stat(directory)
+                    self._require_direct_directory(current)
+                    if (
+                        self._directory_identity(current)
+                        != tree.identities[directory]
+                        or set(lease.listdir(directory))
+                        != remaining_children[directory]
+                    ):
+                        raise StateRootBoundaryError(
+                            "journal cleanup tree changed during removal"
+                        )
+                for remaining in (
+                    *tree.files[index + 1 :],
+                    tree.manifest_path,
+                ):
+                    self._require_journal_cleanup_file(lease, remaining, tree)
 
         for directory in sorted(
             (path for path in tree.directories if path != relative),
@@ -2280,14 +2311,21 @@ class GenericAdapter:
                 raise ValueError("journal candidate changed before retirement")
             self._require_journal_cleanup_file(lease, manifest, tree)
             try:
-                lease.unlink(manifest)
-            except OSError:
+                lease.remove_private_file(
+                    manifest,
+                    expected_bytes=tree.file_bytes[manifest],
+                )
+                self._record_changes((root / manifest,))
+                if lease.listdir(relative):
+                    raise StateRootBoundaryError(
+                        "journal candidate changed before retirement"
+                    )
+            except BaseException:
                 if not lease.exists(manifest):
                     self._record_changes((root / manifest,))
                     lease.write_bytes_exclusive(manifest, tree.manifest_bytes)
                     lease.fsync_directory(relative)
                 raise
-            self._record_changes((root / manifest,))
         try:
             with guard_state_root(root, retained_dirs=(relative.parent,)) as lease:
                 current = lease.stat(relative)

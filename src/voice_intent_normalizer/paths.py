@@ -27,6 +27,10 @@ class StateRootValidationError(ValueError):
     """The configured state root is not a direct canonical local path."""
 
 
+class StateRootBoundaryError(ValueError):
+    """A retained state entry changed at a destructive boundary."""
+
+
 class ProjectRootValidationError(ValueError):
     """The supplied project root is not a retained direct local directory."""
 
@@ -232,6 +236,82 @@ class StateRootLease:
             if not missing_ok:
                 raise
 
+    def remove_private_file(
+        self,
+        relative_path: Path,
+        *,
+        expected_bytes: bytes,
+    ) -> None:
+        """Remove one validated file inside an already isolated private tree."""
+        if not isinstance(relative_path, Path) or not isinstance(
+            expected_bytes, bytes
+        ):
+            raise ValueError("invalid private file removal contract")
+        parts = _relative_path_parts(relative_path)
+        binding, name = self._file_binding(parts)
+        if binding.path is not None:
+            path = binding.path / name
+            before = os.stat(path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_ISLNK(before.st_mode)
+                or getattr(before, "st_file_attributes", 0)
+                & _WINDOWS_REPARSE_POINT
+            ):
+                raise StateRootBoundaryError(
+                    "private cleanup target must be a direct regular file"
+                )
+            with _open_windows_regular_file_for_delete(path) as descriptor:
+                retained = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(retained.st_mode)
+                    or _stat_identity(retained) != _stat_identity(before)
+                    or _read_descriptor_bytes(descriptor, len(expected_bytes))
+                    != expected_bytes
+                    or _stat_identity(os.fstat(descriptor))
+                    != _stat_identity(retained)
+                ):
+                    raise StateRootBoundaryError(
+                        "private cleanup file identity or bytes changed"
+                    )
+                _delete_windows_file_handle(descriptor)
+            return
+        if binding.descriptor is None:
+            raise OSError("retained state directory has no usable identity")
+        _require_posix_dir_fd_support()
+        before = os.stat(
+            name,
+            dir_fd=binding.descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise StateRootBoundaryError(
+                "private cleanup target must be a direct regular file"
+            )
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(name, flags, dir_fd=binding.descriptor)
+        except OSError as exc:
+            raise StateRootBoundaryError(
+                "private cleanup target could not be retained"
+            ) from exc
+        try:
+            retained = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(retained.st_mode)
+                or _stat_identity(retained) != _stat_identity(before)
+                or _read_descriptor_bytes(descriptor, len(expected_bytes))
+                != expected_bytes
+                or _stat_identity(os.fstat(descriptor))
+                != _stat_identity(retained)
+            ):
+                raise StateRootBoundaryError(
+                    "private cleanup file identity or bytes changed"
+                )
+        finally:
+            os.close(descriptor)
+        os.unlink(name, dir_fd=binding.descriptor)
+
     def replace(self, source: str | Path, destination: str | Path) -> None:
         """Atomically move one entry between two retained parent directories."""
         source_parts = _relative_path_parts(source)
@@ -417,6 +497,10 @@ class StateRootLease:
                     raise OSError("published file identity does not match")
             finally:
                 os.close(published)
+            if self.exists(source):
+                raise StateRootBoundaryError(
+                    "source name replaced during exact move"
+                )
             return
         if (
             source_binding.descriptor is None
@@ -444,17 +528,29 @@ class StateRootLease:
             if on_committed is not None:
                 on_committed()
             try:
-                published = os.open(
-                    destination_name,
-                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=destination_binding.descriptor,
-                )
                 try:
+                    published = os.open(
+                        destination_name,
+                        os.O_RDONLY
+                        | os.O_NONBLOCK
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                        dir_fd=destination_binding.descriptor,
+                    )
+                except OSError as exc:
+                    raise StateRootBoundaryError(
+                        "published file is not a direct regular file"
+                    ) from exc
+                try:
+                    published_info = os.fstat(published)
                     if (
-                        _stat_identity(os.fstat(published)) != expected_identity
+                        not stat.S_ISREG(published_info.st_mode)
+                        or _stat_identity(published_info) != expected_identity
                         or _read_descriptor_bytes(published, limit) != expected_bytes
                     ):
-                        raise ValueError("published file identity does not match")
+                        raise StateRootBoundaryError(
+                            "published file identity does not match"
+                        )
                 finally:
                     os.close(published)
                 try:
@@ -536,6 +632,10 @@ class StateRootLease:
                 or _stat_identity(published) != expected_identity
             ):
                 raise OSError("published directory identity does not match")
+            if self.exists(source):
+                raise StateRootBoundaryError(
+                    "source name replaced during exact move"
+                )
             return
         if (
             source_binding.descriptor is None
@@ -599,6 +699,10 @@ class StateRootLease:
                     expected_identity,
                 )
                 raise OSError("published directory identity does not match")
+            if self.exists(source):
+                raise StateRootBoundaryError(
+                    "source name replaced during exact move"
+                )
         finally:
             os.close(source_descriptor)
 
@@ -694,7 +798,12 @@ class StateRootLease:
                 descriptor = _open_windows_regular_file(binding.path / name)
             elif binding.descriptor is not None:
                 _require_posix_dir_fd_support()
-                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                flags = (
+                    os.O_RDONLY
+                    | os.O_NONBLOCK
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW
+                )
                 descriptor = os.open(name, flags, dir_fd=binding.descriptor)
             else:
                 raise OSError("retained state directory has no usable identity")
@@ -732,7 +841,7 @@ def _require_posix_dir_fd_support() -> None:
         raise OSError("secure POSIX state roots require fd support for listdir")
     if not hasattr(os, "replace"):
         raise OSError("secure POSIX state roots require atomic replace")
-    for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+    for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NONBLOCK", "O_NOFOLLOW"):
         if not hasattr(os, name):
             raise OSError(f"secure POSIX state roots require {name}")
 
@@ -1010,6 +1119,81 @@ def _open_windows_regular_file(path: Path) -> int:
 
 
 @contextmanager
+def _open_windows_regular_file_for_delete(path: Path) -> Iterator[int]:
+    """Retain one exact Windows file with read/delete disposition authority."""
+    if os.name != "nt":
+        raise OSError("Windows handle-bound deletion is unavailable")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        _extended_windows_path(path),
+        0x80010000,  # GENERIC_READ | DELETE
+        0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            raise FileNotFoundError(error, os.strerror(error), path)
+        raise ctypes.WinError(error)
+    descriptor = -1
+    try:
+        attributes = _FileAttributeTagInfo()
+        ctypes.set_last_error(0)
+        if not kernel32.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.file_attributes & (0x10 | _WINDOWS_REPARSE_POINT):
+            raise StateRootBoundaryError(
+                "private cleanup target must be a direct regular file"
+            )
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        handle = None
+        yield descriptor
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        elif handle is not None:
+            kernel32.CloseHandle(handle)
+
+
+@contextmanager
 def _open_windows_regular_file_for_move(path: Path) -> Iterator[int]:
     """Retain one exact Windows file with read/delete access and no writers."""
     if os.name != "nt":
@@ -1240,6 +1424,37 @@ def _move_windows_handle_no_replace(descriptor: int, destination: Path) -> None:
     if not kernel32.SetFileInformationByHandle(
         msvcrt.get_osfhandle(descriptor),
         3,  # FileRenameInfo
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _delete_windows_file_handle(descriptor: int) -> None:
+    """Commit deletion for the exact Windows file represented by *descriptor*."""
+    if os.name != "nt":
+        raise OSError("Windows handle-bound deletion is unavailable")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", wintypes.BOOLEAN)]
+
+    information = _FileDispositionInfo()
+    information.delete_file = True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    if not kernel32.SetFileInformationByHandle(
+        msvcrt.get_osfhandle(descriptor),
+        4,  # FileDispositionInfo
         ctypes.byref(information),
         ctypes.sizeof(information),
     ):

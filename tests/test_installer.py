@@ -712,7 +712,13 @@ def test_windows_directory_publication_renames_the_exact_retained_handle(
     )
 
     with guard_state_root(root) as lease:
-        lease.publish_directory_no_replace("source", "published", expected_identity)
+        with pytest.raises(
+            paths_module.StateRootBoundaryError,
+            match="source name replaced during exact move",
+        ):
+            lease.publish_directory_no_replace(
+                "source", "published", expected_identity
+            )
 
     assert replaced
     assert (source / "replacement.txt").read_text(encoding="utf-8") == "replacement"
@@ -2628,6 +2634,175 @@ def test_ownership_journal_review_round2_preserves_replacement_at_move_boundary(
         assert (candidate / relative).read_bytes() == data
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact-handle deletion")
+@pytest.mark.parametrize("relative_path", (Path("SKILL.md"), Path("generation.json")))
+def test_windows_private_cleanup_deletes_only_retained_file_handle(
+    relative_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A replacement at permanent deletion must never be unlinked by name."""
+    scenario = _materialize_journal_state(tmp_path, "initial-complete-stage")
+    layout = generic_layout_paths(scenario.state_paths)
+    candidate = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    transaction_id = json.loads(journal_bytes)["transaction_id"]
+    bound_target = _journal_cleanup_bound_path(
+        candidate, relative_path, transaction_id
+    )
+    displaced = bound_target.with_name(
+        f".{relative_path.name}.owned-displaced-at-permanent-delete"
+    )
+    replacement = b"replacement"
+    source_info = (candidate / relative_path).stat()
+    source_identity = (source_info.st_dev, source_info.st_ino)
+    original_delete = paths_module._delete_windows_file_handle
+    injected = False
+
+    def replace_at_permanent_delete(descriptor: int):
+        nonlocal injected
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) == source_identity and not injected:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = (
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            )
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            writer = kernel32.CreateFileW(
+                paths_module._extended_windows_path(bound_target),
+                0x40000000,  # GENERIC_WRITE
+                0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                None,
+                3,  # OPEN_EXISTING
+                0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+                None,
+            )
+            if writer == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            assert kernel32.CloseHandle(writer)
+            bound_target.rename(displaced)
+            bound_target.write_bytes(replacement)
+            injected = True
+        return original_delete(descriptor)
+
+    monkeypatch.setattr(
+        paths_module,
+        "_delete_windows_file_handle",
+        replace_at_permanent_delete,
+    )
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert bound_target.exists()
+    assert bound_target.read_bytes() == replacement
+    assert layout.transaction.exists()
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert result.status in {"failed", "degraded"}
+    assert not displaced.exists()
+
+
+def test_exact_directory_move_preserves_raced_public_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A replacement at the final-to-stage move boundary remains journaled."""
+    scenario = _materialize_journal_state(tmp_path, "initial-final")
+    layout = generic_layout_paths(scenario.state_paths)
+    final = layout.generations / scenario.candidate_id
+    stage = layout.staging / scenario.candidate_id
+    displaced = final.with_name(f".{scenario.candidate_id}.owned-displaced")
+    journal_bytes = layout.transaction.read_bytes()
+    injected = False
+
+    if os.name == "nt":
+        native = paths_module._move_windows_handle_no_replace
+
+        def replace_final_at_native_move(descriptor, destination):
+            nonlocal injected
+            if Path(destination) == stage and not injected:
+                final.rename(displaced)
+                final.mkdir()
+                (final / "replacement.txt").write_bytes(b"replacement")
+                injected = True
+            native(descriptor, destination)
+
+        monkeypatch.setattr(
+            paths_module,
+            "_move_windows_handle_no_replace",
+            replace_final_at_native_move,
+        )
+    elif sys.platform.startswith("linux"):
+        native = paths_module._rename_linux_directory_no_replace
+
+        def replace_final_at_native_move(
+            source_parent, source_name, destination_parent, destination_name
+        ):
+            nonlocal injected
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+            if destination_name == stage.name and not injected:
+                final.mkdir()
+                (final / "replacement.txt").write_bytes(b"replacement")
+                injected = True
+
+        monkeypatch.setattr(
+            paths_module,
+            "_rename_linux_directory_no_replace",
+            replace_final_at_native_move,
+        )
+    elif sys.platform == "darwin":
+        native = paths_module._rename_darwin_directory_no_replace
+
+        def replace_final_at_native_move(
+            source_parent, source_name, destination_parent, destination_name
+        ):
+            nonlocal injected
+            native(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+            if destination_name == stage.name and not injected:
+                final.mkdir()
+                (final / "replacement.txt").write_bytes(b"replacement")
+                injected = True
+
+        monkeypatch.setattr(
+            paths_module,
+            "_rename_darwin_directory_no_replace",
+            replace_final_at_native_move,
+        )
+    else:
+        pytest.skip("native exclusive directory moves are unsupported")
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert stage.exists()
+    assert final.exists()
+    assert (final / "replacement.txt").read_bytes() == b"replacement"
+    assert layout.transaction.exists()
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert result.status in {"failed", "degraded"}
+
+
 @pytest.mark.parametrize(
     "fault",
     (
@@ -2692,15 +2867,15 @@ def test_ownership_journal_review_round2_final_cleanup_fault_retries_from_stage(
         for index, path in enumerate(child_directories)
         if path.parent == stage
     )
-    original_unlink = StateRootLease.unlink
+    original_remove = StateRootLease.remove_private_file
     original_rmdir = StateRootLease.rmdir
     original_fsync = StateRootLease.fsync_directory
     injected = False
 
-    def unlink_then_fail(lease, relative, *, missing_ok=False):
+    def remove_then_fail(lease, relative, *, expected_bytes):
         nonlocal injected
         relative = Path(relative)
-        original_unlink(lease, relative, missing_ok=missing_ok)
+        original_remove(lease, relative, expected_bytes=expected_bytes)
         selected = (fault == "data-unlink" and relative == bound_data) or (
             fault == "manifest-unlink" and relative == bound_manifest
         )
@@ -2738,7 +2913,7 @@ def test_ownership_journal_review_round2_final_cleanup_fault_retries_from_stage(
             injected = True
             raise OSError("injected post-commit candidate-parent fsync")
 
-    monkeypatch.setattr(StateRootLease, "unlink", unlink_then_fail)
+    monkeypatch.setattr(StateRootLease, "remove_private_file", remove_then_fail)
     monkeypatch.setattr(StateRootLease, "rmdir", rmdir_then_fail)
     monkeypatch.setattr(StateRootLease, "fsync_directory", fsync_then_fail)
 
@@ -2798,6 +2973,143 @@ def test_ownership_journal_review_round2_final_cleanup_fault_retries_from_stage(
     assert not stage.exists()
 
 
+def test_private_cleanup_records_post_delete_revalidation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A later validation error must not hide a committed private deletion."""
+    scenario = _materialize_journal_state(tmp_path, "initial-complete-stage")
+    layout = generic_layout_paths(scenario.state_paths)
+    journal_bytes = layout.transaction.read_bytes()
+    original_remove = StateRootLease.remove_private_file
+    original_listdir = StateRootLease.listdir
+
+    def stop_after_binding(lease, relative, *, expected_bytes):
+        raise OSError("injected pre-commit private cleanup failure")
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "remove_private_file",
+        stop_after_binding,
+    )
+    first = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+    assert first.status == "degraded"
+    assert layout.transaction.read_bytes() == journal_bytes
+
+    deleted: Path | None = None
+    injected = False
+
+    def remove_then_mark(lease, relative, *, expected_bytes):
+        nonlocal deleted
+        original_remove(lease, relative, expected_bytes=expected_bytes)
+        deleted = Path(relative)
+
+    def fail_revalidation(lease, relative):
+        nonlocal injected
+        if deleted is not None and not injected:
+            injected = True
+            raise OSError("injected post-delete tree validation failure")
+        return original_listdir(lease, relative)
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "remove_private_file",
+        remove_then_mark,
+    )
+    monkeypatch.setattr(StateRootLease, "listdir", fail_revalidation)
+
+    second = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert deleted is not None
+    assert second.status == "degraded"
+    assert second.changed_paths == (scenario.state_paths.root / deleted,)
+    assert layout.transaction.read_bytes() == journal_bytes
+
+    monkeypatch.setattr(StateRootLease, "remove_private_file", original_remove)
+    monkeypatch.setattr(StateRootLease, "listdir", original_listdir)
+    third = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+    assert third.status == "not-installed"
+
+
+def test_private_cleanup_restores_manifest_after_post_delete_validation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A post-delete validation error restores exact manifest and journal bytes."""
+    scenario = _materialize_journal_state(tmp_path, "initial-complete-stage")
+    layout = generic_layout_paths(scenario.state_paths)
+    candidate = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    transaction_id = json.loads(journal_bytes)["transaction_id"]
+    manifest_bytes = (candidate / "generation.json").read_bytes()
+    bound_manifest = _journal_cleanup_bound_path(
+        candidate,
+        Path("generation.json"),
+        transaction_id,
+    )
+    bound_manifest_relative = bound_manifest.relative_to(
+        scenario.state_paths.root
+    )
+    original_remove = StateRootLease.remove_private_file
+    original_listdir = StateRootLease.listdir
+
+    def stop_before_manifest(lease, relative, *, expected_bytes):
+        if Path(relative) == bound_manifest_relative:
+            raise OSError("injected pre-commit manifest removal failure")
+        return original_remove(lease, relative, expected_bytes=expected_bytes)
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "remove_private_file",
+        stop_before_manifest,
+    )
+    first = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+    assert first.status == "degraded"
+    assert bound_manifest.read_bytes() == manifest_bytes
+    assert layout.transaction.read_bytes() == journal_bytes
+
+    manifest_deleted = False
+    injected = False
+
+    def remove_then_mark(lease, relative, *, expected_bytes):
+        nonlocal manifest_deleted
+        original_remove(lease, relative, expected_bytes=expected_bytes)
+        if Path(relative) == bound_manifest_relative:
+            manifest_deleted = True
+
+    def fail_manifest_revalidation(lease, relative):
+        nonlocal injected
+        if manifest_deleted and not injected:
+            injected = True
+            raise OSError("injected post-delete manifest validation failure")
+        return original_listdir(lease, relative)
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "remove_private_file",
+        remove_then_mark,
+    )
+    monkeypatch.setattr(
+        StateRootLease,
+        "listdir",
+        fail_manifest_revalidation,
+    )
+
+    second = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert second.status == "degraded"
+    assert second.changed_paths == (bound_manifest,)
+    assert bound_manifest.read_bytes() == manifest_bytes
+    assert layout.transaction.read_bytes() == journal_bytes
+
+    monkeypatch.setattr(StateRootLease, "remove_private_file", original_remove)
+    monkeypatch.setattr(StateRootLease, "listdir", original_listdir)
+    third = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+    assert third.status == "not-installed"
+
+
 @pytest.mark.parametrize(
     "fault,state,expected_first,expected_second",
     (
@@ -2840,14 +3152,14 @@ def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
     bound_manifest = _journal_cleanup_bound_path(
         candidate, Path("generation.json"), transaction_id
     )
-    original_unlink = StateRootLease.unlink
+    original_remove = StateRootLease.remove_private_file
     original_rmdir = StateRootLease.rmdir
     injected = False
 
-    def unlink_then_fail(lease, relative, *, missing_ok=False):
+    def remove_then_fail(lease, relative, *, expected_bytes):
         nonlocal injected
         relative = Path(relative)
-        original_unlink(lease, relative, missing_ok=missing_ok)
+        original_remove(lease, relative, expected_bytes=expected_bytes)
         if (
             fault == "file-unlink"
             and relative == bound_skill.relative_to(scenario.state_paths.root)
@@ -2868,7 +3180,7 @@ def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
             injected = True
             raise OSError("injected post-commit directory removal failure")
 
-    monkeypatch.setattr(StateRootLease, "unlink", unlink_then_fail)
+    monkeypatch.setattr(StateRootLease, "remove_private_file", remove_then_fail)
     monkeypatch.setattr(StateRootLease, "rmdir", rmdir_then_fail)
 
     first = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
@@ -2946,6 +3258,7 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
         layout.transaction,
     )
     original_unlink = StateRootLease.unlink
+    original_remove = StateRootLease.remove_private_file
     original_rmdir = StateRootLease.rmdir
     original_fsync = StateRootLease.fsync_directory
     failures = 0
@@ -2959,18 +3272,23 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
 
     def fail_unlink(lease, relative, *, missing_ok=False):
         relative = Path(relative)
-        selected = (
-            fault == "file-unlink"
-            and relative == bound_skill.relative_to(scenario.state_paths.root)
-        ) or (
-            fault == "transaction-unlink"
-            and relative == Path("adapters/generic/transaction.json")
+        selected = fault == "transaction-unlink" and relative == Path(
+            "adapters/generic/transaction.json"
         )
         if selected and should_fail():
-            if fault == "transaction-unlink":
-                original_unlink(lease, relative, missing_ok=missing_ok)
+            original_unlink(lease, relative, missing_ok=missing_ok)
             raise OSError(f"injected {fault}")
         return original_unlink(lease, relative, missing_ok=missing_ok)
+
+    def fail_remove(lease, relative, *, expected_bytes):
+        relative = Path(relative)
+        if (
+            fault == "file-unlink"
+            and relative == bound_skill.relative_to(scenario.state_paths.root)
+            and should_fail()
+        ):
+            raise OSError(f"injected {fault}")
+        return original_remove(lease, relative, expected_bytes=expected_bytes)
 
     def fail_rmdir(lease, relative, *, missing_ok=False):
         relative = Path(relative)
@@ -2999,6 +3317,7 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
         return original_fsync(lease, relative)
 
     monkeypatch.setattr(StateRootLease, "unlink", fail_unlink)
+    monkeypatch.setattr(StateRootLease, "remove_private_file", fail_remove)
     monkeypatch.setattr(StateRootLease, "rmdir", fail_rmdir)
     monkeypatch.setattr(StateRootLease, "fsync_directory", fail_fsync)
 
