@@ -74,6 +74,8 @@ class _JournalCleanupTree:
     directories: tuple[Path, ...]
     identities: Mapping[Path, tuple[int, int]]
     files: tuple[Path, ...]
+    file_identities: Mapping[Path, tuple[int, int]]
+    file_bytes: Mapping[Path, bytes]
     children: Mapping[Path, frozenset[str]]
 
 
@@ -684,19 +686,21 @@ class GenericAdapter:
         )
         try:
             lease.unlink(_TRANSACTION_RELATIVE)
+            self._record_changes(
+                (generic_layout_paths(self.state_paths).transaction,)
+            )
             lease.fsync_directory(_GENERIC_RELATIVE)
         except OSError:
             if not lease.exists(_TRANSACTION_RELATIVE):
+                self._record_changes(
+                    (generic_layout_paths(self.state_paths).transaction,)
+                )
                 lease.write_bytes_exclusive(_TRANSACTION_RELATIVE, payload)
                 try:
                     lease.fsync_directory(_GENERIC_RELATIVE)
                 except OSError:
                     pass
-                self._record_changes(
-                    (generic_layout_paths(self.state_paths).transaction,)
-                )
             raise
-        self._record_changes((generic_layout_paths(self.state_paths).transaction,))
 
     def _recover_ownership_journal(
         self,
@@ -830,6 +834,13 @@ class GenericAdapter:
             self._validate_generation_ref(status.active)
             if status.previous is not None:
                 self._validate_generation_ref(status.previous)
+            baseline_ids = {status.active.generation_id}
+            if status.previous is not None:
+                baseline_ids.add(status.previous.generation_id)
+            if journal.candidate.generation_id in baseline_ids:
+                raise ValueError(
+                    "journal candidate aliases a baseline generation"
+                )
 
         stage_relative = _STAGING_RELATIVE / journal.candidate.generation_id
         final_relative = _GENERATIONS_RELATIVE / journal.candidate.generation_id
@@ -1851,17 +1862,24 @@ class GenericAdapter:
         """Anchor one exact partial candidate before any recovery deletion."""
         root = self.state_paths.root
         absolute = root / relative
+        partial_staging = relative.parent == _STAGING_RELATIVE
+        if not partial_staging and relative.parent != _GENERATIONS_RELATIVE:
+            raise ValueError("journal candidate has an invalid cleanup parent")
         root_info = absolute.lstat()
         self._require_direct_directory(root_info)
         root_identity = self._directory_identity(root_info)
         root_names = frozenset(os.listdir(absolute))
         if not root_names:
+            if not partial_staging:
+                raise ValueError("final journal candidate is incomplete")
             return _JournalCleanupTree(
                 identity=root_identity,
                 manifest_bytes=None,
                 directories=(relative,),
                 identities={relative: root_identity},
                 files=(),
+                file_identities={},
+                file_bytes={},
                 children={relative: frozenset()},
             )
         if "generation.json" not in root_names:
@@ -1886,9 +1904,9 @@ class GenericAdapter:
         temporary_files = {
             path.parent / f".{path.name}.tmp" for path in declared_files
         }
-        allowed_files = declared_files | temporary_files | {
-            relative / "generation.json"
-        }
+        allowed_files = declared_files | {relative / "generation.json"}
+        if partial_staging:
+            allowed_files |= temporary_files
         identities: dict[Path, tuple[int, int]] = {}
         children: dict[Path, frozenset[str]] = {}
         files: list[Path] = []
@@ -1926,6 +1944,11 @@ class GenericAdapter:
         directories = tuple(
             sorted(identities, key=lambda path: (len(path.parts), str(path)))
         )
+        if not partial_staging and (
+            set(directories) != expected_directories
+            or set(files) != declared_files
+        ):
+            raise ValueError("final journal candidate is incomplete")
         retained = tuple(
             sorted(
                 {relative.parent, *directories},
@@ -1934,6 +1957,8 @@ class GenericAdapter:
         )
         hashes = manifest["file_hashes"]
         assert isinstance(hashes, Mapping)
+        file_identities: dict[Path, tuple[int, int]] = {}
+        file_bytes: dict[Path, bytes] = {}
         with guard_state_root(root, retained_dirs=retained) as lease:
             for directory in directories:
                 current = lease.stat(directory)
@@ -1942,13 +1967,17 @@ class GenericAdapter:
                     raise ValueError("journal cleanup directory identity changed")
                 if frozenset(lease.listdir(directory)) != children[directory]:
                     raise ValueError("journal cleanup tree changed during preflight")
-            for path in files:
-                info = lease.stat(path)
-                if not stat.S_ISREG(info.st_mode) or self._is_alias(info):
-                    raise ValueError("unsafe journal cleanup file")
-                data = lease.read_bytes(
-                    path, _MANAGED_FILE_LIMIT, "journal candidate file"
+            for path in (*files, relative / "generation.json"):
+                limit = (
+                    _MANIFEST_LIMIT
+                    if path == relative / "generation.json"
+                    else _MANAGED_FILE_LIMIT
                 )
+                identity, data = self._read_leased_file_snapshot(
+                    lease, path, limit, "journal candidate file"
+                )
+                file_identities[path] = identity
+                file_bytes[path] = data
                 if path in declared_files:
                     name = path.relative_to(relative).as_posix()
                     if hashlib.sha256(data).hexdigest() != hashes[name]:
@@ -1968,6 +1997,8 @@ class GenericAdapter:
             directories=directories,
             identities=identities,
             files=tuple(sorted(files, key=str)),
+            file_identities=file_identities,
+            file_bytes=file_bytes,
             children=children,
         )
 
@@ -1982,9 +2013,14 @@ class GenericAdapter:
                 self._require_direct_directory(current)
                 if self._directory_identity(current) != tree.identity:
                     raise ValueError("journal candidate identity changed")
-                lease.rmdir(relative)
+                try:
+                    lease.rmdir(relative)
+                except OSError:
+                    if not lease.exists(relative):
+                        self._record_changes((root / relative,))
+                    raise
+                self._record_changes((root / relative,))
                 lease.fsync_directory(relative.parent)
-            self._record_changes((root / relative,))
             return
 
         retained = tuple(
@@ -2001,8 +2037,16 @@ class GenericAdapter:
                     raise ValueError("journal cleanup directory identity changed")
                 if frozenset(lease.listdir(directory)) != tree.children[directory]:
                     raise ValueError("journal cleanup tree changed after preflight")
+            for path in (*tree.files, relative / "generation.json"):
+                self._require_journal_cleanup_file(lease, path, tree)
             for path in tree.files:
-                lease.unlink(path)
+                self._require_journal_cleanup_file(lease, path, tree)
+                try:
+                    lease.unlink(path)
+                except OSError:
+                    if not lease.exists(path):
+                        self._record_changes((root / path,))
+                    raise
                 self._record_changes((root / path,))
 
         for directory in sorted(
@@ -2017,9 +2061,14 @@ class GenericAdapter:
                 self._require_direct_directory(current)
                 if self._directory_identity(current) != tree.identities[directory]:
                     raise ValueError("journal cleanup directory identity changed")
-                lease.rmdir(directory)
+                try:
+                    lease.rmdir(directory)
+                except OSError:
+                    if not lease.exists(directory):
+                        self._record_changes((root / directory,))
+                    raise
+                self._record_changes((root / directory,))
                 lease.fsync_directory(directory.parent)
-            self._record_changes((root / directory,))
 
         manifest = relative / "generation.json"
         with guard_state_root(root, retained_dirs=(relative,)) as lease:
@@ -2029,21 +2078,29 @@ class GenericAdapter:
                 raise ValueError("journal candidate identity changed")
             if frozenset(lease.listdir(relative)) != {"generation.json"}:
                 raise ValueError("journal candidate changed before retirement")
+            self._require_journal_cleanup_file(lease, manifest, tree)
             try:
                 lease.unlink(manifest)
             except OSError:
                 if not lease.exists(manifest):
+                    self._record_changes((root / manifest,))
                     lease.write_bytes_exclusive(manifest, tree.manifest_bytes)
                     lease.fsync_directory(relative)
                 raise
-        self._record_changes((root / manifest,))
+            self._record_changes((root / manifest,))
         try:
             with guard_state_root(root, retained_dirs=(relative.parent,)) as lease:
                 current = lease.stat(relative)
                 self._require_direct_directory(current)
                 if self._directory_identity(current) != tree.identity:
                     raise ValueError("journal candidate identity changed")
-                lease.rmdir(relative)
+                try:
+                    lease.rmdir(relative)
+                except OSError:
+                    if not lease.exists(relative):
+                        self._record_changes((root / relative,))
+                    raise
+                self._record_changes((root / relative,))
                 lease.fsync_directory(relative.parent)
         except OSError:
             if self._direct_directory_exists(root / relative):
@@ -2057,7 +2114,6 @@ class GenericAdapter:
                     lease.write_bytes_exclusive(manifest, tree.manifest_bytes)
                     lease.fsync_directory(relative)
             raise
-        self._record_changes((root / relative,))
 
     def _preflight_staged_cleanup(
         self,
@@ -2458,6 +2514,46 @@ class GenericAdapter:
     @staticmethod
     def _directory_identity(info: os.stat_result) -> tuple[int, int]:
         return info.st_dev, info.st_ino
+
+    @staticmethod
+    def _read_leased_file_snapshot(
+        lease: StateRootLease,
+        path: Path,
+        limit: int,
+        label: str,
+    ) -> tuple[tuple[int, int], bytes]:
+        with lease.open_regular(path, label) as descriptor:
+            info = os.fstat(descriptor)
+            chunks: list[bytes] = []
+            total = 0
+            while total <= limit:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > limit:
+                raise ValueError(f"{label} exceeds size limit")
+            return (info.st_dev, info.st_ino), b"".join(chunks)
+
+    def _require_journal_cleanup_file(
+        self,
+        lease: StateRootLease,
+        path: Path,
+        tree: _JournalCleanupTree,
+    ) -> None:
+        limit = (
+            _MANIFEST_LIMIT
+            if path.name == "generation.json"
+            else _MANAGED_FILE_LIMIT
+        )
+        identity, data = self._read_leased_file_snapshot(
+            lease, path, limit, "journal cleanup file"
+        )
+        if identity != tree.file_identities[path]:
+            raise ValueError("journal cleanup file identity changed")
+        if data != tree.file_bytes[path]:
+            raise ValueError("journal cleanup file contents changed")
 
     def _reset_operation(self) -> None:
         self._change_events = []

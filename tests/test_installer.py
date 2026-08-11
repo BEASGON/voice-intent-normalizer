@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Callable
@@ -161,13 +163,134 @@ def _write_test_artifact(root: Path, files: object) -> None:
         target.write_bytes(data)
 
 
-def _file_snapshot(*roots: Path) -> dict[Path, bytes]:
+@dataclass(frozen=True)
+class _DirectEntrySnapshot:
+    kind: str
+    identity: tuple[int, int]
+    contents: bytes | None = None
+
+
+def _snapshot_entry_is_alias(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & 0x400
+    )
+
+
+def _file_snapshot(*roots: Path) -> dict[Path, _DirectEntrySnapshot]:
+    """Snapshot direct identities without following aliases or losing empty dirs."""
+    snapshot: dict[Path, _DirectEntrySnapshot] = {}
+    pending = list(roots)
+    while pending:
+        path = pending.pop()
+        info = path.lstat()
+        identity = (info.st_dev, info.st_ino)
+        if stat.S_ISDIR(info.st_mode) and not _snapshot_entry_is_alias(info):
+            snapshot[path] = _DirectEntrySnapshot("directory", identity)
+            with os.scandir(path) as entries:
+                pending.extend(path / entry.name for entry in entries)
+        elif stat.S_ISREG(info.st_mode) and not _snapshot_entry_is_alias(info):
+            snapshot[path] = _DirectEntrySnapshot(
+                "file", identity, path.read_bytes()
+            )
+        else:
+            snapshot[path] = _DirectEntrySnapshot("alias", identity)
+    return snapshot
+
+
+def _tree_relative_entries(root: Path) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    directories = {Path(".")}
+    files: set[Path] = set()
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                relative = (directory / entry.name).relative_to(root)
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode) and not _snapshot_entry_is_alias(info):
+                    directories.add(relative)
+                    pending.append(directory / entry.name)
+                elif stat.S_ISREG(info.st_mode) and not _snapshot_entry_is_alias(info):
+                    files.add(relative)
+                else:
+                    raise AssertionError(
+                        f"unexpected alias in expected tree: {relative}"
+                    )
+    return (
+        tuple(sorted(directories, key=lambda path: (len(path.parts), str(path)))),
+        tuple(sorted(files, key=str)),
+    )
+
+
+def _expected_published_tree_paths(root: Path) -> tuple[Path, ...]:
+    directories, files = _tree_relative_entries(root)
+    changed_directories = tuple(
+        root if path == Path(".") else root / path for path in directories
+    )
+    return changed_directories + tuple(root / path for path in files)
+
+
+def _expected_removed_tree_paths(
+    source: Path, tombstone: Path, manifest_name: str
+) -> tuple[Path, ...]:
+    directories, files = _tree_relative_entries(source)
+    data_files = tuple(path for path in files if path.name != manifest_name)
+    return (
+        source,
+        tombstone,
+        *(tombstone / path for path in data_files),
+        tombstone / manifest_name,
+        *(
+            tombstone if path == Path(".") else tombstone / path
+            for path in directories
+        ),
+    )
+
+
+def _dedupe_expected_paths(*groups: tuple[Path, ...]) -> tuple[Path, ...]:
+    return tuple(dict.fromkeys(path for group in groups for path in group))
+
+
+def _expected_initial_cleanup_paths(
+    layout,
+    candidate_id: str,
+    state: str,
+) -> tuple[Path, ...]:
+    transaction = (layout.transaction,)
+    if state == "initial-journal-only":
+        return transaction
+    parent = layout.generations if state == "initial-final" else layout.staging
+    candidate = parent / candidate_id
+    if state == "initial-empty-stage":
+        return candidate, *transaction
+    directories, files = _tree_relative_entries(candidate)
+    data_files = tuple(path for path in files if path.name != "generation.json")
+    child_directories = tuple(
+        sorted(
+            (path for path in directories if path != Path(".")),
+            key=lambda path: (len(path.parts), str(path)),
+            reverse=True,
+        )
+    )
+    return (
+        *(candidate / path for path in data_files),
+        *(candidate / path for path in child_directories),
+        candidate / "generation.json",
+        candidate,
+        *transaction,
+    )
+
+
+def _expected_recovery_paths(
+    layout, candidate_id: str, state: str
+) -> tuple[Path, ...]:
+    if state.startswith("initial-"):
+        return _expected_initial_cleanup_paths(layout, candidate_id, state)
     return {
-        path: path.read_bytes()
-        for root in roots
-        for path in root.rglob("*")
-        if path.is_file()
-    }
+        "later-before": (layout.status, layout.transaction),
+        "matching-nonterminal-after": (layout.transaction, layout.status),
+        "matching-terminal-after": (layout.transaction,),
+    }[state]
 
 
 def _materialize_journal_state(
@@ -2084,10 +2207,48 @@ def test_ownership_journal_fresh_process_matrix(
     operation: str,
     state: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Catch a fresh public adapter stranding an exactly journal-owned state."""
     scenario = _materialize_journal_state(tmp_path, state)
     layout = generic_layout_paths(scenario.state_paths)
+    expected_recovery = _expected_recovery_paths(
+        layout, scenario.candidate_id, state
+    )
+    fixed_token = "b" * 32
+    monkeypatch.setattr(secrets, "token_hex", lambda size: "b" * (size * 2))
+    uninstall_changes: tuple[Path, ...] = ()
+    if operation == "uninstall" and not state.startswith("initial-"):
+        status = validate_status_v5(
+            layout.status.read_bytes(),
+            skill_root=scenario.skill_root,
+            generations_root=layout.generations,
+        )
+        transaction_id = f"t-{fixed_token}"
+        capsule = scenario.skill_root / "voice-intent-normalizer"
+        capsule_tombstone = scenario.skill_root / (
+            f".voice-intent-normalizer.retired-{fixed_token}"
+        )
+        removals = [
+            _expected_removed_tree_paths(
+                capsule, capsule_tombstone, "capsule.json"
+            )
+        ]
+        for reference in (status.active, status.previous):
+            if reference is None:
+                continue
+            generation = layout.generations / reference.generation_id
+            retired = layout.retired / (
+                f"{reference.generation_id}.{transaction_id}"
+            )
+            removals.append(
+                _expected_removed_tree_paths(
+                    generation, retired, "generation.json"
+                )
+            )
+        uninstall_changes = _dedupe_expected_paths(
+            (layout.transaction, layout.status), *removals
+        )
     adapter, invoke = scenario.restart(operation)
 
     result = invoke()
@@ -2104,7 +2265,28 @@ def test_ownership_journal_fresh_process_matrix(
     assert result.status == expected_status
     assert not layout.transaction.exists()
     assert not (layout.staging / scenario.candidate_id).exists()
-    assert len(result.changed_paths) == len(set(result.changed_paths))
+    expected_changes = expected_recovery
+    if operation == "install" and state.startswith("initial-"):
+        terminal_status = validate_status_v5(
+            layout.status.read_bytes(),
+            skill_root=scenario.skill_root,
+            generations_root=layout.generations,
+        )
+        expected_changes = _dedupe_expected_paths(
+            expected_recovery,
+            _expected_published_tree_paths(
+                layout.generations / terminal_status.active.generation_id
+            ),
+            (layout.status,),
+            _expected_published_tree_paths(
+                scenario.skill_root / "voice-intent-normalizer"
+            ),
+        )
+    elif operation == "uninstall" and not state.startswith("initial-"):
+        expected_changes = _dedupe_expected_paths(
+            expected_recovery, uninstall_changes
+        )
+    assert result.changed_paths == expected_changes
     if initial:
         assert not (layout.generations / scenario.candidate_id).exists()
     if operation in {"doctor", "uninstall"} and initial or operation == "uninstall":
@@ -2128,11 +2310,39 @@ def test_ownership_journal_fresh_process_preserves_upgrade_baseline(
     operation: str,
     tmp_path: Path,
     repository_v2: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Catch initial upgrade cleanup replacing the old terminal installation."""
     scenario = _materialize_upgrade_initial_state(tmp_path, repository_v2)
     layout = generic_layout_paths(scenario.state_paths)
     baseline_bytes = layout.status.read_bytes()
+    baseline = validate_status_v5(
+        baseline_bytes,
+        skill_root=scenario.skill_root,
+        generations_root=layout.generations,
+    )
+    expected_recovery = _expected_initial_cleanup_paths(
+        layout, scenario.candidate_id, "initial-final"
+    )
+    fixed_token = "c" * 32
+    monkeypatch.setattr(secrets, "token_hex", lambda size: "c" * (size * 2))
+    capsule = scenario.skill_root / "voice-intent-normalizer"
+    capsule_tombstone = scenario.skill_root / (
+        f".voice-intent-normalizer.retired-{fixed_token}"
+    )
+    generation = layout.generations / baseline.active.generation_id
+    retired_generation = layout.retired / (
+        f"{baseline.active.generation_id}.t-{fixed_token}"
+    )
+    uninstall_changes = _dedupe_expected_paths(
+        (layout.transaction, layout.status),
+        _expected_removed_tree_paths(
+            capsule, capsule_tombstone, "capsule.json"
+        ),
+        _expected_removed_tree_paths(
+            generation, retired_generation, "generation.json"
+        ),
+    )
     adapter, invoke = scenario.restart(operation)
 
     result = invoke()
@@ -2148,7 +2358,215 @@ def test_ownership_journal_fresh_process_preserves_upgrade_baseline(
         assert layout.status.read_bytes() == baseline_bytes
     elif operation == "uninstall":
         assert not layout.status.exists()
-    assert len(result.changed_paths) == len(set(result.changed_paths))
+    expected_changes = expected_recovery
+    if operation == "install":
+        terminal = validate_status_v5(
+            layout.status.read_bytes(),
+            skill_root=scenario.skill_root,
+            generations_root=layout.generations,
+        )
+        expected_changes = _dedupe_expected_paths(
+            expected_recovery,
+            _expected_published_tree_paths(
+                layout.generations / terminal.active.generation_id
+            ),
+            (layout.status,),
+        )
+    elif operation == "uninstall":
+        expected_changes = _dedupe_expected_paths(
+            expected_recovery, uninstall_changes
+        )
+    assert result.changed_paths == expected_changes
+
+
+@pytest.mark.parametrize("operation", ("install", "doctor", "uninstall"))
+@pytest.mark.parametrize("baseline_ref", ("active", "previous"))
+def test_ownership_journal_review_round1_rejects_baseline_candidate_alias(
+    operation: str,
+    baseline_ref: str,
+    tmp_path: Path,
+    repository_v2: Path,
+):
+    """A canonical upgrade journal must never own a launchable baseline ref."""
+    scenario = _materialize_upgrade_initial_state(tmp_path, repository_v2)
+    layout = generic_layout_paths(scenario.state_paths)
+    status_payload = json.loads(layout.status.read_bytes())
+    journal_payload = json.loads(layout.transaction.read_bytes())
+    if baseline_ref == "previous":
+        status_payload["previous"] = journal_payload["candidate"]
+        baseline_bytes = canonical_json_bytes(status_payload)
+        layout.status.write_bytes(baseline_bytes)
+    else:
+        baseline_bytes = layout.status.read_bytes()
+    journal_payload["candidate"] = status_payload[baseline_ref]
+    baseline_digest = hashlib.sha256(baseline_bytes).hexdigest()
+    journal_payload["baseline_status_digest"] = baseline_digest
+    journal_payload["status_transition"]["before_digest"] = baseline_digest
+    layout.transaction.write_bytes(canonical_json_bytes(journal_payload))
+    before = _file_snapshot(scenario.state_paths.root, scenario.skill_root)
+
+    adapter, invoke = scenario.restart(operation)
+    result = invoke()
+
+    assert result.status in {"failed", "degraded"}
+    assert result.changed_paths == ()
+    assert _file_snapshot(
+        scenario.state_paths.root, scenario.skill_root
+    ) == before
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("missing-declared-file", "staging-temporary"),
+)
+def test_ownership_journal_review_round1_preserves_partial_final_candidate(
+    tamper: str,
+    tmp_path: Path,
+):
+    """An atomically published final candidate is necessarily exact and complete."""
+    scenario = _materialize_journal_state(tmp_path, "initial-final")
+    layout = generic_layout_paths(scenario.state_paths)
+    candidate = layout.generations / scenario.candidate_id
+    if tamper == "missing-declared-file":
+        (candidate / "SKILL.md").unlink()
+    else:
+        (candidate / ".SKILL.md.tmp").write_bytes(b"uncommitted")
+    before = _file_snapshot(scenario.state_paths.root, scenario.skill_root)
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert result.status == "degraded"
+    assert result.changed_paths == ()
+    assert _file_snapshot(
+        scenario.state_paths.root, scenario.skill_root
+    ) == before
+
+
+@pytest.mark.parametrize("target_name", ("SKILL.md", "generation.json"))
+def test_ownership_journal_review_round1_rechecks_file_identity_before_deletion(
+    target_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A same-name replacement after preflight is not journal-owned."""
+    scenario = _materialize_journal_state(tmp_path, "initial-complete-stage")
+    layout = generic_layout_paths(scenario.state_paths)
+    candidate = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    original = GenericAdapter._preflight_journal_cleanup
+    replacement_identity: tuple[int, int] | None = None
+    before_paths = set(
+        _file_snapshot(scenario.state_paths.root, scenario.skill_root)
+    )
+
+    def replace_after_preflight(adapter, relative, journal):
+        nonlocal replacement_identity
+        tree = original(adapter, relative, journal)
+        target = adapter.state_paths.root / relative / target_name
+        original_bytes = target.read_bytes()
+        displaced = target.with_name(f".{target.name}.displaced")
+        target.rename(displaced)
+        target.write_bytes(original_bytes)
+        displaced.unlink()
+        info = target.lstat()
+        replacement_identity = (info.st_dev, info.st_ino)
+        return tree
+
+    monkeypatch.setattr(
+        GenericAdapter,
+        "_preflight_journal_cleanup",
+        replace_after_preflight,
+    )
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    target = candidate / target_name
+    assert result.status == "degraded"
+    assert result.changed_paths == ()
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert target.exists()
+    assert replacement_identity is not None
+    assert (target.stat().st_dev, target.stat().st_ino) == replacement_identity
+    assert set(
+        _file_snapshot(scenario.state_paths.root, scenario.skill_root)
+    ) == before_paths
+
+
+@pytest.mark.parametrize(
+    "fault,state,expected_first,expected_second",
+    (
+        (
+            "file-unlink",
+            "initial-partial-stage",
+            ("candidate/SKILL.md",),
+            ("candidate/generation.json", "candidate", "transaction"),
+        ),
+        (
+            "directory-removal",
+            "initial-empty-stage",
+            ("candidate",),
+            ("transaction",),
+        ),
+    ),
+)
+def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
+    fault: str,
+    state: str,
+    expected_first: tuple[str, ...],
+    expected_second: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A committed unlink/rmdir is reported even when its API raises afterward."""
+    scenario = _materialize_journal_state(tmp_path, state)
+    layout = generic_layout_paths(scenario.state_paths)
+    candidate = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    original_unlink = StateRootLease.unlink
+    original_rmdir = StateRootLease.rmdir
+    injected = False
+
+    def unlink_then_fail(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        relative = Path(relative)
+        original_unlink(lease, relative, missing_ok=missing_ok)
+        if fault == "file-unlink" and relative.name == "SKILL.md" and not injected:
+            injected = True
+            raise OSError("injected post-commit file unlink failure")
+
+    def rmdir_then_fail(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        relative = Path(relative)
+        original_rmdir(lease, relative, missing_ok=missing_ok)
+        if (
+            fault == "directory-removal"
+            and relative.name == scenario.candidate_id
+            and not injected
+        ):
+            injected = True
+            raise OSError("injected post-commit directory removal failure")
+
+    monkeypatch.setattr(StateRootLease, "unlink", unlink_then_fail)
+    monkeypatch.setattr(StateRootLease, "rmdir", rmdir_then_fail)
+
+    first = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    aliases = {
+        "candidate": candidate,
+        "candidate/SKILL.md": candidate / "SKILL.md",
+        "candidate/generation.json": candidate / "generation.json",
+        "transaction": layout.transaction,
+    }
+    assert first.status == "degraded"
+    assert first.changed_paths == tuple(aliases[name] for name in expected_first)
+    assert layout.transaction.read_bytes() == journal_bytes
+
+    second = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert second.status == "not-installed"
+    assert second.changed_paths == tuple(aliases[name] for name in expected_second)
+    assert not layout.transaction.exists()
+    assert not candidate.exists()
 
 
 @pytest.mark.parametrize("repeated", (False, True), ids=("fail-once", "repeated"))
@@ -2179,6 +2597,9 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
     )
     scenario = _materialize_journal_state(tmp_path, state)
     layout = generic_layout_paths(scenario.state_paths)
+    success_expected = _expected_initial_cleanup_paths(
+        layout, scenario.candidate_id, state
+    )
     journal_bytes = layout.transaction.read_bytes()
     original_unlink = StateRootLease.unlink
     original_rmdir = StateRootLease.rmdir
@@ -2240,19 +2661,25 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
 
     assert first.status == "degraded"
     assert layout.transaction.read_bytes() == journal_bytes
-    assert len(first.changed_paths) == len(set(first.changed_paths))
+    first_expected = (
+        (layout.transaction,)
+        if fault in {"transaction-unlink", "generic-parent-fsync"}
+        else ()
+    )
+    assert first.changed_paths == first_expected
 
     second = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
 
     if repeated:
         assert second.status == "degraded"
         assert layout.transaction.read_bytes() == journal_bytes
+        assert second.changed_paths == first_expected
     else:
         assert second.status == "not-installed"
         assert not layout.transaction.exists()
         assert not (layout.staging / scenario.candidate_id).exists()
         assert not (layout.generations / scenario.candidate_id).exists()
-    assert len(second.changed_paths) == len(set(second.changed_paths))
+        assert second.changed_paths == success_expected
 
 
 @pytest.mark.parametrize(
@@ -2270,6 +2697,7 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
         "final-manifest",
         "both-names",
         "extra-direct-entry",
+        "alias-entry",
         "unknown-format",
         "old-marker",
         "oversized",
@@ -2298,7 +2726,7 @@ def test_ownership_journal_conflict_preserves_all_observed_objects(
         else "initial-final"
         if conflict in {"final-manifest", "both-names"}
         else "initial-partial-stage"
-        if conflict in {"staging-manifest", "extra-direct-entry"}
+        if conflict in {"staging-manifest", "extra-direct-entry", "alias-entry"}
         else "initial-empty-stage"
         if conflict == "directory-identity"
         else "initial-journal-only"
@@ -2362,6 +2790,14 @@ def test_ownership_journal_conflict_preserves_all_observed_objects(
         (layout.staging / scenario.candidate_id / "unexpected.bin").write_bytes(
             b"preserve"
         )
+    elif conflict == "alias-entry":
+        external = tmp_path / "external-alias-target"
+        external.write_bytes(b"outside journal ownership")
+        alias = layout.staging / scenario.candidate_id / "alias-entry"
+        try:
+            alias.symlink_to(external)
+        except OSError as exc:
+            pytest.skip(f"native file aliases are unavailable: {exc}")
     elif conflict == "old-marker":
         layout.transaction.write_bytes(
             canonical_json_bytes(
@@ -2405,7 +2841,7 @@ def test_ownership_journal_conflict_preserves_all_observed_objects(
         assert _file_snapshot(
             scenario.state_paths.root, scenario.skill_root
         ) == before
-    assert len(result.changed_paths) == len(set(result.changed_paths))
+    assert result.changed_paths == ()
 
 
 @pytest.mark.parametrize("operation", ("first-install", "upgrade"))
