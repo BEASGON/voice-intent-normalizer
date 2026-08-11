@@ -240,11 +240,16 @@ class StateRootLease:
         self,
         relative_path: Path,
         *,
+        expected_identity: tuple[int, int],
         expected_bytes: bytes,
     ) -> None:
         """Remove one validated file inside an already isolated private tree."""
-        if not isinstance(relative_path, Path) or not isinstance(
-            expected_bytes, bytes
+        if (
+            not isinstance(relative_path, Path)
+            or not isinstance(expected_identity, tuple)
+            or len(expected_identity) != 2
+            or any(type(value) is not int or value < 0 for value in expected_identity)
+            or not isinstance(expected_bytes, bytes)
         ):
             raise ValueError("invalid private file removal contract")
         parts = _relative_path_parts(relative_path)
@@ -257,6 +262,7 @@ class StateRootLease:
                 or stat.S_ISLNK(before.st_mode)
                 or getattr(before, "st_file_attributes", 0)
                 & _WINDOWS_REPARSE_POINT
+                or _stat_identity(before) != expected_identity
             ):
                 raise StateRootBoundaryError(
                     "private cleanup target must be a direct regular file"
@@ -265,7 +271,7 @@ class StateRootLease:
                 retained = os.fstat(descriptor)
                 if (
                     not stat.S_ISREG(retained.st_mode)
-                    or _stat_identity(retained) != _stat_identity(before)
+                    or _stat_identity(retained) != expected_identity
                     or _read_descriptor_bytes(descriptor, len(expected_bytes))
                     != expected_bytes
                     or _stat_identity(os.fstat(descriptor))
@@ -284,7 +290,11 @@ class StateRootLease:
             dir_fd=binding.descriptor,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or _stat_identity(before) != expected_identity
+        ):
             raise StateRootBoundaryError(
                 "private cleanup target must be a direct regular file"
             )
@@ -299,7 +309,7 @@ class StateRootLease:
             retained = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(retained.st_mode)
-                or _stat_identity(retained) != _stat_identity(before)
+                or _stat_identity(retained) != expected_identity
                 or _read_descriptor_bytes(descriptor, len(expected_bytes))
                 != expected_bytes
                 or _stat_identity(os.fstat(descriptor))

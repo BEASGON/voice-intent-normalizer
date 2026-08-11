@@ -70,6 +70,8 @@ class _CleanupTree:
     directories: tuple[Path, ...]
     identities: Mapping[Path, tuple[int, int]]
     files: tuple[Path, ...]
+    file_identities: Mapping[Path, tuple[int, int]]
+    file_bytes: Mapping[Path, bytes]
     children: Mapping[Path, frozenset[str]]
 
 
@@ -879,6 +881,10 @@ class GenericAdapter:
                 )
                 publication.fsync_directory(_GENERATIONS_RELATIVE)
                 publication.fsync_directory(_STAGING_RELATIVE)
+                if publication.exists(final_relative):
+                    raise StateRootBoundaryError(
+                        "public final name replaced before journal cleanup"
+                    )
             stage_exists = True
         if stage_exists:
             tree = self._preflight_journal_cleanup(stage_relative, journal)
@@ -1845,6 +1851,9 @@ class GenericAdapter:
         )
         if tree is None:
             return
+        manifest = stage_relative / artifact.manifest_name
+        manifest_present = manifest in tree.files
+        data_files = tuple(path for path in tree.files if path != manifest)
         retained = tuple(
             path
             for path in (stage_relative.parent, *tree.directories)
@@ -1859,18 +1868,41 @@ class GenericAdapter:
                 if frozenset(lease.listdir(directory)) != tree.children[directory]:
                     raise ValueError("cleanup tree changed after preflight")
             for path in tree.files:
-                info = lease.stat(path)
+                identity, data = self._read_leased_file_snapshot(
+                    lease,
+                    path,
+                    _MANIFEST_LIMIT if path == manifest else _MANAGED_FILE_LIMIT,
+                    "staged cleanup file",
+                )
                 if (
-                    not stat.S_ISREG(info.st_mode)
-                    or stat.S_ISLNK(info.st_mode)
-                    or getattr(info, "st_file_attributes", 0)
-                    & _WINDOWS_REPARSE_POINT
+                    identity != tree.file_identities[path]
+                    or data != tree.file_bytes[path]
                 ):
-                    raise ValueError("unsafe cleanup file")
-            for path in tree.files:
-                lease.unlink(path)
+                    raise ValueError("cleanup file changed after preflight")
+            remaining_children = {
+                directory: set(children)
+                for directory, children in tree.children.items()
+            }
+            for path in data_files:
+                lease.remove_private_file(
+                    path,
+                    expected_identity=tree.file_identities[path],
+                    expected_bytes=tree.file_bytes[path],
+                )
+                remaining_children[path.parent].remove(path.name)
+                for directory in tree.directories:
+                    info = lease.stat(directory)
+                    self._require_direct_directory(info)
+                    if (
+                        self._directory_identity(info) != tree.identities[directory]
+                        or set(lease.listdir(directory))
+                        != remaining_children[directory]
+                    ):
+                        raise StateRootBoundaryError(
+                            "cleanup tree changed during removal"
+                        )
         for directory in sorted(
-            tree.directories,
+            (path for path in tree.directories if path != stage_relative),
             key=lambda path: (len(path.parts), str(path)),
             reverse=True,
         ):
@@ -1883,6 +1915,63 @@ class GenericAdapter:
                     raise ValueError("cleanup directory identity changed")
                 lease.rmdir(directory)
                 lease.fsync_directory(parent)
+
+        if manifest_present:
+            manifest_bytes = tree.file_bytes[manifest]
+            with guard_state_root(root, retained_dirs=(stage_relative,)) as lease:
+                info = lease.stat(stage_relative)
+                self._require_direct_directory(info)
+                if self._directory_identity(info) != expected_identity:
+                    raise ValueError("staging directory identity changed")
+                if frozenset(lease.listdir(stage_relative)) != {manifest.name}:
+                    raise ValueError("cleanup tree changed before retirement")
+                try:
+                    lease.remove_private_file(
+                        manifest,
+                        expected_identity=tree.file_identities[manifest],
+                        expected_bytes=manifest_bytes,
+                    )
+                    if lease.listdir(stage_relative):
+                        raise StateRootBoundaryError(
+                            "cleanup tree changed before retirement"
+                        )
+                except BaseException:
+                    if not lease.exists(manifest):
+                        lease.write_bytes_exclusive(manifest, manifest_bytes)
+                        lease.fsync_directory(stage_relative)
+                    raise
+
+        with guard_state_root(root, retained_dirs=(stage_relative,)) as lease:
+            info = lease.stat(stage_relative)
+            self._require_direct_directory(info)
+            if self._directory_identity(info) != expected_identity:
+                raise ValueError("staging directory identity changed")
+            if lease.listdir(stage_relative):
+                raise ValueError("cleanup tree changed before root removal")
+        try:
+            with guard_state_root(
+                root, retained_dirs=(stage_relative.parent,)
+            ) as lease:
+                info = lease.stat(stage_relative)
+                self._require_direct_directory(info)
+                if self._directory_identity(info) != expected_identity:
+                    raise ValueError("staging directory identity changed")
+                lease.rmdir(stage_relative)
+                lease.fsync_directory(stage_relative.parent)
+        except BaseException:
+            if manifest_present and self._direct_directory_exists(
+                root / stage_relative
+            ):
+                with guard_state_root(root, retained_dirs=(stage_relative,)) as lease:
+                    info = lease.stat(stage_relative)
+                    self._require_direct_directory(info)
+                    if self._directory_identity(info) != expected_identity:
+                        raise ValueError("staging directory identity changed")
+                    if lease.listdir(stage_relative):
+                        raise ValueError("cleanup tree changed after root failure")
+                    lease.write_bytes_exclusive(manifest, manifest_bytes)
+                    lease.fsync_directory(stage_relative)
+            raise
 
     @staticmethod
     def _journal_cleanup_bound_path(
@@ -2256,6 +2345,7 @@ class GenericAdapter:
                 try:
                     lease.remove_private_file(
                         path,
+                        expected_identity=tree.file_identities[path],
                         expected_bytes=tree.file_bytes[path],
                     )
                 except OSError:
@@ -2313,6 +2403,7 @@ class GenericAdapter:
             try:
                 lease.remove_private_file(
                     manifest,
+                    expected_identity=tree.file_identities[manifest],
                     expected_bytes=tree.file_bytes[manifest],
                 )
                 self._record_changes((root / manifest,))
@@ -2382,6 +2473,8 @@ class GenericAdapter:
         identities: dict[Path, tuple[int, int]] = {}
         children: dict[Path, frozenset[str]] = {}
         files: list[Path] = []
+        file_identities: dict[Path, tuple[int, int]] = {}
+        file_bytes: dict[Path, bytes] = {}
         pending = [stage_relative]
         while pending:
             directory = pending.pop()
@@ -2436,10 +2529,22 @@ class GenericAdapter:
                     raise ValueError("cleanup directory identity changed")
                 if frozenset(lease.listdir(directory)) != children[directory]:
                     raise ValueError("cleanup tree changed during preflight")
+            manifest = stage_relative / artifact.manifest_name
+            for path in files:
+                identity, data = self._read_leased_file_snapshot(
+                    lease,
+                    path,
+                    _MANIFEST_LIMIT if path == manifest else _MANAGED_FILE_LIMIT,
+                    "staged cleanup file",
+                )
+                file_identities[path] = identity
+                file_bytes[path] = data
         return _CleanupTree(
             directories=directories,
             identities=identities,
             files=tuple(sorted(files, key=str)),
+            file_identities=file_identities,
+            file_bytes=file_bytes,
             children=children,
         )
 

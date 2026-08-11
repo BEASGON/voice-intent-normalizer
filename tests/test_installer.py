@@ -1536,7 +1536,7 @@ def test_candidate_cleanup_propagates_filesystem_failures(
     skill_root.mkdir()
     layout = generic_layout_paths(generic_adapter.state_paths)
     original_publish = StateRootLease.publish_directory_no_replace
-    original_unlink = StateRootLease.unlink
+    original_remove = StateRootLease.remove_private_file
     original_rmdir = StateRootLease.rmdir
     original_fsync = StateRootLease.fsync_directory
     cleanup_started = False
@@ -1557,12 +1557,17 @@ def test_candidate_cleanup_propagates_filesystem_failures(
             on_committed=on_committed,
         )
 
-    def fail_unlink(lease, relative, *, missing_ok=False):
+    def fail_remove(lease, relative, *, expected_identity, expected_bytes):
         nonlocal injected
         if failure == "unlink" and cleanup_started and not injected:
             injected = True
             raise OSError("cleanup unlink failure")
-        return original_unlink(lease, relative, missing_ok=missing_ok)
+        return original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
 
     def fail_rmdir(lease, relative, *, missing_ok=False):
         nonlocal injected
@@ -1581,7 +1586,7 @@ def test_candidate_cleanup_propagates_filesystem_failures(
     monkeypatch.setattr(
         StateRootLease, "publish_directory_no_replace", fail_publication
     )
-    monkeypatch.setattr(StateRootLease, "unlink", fail_unlink)
+    monkeypatch.setattr(StateRootLease, "remove_private_file", fail_remove)
     monkeypatch.setattr(StateRootLease, "rmdir", fail_rmdir)
     monkeypatch.setattr(StateRootLease, "fsync_directory", fail_fsync)
 
@@ -1593,6 +1598,97 @@ def test_candidate_cleanup_propagates_filesystem_failures(
 
     assert injected
     assert layout.transaction.is_file()
+
+
+def test_failed_generation_stage_cleanup_remains_restart_recoverable(
+    tmp_path: Path,
+    generic_adapter: GenericAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A later cleanup failure keeps the manifest needed by fresh recovery."""
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    layout = generic_layout_paths(generic_adapter.state_paths)
+    original_prepare = generic_adapter._prepare_versioned_artifacts
+    original_publish = StateRootLease.publish_directory_no_replace
+    original_rmdir = StateRootLease.rmdir
+    candidate = None
+    cleanup_started = False
+    injected = False
+
+    def capture_artifacts(nonce: str):
+        nonlocal candidate
+        artifacts = original_prepare(nonce)
+        candidate = artifacts.generation
+        return artifacts
+
+    def fail_generation_publication(
+        lease, source, destination, expected_identity, *, on_committed=None
+    ):
+        nonlocal cleanup_started
+        if Path(destination).parent == Path("adapters/generic/generations"):
+            cleanup_started = True
+            raise OSError("injected generation publication failure")
+        return original_publish(
+            lease,
+            source,
+            destination,
+            expected_identity,
+            on_committed=on_committed,
+        )
+
+    def fail_first_child_rmdir(lease, relative, *, missing_ok=False):
+        nonlocal injected
+        relative = Path(relative)
+        if candidate is not None:
+            stage_relative = Path("adapters/generic/staging") / candidate.identifier
+            if (
+                cleanup_started
+                and not injected
+                and relative != stage_relative
+                and stage_relative in relative.parents
+            ):
+                injected = True
+                raise OSError("injected staged child-directory removal failure")
+        return original_rmdir(lease, relative, missing_ok=missing_ok)
+
+    monkeypatch.setattr(
+        generic_adapter,
+        "_prepare_versioned_artifacts",
+        capture_artifacts,
+    )
+    monkeypatch.setattr(
+        StateRootLease,
+        "publish_directory_no_replace",
+        fail_generation_publication,
+    )
+    monkeypatch.setattr(StateRootLease, "rmdir", fail_first_child_rmdir)
+
+    failed = generic_adapter.install(InstallOptions(output_dir=skill_root))
+
+    assert injected
+    assert candidate is not None
+    stage = layout.staging / candidate.identifier
+    manifest_survived = (stage / "generation.json").is_file()
+    journal_bytes = layout.transaction.read_bytes()
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "publish_directory_no_replace",
+        original_publish,
+    )
+    monkeypatch.setattr(StateRootLease, "rmdir", original_rmdir)
+    recovered = GenericAdapter(
+        generic_adapter.repository,
+        generic_adapter.state_paths,
+    ).doctor()
+
+    assert failed.status == "failed"
+    assert manifest_survived
+    assert recovered.status == "not-installed"
+    assert not stage.exists()
+    assert not layout.transaction.exists()
+    assert journal_bytes
 
 
 def test_candidate_cleanup_extra_entry_causes_zero_deletions(
@@ -2713,6 +2809,82 @@ def test_windows_private_cleanup_deletes_only_retained_file_handle(
     assert not displaced.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact-handle deletion")
+def test_windows_private_cleanup_preserves_byte_identical_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The anchored identity, not byte equality, authorizes deletion."""
+    scenario = _materialize_journal_state(tmp_path, "initial-complete-stage")
+    layout = generic_layout_paths(scenario.state_paths)
+    journal_bytes = layout.transaction.read_bytes()
+    original_require = GenericAdapter._require_journal_cleanup_file
+    original_delete = paths_module._delete_windows_file_handle
+    bound_target: Path | None = None
+    displaced: Path | None = None
+    source_bytes: bytes | None = None
+    source_identity: tuple[int, int] | None = None
+    replacement_identity: tuple[int, int] | None = None
+    injected = False
+    replacement_delete_attempted = False
+
+    def replace_after_identity_validation(adapter, lease, path, tree):
+        nonlocal bound_target, displaced, injected
+        nonlocal replacement_identity, source_bytes, source_identity
+        original_require(adapter, lease, path, tree)
+        if tree.binding_complete and Path(path) == tree.files[0] and not injected:
+            bound_target = scenario.state_paths.root / path
+            displaced = bound_target.with_name(
+                f".{bound_target.name}.anchored-displaced"
+            )
+            source_bytes = tree.file_bytes[path]
+            source_identity = tree.file_identities[path]
+            bound_target.rename(displaced)
+            bound_target.write_bytes(source_bytes)
+            replacement_info = bound_target.stat()
+            replacement_identity = (
+                replacement_info.st_dev,
+                replacement_info.st_ino,
+            )
+            injected = True
+
+    def observe_permanent_delete(descriptor):
+        nonlocal replacement_delete_attempted
+        info = os.fstat(descriptor)
+        if replacement_identity == (info.st_dev, info.st_ino):
+            replacement_delete_attempted = True
+        return original_delete(descriptor)
+
+    monkeypatch.setattr(
+        GenericAdapter,
+        "_require_journal_cleanup_file",
+        replace_after_identity_validation,
+    )
+    monkeypatch.setattr(
+        paths_module,
+        "_delete_windows_file_handle",
+        observe_permanent_delete,
+    )
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert bound_target is not None
+    assert displaced is not None
+    assert source_bytes is not None
+    assert source_identity is not None
+    assert replacement_identity is not None
+    assert not replacement_delete_attempted
+    assert result.status in {"failed", "degraded"}
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert bound_target.read_bytes() == source_bytes
+    current = bound_target.stat()
+    assert (current.st_dev, current.st_ino) == replacement_identity
+    assert displaced.read_bytes() == source_bytes
+    displaced_info = displaced.stat()
+    assert (displaced_info.st_dev, displaced_info.st_ino) == source_identity
+
+
 def test_exact_directory_move_preserves_raced_public_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2803,6 +2975,48 @@ def test_exact_directory_move_preserves_raced_public_replacement(
     assert result.status in {"failed", "degraded"}
 
 
+def test_final_name_reappearance_before_cleanup_preserves_both_and_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Recovery rechecks the public name after move durability, before cleanup."""
+    scenario = _materialize_journal_state(tmp_path, "initial-final")
+    layout = generic_layout_paths(scenario.state_paths)
+    final = layout.generations / scenario.candidate_id
+    stage = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    original_fsync = StateRootLease.fsync_directory
+    injected = False
+
+    def replace_after_stage_fsync(lease, relative=Path(".")):
+        nonlocal injected
+        result = original_fsync(lease, relative)
+        if (
+            Path(relative) == Path("adapters/generic/staging")
+            and stage.is_dir()
+            and not final.exists()
+            and not injected
+        ):
+            final.mkdir()
+            (final / "replacement.txt").write_bytes(b"replacement")
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "fsync_directory",
+        replace_after_stage_fsync,
+    )
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert result.status in {"failed", "degraded"}
+    assert stage.is_dir()
+    assert (final / "replacement.txt").read_bytes() == b"replacement"
+    assert layout.transaction.read_bytes() == journal_bytes
+
+
 @pytest.mark.parametrize(
     "fault",
     (
@@ -2872,10 +3086,15 @@ def test_ownership_journal_review_round2_final_cleanup_fault_retries_from_stage(
     original_fsync = StateRootLease.fsync_directory
     injected = False
 
-    def remove_then_fail(lease, relative, *, expected_bytes):
+    def remove_then_fail(lease, relative, *, expected_identity, expected_bytes):
         nonlocal injected
         relative = Path(relative)
-        original_remove(lease, relative, expected_bytes=expected_bytes)
+        original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
         selected = (fault == "data-unlink" and relative == bound_data) or (
             fault == "manifest-unlink" and relative == bound_manifest
         )
@@ -2984,7 +3203,7 @@ def test_private_cleanup_records_post_delete_revalidation_error(
     original_remove = StateRootLease.remove_private_file
     original_listdir = StateRootLease.listdir
 
-    def stop_after_binding(lease, relative, *, expected_bytes):
+    def stop_after_binding(lease, relative, *, expected_identity, expected_bytes):
         raise OSError("injected pre-commit private cleanup failure")
 
     monkeypatch.setattr(
@@ -2999,9 +3218,14 @@ def test_private_cleanup_records_post_delete_revalidation_error(
     deleted: Path | None = None
     injected = False
 
-    def remove_then_mark(lease, relative, *, expected_bytes):
+    def remove_then_mark(lease, relative, *, expected_identity, expected_bytes):
         nonlocal deleted
-        original_remove(lease, relative, expected_bytes=expected_bytes)
+        original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
         deleted = Path(relative)
 
     def fail_revalidation(lease, relative):
@@ -3054,10 +3278,15 @@ def test_private_cleanup_restores_manifest_after_post_delete_validation_error(
     original_remove = StateRootLease.remove_private_file
     original_listdir = StateRootLease.listdir
 
-    def stop_before_manifest(lease, relative, *, expected_bytes):
+    def stop_before_manifest(lease, relative, *, expected_identity, expected_bytes):
         if Path(relative) == bound_manifest_relative:
             raise OSError("injected pre-commit manifest removal failure")
-        return original_remove(lease, relative, expected_bytes=expected_bytes)
+        return original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
 
     monkeypatch.setattr(
         StateRootLease,
@@ -3072,9 +3301,14 @@ def test_private_cleanup_restores_manifest_after_post_delete_validation_error(
     manifest_deleted = False
     injected = False
 
-    def remove_then_mark(lease, relative, *, expected_bytes):
+    def remove_then_mark(lease, relative, *, expected_identity, expected_bytes):
         nonlocal manifest_deleted
-        original_remove(lease, relative, expected_bytes=expected_bytes)
+        original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
         if Path(relative) == bound_manifest_relative:
             manifest_deleted = True
 
@@ -3156,10 +3390,15 @@ def test_ownership_journal_review_round1_records_post_commit_cleanup_errors(
     original_rmdir = StateRootLease.rmdir
     injected = False
 
-    def remove_then_fail(lease, relative, *, expected_bytes):
+    def remove_then_fail(lease, relative, *, expected_identity, expected_bytes):
         nonlocal injected
         relative = Path(relative)
-        original_remove(lease, relative, expected_bytes=expected_bytes)
+        original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
         if (
             fault == "file-unlink"
             and relative == bound_skill.relative_to(scenario.state_paths.root)
@@ -3280,7 +3519,7 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
             raise OSError(f"injected {fault}")
         return original_unlink(lease, relative, missing_ok=missing_ok)
 
-    def fail_remove(lease, relative, *, expected_bytes):
+    def fail_remove(lease, relative, *, expected_identity, expected_bytes):
         relative = Path(relative)
         if (
             fault == "file-unlink"
@@ -3288,7 +3527,12 @@ def test_ownership_journal_cleanup_retry_preserves_exact_journal_bytes(
             and should_fail()
         ):
             raise OSError(f"injected {fault}")
-        return original_remove(lease, relative, expected_bytes=expected_bytes)
+        return original_remove(
+            lease,
+            relative,
+            expected_identity=expected_identity,
+            expected_bytes=expected_bytes,
+        )
 
     def fail_rmdir(lease, relative, *, missing_ok=False):
         relative = Path(relative)
