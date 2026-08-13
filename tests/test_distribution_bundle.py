@@ -17,6 +17,11 @@ from pathlib import Path
 import pytest
 import setuptools
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
 from voice_intent_normalizer.adapters import generic_layout
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_ci_runs_native_adapter_contract_on_all_supported_operating_systems():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
     for runner in ("windows-latest", "ubuntu-latest", "macos-latest"):
         assert runner in workflow
     assert "python-version: '3.10'" in workflow
@@ -32,6 +38,7 @@ def test_ci_runs_native_adapter_contract_on_all_supported_operating_systems():
     assert "ownership_journal" in workflow
     assert "python -m ruff check" in workflow
     assert "python -m build --no-isolation" in workflow
+    assert "setuptools>=77" in project["project"]["optional-dependencies"]["dev"]
 
 
 BUNDLE_FILES = (

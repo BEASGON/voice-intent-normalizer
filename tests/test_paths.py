@@ -70,6 +70,7 @@ def test_publish_file_no_replace_exact_preserves_boundary_replacement(
         )
     elif sys.platform.startswith("linux"):
         native = paths_module._rename_linux_directory_no_replace
+        injected = False
 
         def replace_at_native_boundary(
             source_parent,
@@ -77,8 +78,11 @@ def test_publish_file_no_replace_exact_preserves_boundary_replacement(
             destination_parent,
             destination_name,
         ):
-            source.rename(displaced)
-            source.write_bytes(b"replacement bytes")
+            nonlocal injected
+            if not injected:
+                source.rename(displaced)
+                source.write_bytes(b"replacement bytes")
+                injected = True
             native(
                 source_parent,
                 source_name,
@@ -93,6 +97,7 @@ def test_publish_file_no_replace_exact_preserves_boundary_replacement(
         )
     elif sys.platform == "darwin":
         native = paths_module._rename_darwin_directory_no_replace
+        injected = False
 
         def replace_at_native_boundary(
             source_parent,
@@ -100,8 +105,11 @@ def test_publish_file_no_replace_exact_preserves_boundary_replacement(
             destination_parent,
             destination_name,
         ):
-            source.rename(displaced)
-            source.write_bytes(b"replacement bytes")
+            nonlocal injected
+            if not injected:
+                source.rename(displaced)
+                source.write_bytes(b"replacement bytes")
+                injected = True
             native(
                 source_parent,
                 source_name,
@@ -171,25 +179,30 @@ def test_posix_exact_publication_rejects_raced_fifo_without_blocking(
         else:
             raise AssertionError("POSIX native test ran on an unsupported host")
 
+        injected = False
+
         def swap_destination_for_fifo(
             source_parent,
             source_name,
             destination_parent,
             destination_name,
         ):
+            global injected
             native(
                 source_parent,
                 source_name,
                 destination_parent,
                 destination_name,
             )
-            os.rename(
-                destination_name,
-                displaced.name,
-                src_dir_fd=destination_parent,
-                dst_dir_fd=destination_parent,
-            )
-            os.mkfifo(destination_name, dir_fd=destination_parent)
+            if not injected:
+                os.rename(
+                    destination_name,
+                    displaced.name,
+                    src_dir_fd=destination_parent,
+                    dst_dir_fd=destination_parent,
+                )
+                os.mkfifo(destination_name, dir_fd=destination_parent)
+                injected = True
 
         setattr(paths_module, attribute, swap_destination_for_fifo)
         try:

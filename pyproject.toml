@@ -18,6 +18,7 @@ dev = [
     "coverage>=7.6",
     "pytest>=8.3",
     "ruff>=0.6",
+    "setuptools>=77",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

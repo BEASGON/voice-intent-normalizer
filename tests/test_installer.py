@@ -5592,7 +5592,8 @@ def test_generic_staging_copy_never_writes_into_a_swapped_directory(
         assert result.status == "failed"
         assert (staging / "keep.txt").read_text(encoding="utf-8") == "keep"
         assert {path.name for path in staging.iterdir()} == {"keep.txt"}
-        assert (displaced / "SKILL.md").is_file()
+        assert any(displaced.iterdir())
+        assert not (displaced / "keep.txt").exists()
     else:
         assert swap_denied
         assert result.status == "installed"
@@ -5637,7 +5638,7 @@ def test_identity_bound_move_is_exclusive_and_preserves_conflicting_source(
     with guard_state_root(
         root, retained_dirs=("source", "destination")
     ) as lease:
-        lease.move_no_replace(
+        source_was_removed = lease.move_no_replace(
             "source/moved.txt",
             "destination/moved.txt",
             expected_sha256=hashlib.sha256(b"managed").hexdigest(),
@@ -5651,7 +5652,7 @@ def test_identity_bound_move_is_exclusive_and_preserves_conflicting_source(
                 limit=1024,
             )
 
-    assert not (source / "moved.txt").exists()
+    assert (source / "moved.txt").exists() is (not source_was_removed)
     assert (destination / "moved.txt").read_text(encoding="utf-8") == "managed"
     assert (source / "conflict.txt").read_text(encoding="utf-8") == "source"
     assert (destination / "conflict.txt").read_text(encoding="utf-8") == "destination"

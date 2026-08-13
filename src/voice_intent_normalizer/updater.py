@@ -159,6 +159,7 @@ def update_hotwords(
                     message="update check is not due",
                 )
 
+        validate_state_root(paths.root)
         manifest = _parse_manifest(
             _fetch_limited(fetcher, manifest_url, _MAX_MANIFEST_BYTES)
         )
