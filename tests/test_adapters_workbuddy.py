@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import zipfile
 from pathlib import Path
+
+import pytest
 
 from voice_intent_normalizer.adapters.base import (
     CapabilityLevel,
@@ -95,3 +98,43 @@ def test_workbuddy_uninstall_is_manual_and_preserves_shared_data(tmp_path: Path)
     assert result.status == "manual-action-required"
     assert result.capability is CapabilityLevel.MANUAL
     assert any("shared personal lexicon" in message for message in result.messages)
+
+
+def test_workbuddy_rejects_an_output_directory_below_an_aliased_parent(
+    tmp_path: Path,
+):
+    target = tmp_path / "outside"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory aliases are unavailable: {exc}")
+    adapter = _adapter(Path(__file__).resolve().parents[1])
+
+    result = adapter.install(InstallOptions(output_dir=alias / "packages"))
+
+    assert result.status == "failed"
+    assert not (target / "packages" / "voice-intent-normalizer-workbuddy.zip").exists()
+
+
+def test_workbuddy_archive_write_uses_retained_output_authority(
+    tmp_path: Path, monkeypatch
+):
+    from voice_intent_normalizer.adapters import workbuddy
+
+    adapter = _adapter(Path(__file__).resolve().parents[1])
+    calls: list[Path] = []
+    native_guard = workbuddy.guard_state_root
+
+    def guarded_output(root, **kwargs):
+        calls.append(Path(root))
+        return native_guard(root, **kwargs)
+
+    monkeypatch.setattr(workbuddy, "guard_state_root", guarded_output)
+
+    result = adapter.install(InstallOptions(output_dir=tmp_path))
+
+    assert result.status == "package-created"
+    assert calls == [tmp_path]
+    assert os.path.exists(tmp_path / "voice-intent-normalizer-workbuddy.zip")

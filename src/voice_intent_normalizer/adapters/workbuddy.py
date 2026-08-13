@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import stat
-import tempfile
+import io
 import zipfile
 from pathlib import Path
 
+from ..paths import guard_state_root
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
 from .generic_layout import generation_source_files
 
 _ARCHIVE = "voice-intent-normalizer-workbuddy.zip"
 _SIDECAR = f"{_ARCHIVE}.sha256"
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
-_WINDOWS_REPARSE_POINT = 0x400
 
 
 class WorkBuddyAdapter:
@@ -55,17 +53,23 @@ class WorkBuddyAdapter:
         try:
             output = self._output_dir(options)
             sources = generation_source_files(self.repository)
-            archive = output / _ARCHIVE
-            self._write_archive(archive, sources)
-            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            self._write_bytes_atomic(output / _SIDECAR, f"{digest}\n".encode("ascii"))
+            archive_bytes = self._archive_bytes(sources)
+            digest = hashlib.sha256(archive_bytes).hexdigest()
+            with guard_state_root(output, create=True) as lease:
+                if not lease.root_exists:
+                    raise ValueError("WorkBuddy output directory is unavailable")
+                lease.write_bytes_atomic(_ARCHIVE, archive_bytes)
+                lease.write_bytes_atomic(_SIDECAR, f"{digest}\n".encode("ascii"))
+                lease.fsync_directory()
+                archive = lease.root / _ARCHIVE
+                sidecar = lease.root / _SIDECAR
             self._confirmed = options.implicit_invocation_confirmed
             return AdapterResult(
                 self.platform,
                 "package-created",
                 CapabilityLevel.MANUAL,
                 self._instructions(),
-                (archive, output / _SIDECAR),
+                (archive, sidecar),
             )
         except (OSError, TypeError, ValueError, zipfile.BadZipFile):
             return self._failed("WorkBuddy package was not created")
@@ -89,40 +93,23 @@ class WorkBuddyAdapter:
             if options.output_dir is None
             else options.output_dir
         )
-        output = Path(output).absolute()
-        output.mkdir(parents=True, exist_ok=True)
-        info = output.lstat()
-        if not stat.S_ISDIR(info.st_mode) or self._is_alias(info):
-            raise ValueError("WorkBuddy output directory is unsafe")
-        return output
+        return Path(output).absolute()
 
-    def _write_archive(self, archive: Path, sources: dict[str, bytes]) -> None:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{archive.name}-", dir=archive.parent
-        )
-        os.close(descriptor)
-        try:
-            with zipfile.ZipFile(
-                temporary,
-                "w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=9,
-            ) as bundle:
-                for name, data in sorted(sources.items()):
-                    self._validate_archive_name(name)
-                    entry = zipfile.ZipInfo(name, _ZIP_TIMESTAMP)
-                    entry.compress_type = zipfile.ZIP_DEFLATED
-                    entry.external_attr = 0o100644 << 16
-                    bundle.writestr(
-                        entry, data, compress_type=zipfile.ZIP_DEFLATED
-                    )
-            os.replace(temporary, archive)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+    def _archive_bytes(self, sources: dict[str, bytes]) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            buffer,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as bundle:
+            for name, data in sorted(sources.items()):
+                self._validate_archive_name(name)
+                entry = zipfile.ZipInfo(name, _ZIP_TIMESTAMP)
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                entry.external_attr = 0o100644 << 16
+                bundle.writestr(entry, data, compress_type=zipfile.ZIP_DEFLATED)
+        return buffer.getvalue()
 
     @staticmethod
     def _validate_archive_name(name: str) -> None:
@@ -134,30 +121,6 @@ class WorkBuddyAdapter:
             or any(part in {"", ".", ".."} for part in parts)
         ):
             raise ValueError("WorkBuddy archive file name is unsafe")
-
-    @staticmethod
-    def _write_bytes_atomic(path: Path, data: bytes) -> None:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}-", dir=path.parent
-        )
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
-
-    @staticmethod
-    def _is_alias(info: os.stat_result) -> bool:
-        return stat.S_ISLNK(info.st_mode) or bool(
-            getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
-        )
 
     def _failed(self, message: str) -> AdapterResult:
         return AdapterResult(
