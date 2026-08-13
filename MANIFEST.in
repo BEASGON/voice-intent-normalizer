@@ -8,3 +8,4 @@ recursive-include references *.md
 include scripts/voice_intent.py
 include adapters/codex/AGENTS.snippet.md
 include adapters/codex/hooks.template.json
+include adapters/openclaw/README.zh-CN.md
