@@ -4872,6 +4872,23 @@ def test_doctor_rejects_invalid_ownership_journal_without_mutating_it(
     assert journal.read_bytes() == bad_journal
 
 
+def test_ownership_journal_native_first_install_completes_without_masking(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+):
+    """Exercise the native first-install path without public error masking."""
+    skill_root = tmp_path / "native-skills"
+    skill_root.mkdir()
+
+    generic_adapter._reset_operation()
+    with generic_adapter._state_operation(create=True):
+        result = generic_adapter._install_locked(
+            InstallOptions(output_dir=skill_root)
+        )
+
+    assert result.status == "installed"
+
+
 def test_versioned_strict_mode_fails_before_any_mutation(
     tmp_path: Path, generic_adapter: GenericAdapter
 ):

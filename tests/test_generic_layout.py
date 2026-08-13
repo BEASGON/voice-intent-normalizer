@@ -42,6 +42,13 @@ _PREVIOUS_GENERATION_ID = f"g-{'f' * 64}-{'d' * 32}"
 _TRANSACTION_ID = f"t-{'0' * 32}"
 
 
+def test_package_version_accepts_checkout_line_endings():
+    parse = generic_layout_module._package_version
+
+    assert parse(b'[project]\nversion = "1.2.3"\n') == "1.2.3"
+    assert parse(b'[project]\r\nversion = "1.2.3"\r\n') == "1.2.3"
+
+
 def _manifest() -> dict[str, object]:
     return {
         "format": 1,

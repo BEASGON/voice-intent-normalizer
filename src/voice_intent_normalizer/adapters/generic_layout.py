@@ -89,7 +89,7 @@ _GENERATION_FILES = (
     "src/voice_intent_normalizer/adapters/generic_contract.py",
     "src/voice_intent_normalizer/adapters/generic_layout.py",
 )
-_VERSION_PATTERN = re.compile(br'(?m)^version = "([^"\r\n]+)"$')
+_VERSION_PATTERN = re.compile(br'(?m)^version = "([^"\r\n]+)"\r?$')
 _TRANSACTION_ID_PATTERN = re.compile(r"t-[0-9a-f]{32}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 CAPSULE_PROTOCOL_VERSION = "1"

@@ -195,13 +195,9 @@ def test_posix_exact_publication_rejects_raced_fifo_without_blocking(
                 destination_name,
             )
             if not injected:
-                os.rename(
-                    destination_name,
-                    displaced.name,
-                    src_dir_fd=destination_parent,
-                    dst_dir_fd=destination_parent,
-                )
-                os.mkfifo(destination_name, dir_fd=destination_parent)
+                destination = root / destination_name
+                destination.rename(displaced)
+                os.mkfifo(destination)
                 injected = True
 
         setattr(paths_module, attribute, swap_destination_for_fifo)
