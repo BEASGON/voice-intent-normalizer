@@ -41,6 +41,25 @@ def test_ci_runs_native_adapter_contract_on_all_supported_operating_systems():
     assert "setuptools>=77" in project["project"]["optional-dependencies"]["dev"]
 
 
+def test_ci_combines_full_coverage_from_all_supported_operating_systems():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
+
+    assert "coverage:" in workflow
+    assert "needs: coverage" in workflow
+    assert "coverage-${{ matrix.os }}" in workflow
+    assert "actions/upload-artifact@v4" in workflow
+    assert "actions/download-artifact@v4" in workflow
+    assert "merge-multiple: true" in workflow
+    assert "python -m coverage combine" in workflow
+    assert "python -m coverage report --fail-under=90" in workflow
+    assert project["tool"]["coverage"]["run"] == {
+        "parallel": True,
+        "relative_files": True,
+        "source": ["voice_intent_normalizer"],
+    }
+
+
 BUNDLE_FILES = (
     "SKILL.md",
     "LICENSE",
@@ -54,6 +73,7 @@ BUNDLE_FILES = (
     "references/correction-policy.md",
     "references/domain-packs.md",
     "references/lexicon-schema.md",
+    "references/platform-compatibility.md",
     "scripts/voice_intent.py",
 )
 PYTHON_FILES = (
@@ -415,6 +435,7 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
         names = set(archive.getnames())
     assert any(name.endswith("adapters/codex/AGENTS.snippet.md") for name in names)
     assert any(name.endswith("adapters/codex/hooks.template.json") for name in names)
+    assert not any("/tests/" in name for name in names)
 
 
 @pytest.mark.parametrize(

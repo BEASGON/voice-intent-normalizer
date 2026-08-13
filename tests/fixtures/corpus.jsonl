@@ -1,0 +1,204 @@
+{"id":"apply-open-cloud-alpha","input":"please configure open cloud for alpha","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for alpha","risk":"low"}
+{"id":"apply-open-cloud-bravo","input":"please configure open cloud for bravo","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for bravo","risk":"low"}
+{"id":"apply-open-cloud-cider","input":"please configure open cloud for cider","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for cider","risk":"low"}
+{"id":"apply-open-cloud-delta","input":"please configure open cloud for delta","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for delta","risk":"low"}
+{"id":"apply-open-cloud-ember","input":"please configure open cloud for ember","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for ember","risk":"low"}
+{"id":"apply-open-cloud-fable","input":"please configure open cloud for fable","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for fable","risk":"low"}
+{"id":"apply-open-cloud-gamma","input":"please configure open cloud for gamma","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for gamma","risk":"low"}
+{"id":"apply-open-cloud-harbor","input":"please configure open cloud for harbor","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for harbor","risk":"low"}
+{"id":"apply-open-cloud-island","input":"please configure open cloud for island","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for island","risk":"low"}
+{"id":"apply-open-cloud-jungle","input":"please configure open cloud for jungle","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for jungle","risk":"low"}
+{"id":"apply-open-cloud-kernel","input":"please configure open cloud for kernel","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for kernel","risk":"low"}
+{"id":"apply-open-cloud-lumen","input":"please configure open cloud for lumen","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for lumen","risk":"low"}
+{"id":"apply-open-cloud-maple","input":"please configure open cloud for maple","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for maple","risk":"low"}
+{"id":"apply-open-cloud-native","input":"please configure open cloud for native","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for native","risk":"low"}
+{"id":"apply-open-cloud-ocean","input":"please configure open cloud for ocean","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for ocean","risk":"low"}
+{"id":"apply-open-cloud-piano","input":"please configure open cloud for piano","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for piano","risk":"low"}
+{"id":"apply-open-cloud-quartz","input":"please configure open cloud for quartz","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for quartz","risk":"low"}
+{"id":"apply-open-cloud-river","input":"please configure open cloud for river","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for river","risk":"low"}
+{"id":"apply-open-cloud-solar","input":"please configure open cloud for solar","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for solar","risk":"low"}
+{"id":"apply-open-cloud-tiger","input":"please configure open cloud for tiger","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for tiger","risk":"low"}
+{"id":"apply-open-cloud-ultra","input":"please configure open cloud for ultra","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for ultra","risk":"low"}
+{"id":"apply-open-cloud-velvet","input":"please configure open cloud for velvet","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for velvet","risk":"low"}
+{"id":"apply-open-cloud-winter","input":"please configure open cloud for winter","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for winter","risk":"low"}
+{"id":"apply-open-cloud-xenon","input":"please configure open cloud for xenon","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for xenon","risk":"low"}
+{"id":"apply-open-cloud-yellow","input":"please configure open cloud for yellow","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for yellow","risk":"low"}
+{"id":"apply-open-clow-alpha","input":"please configure open clow for alpha","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for alpha","risk":"low"}
+{"id":"apply-open-clow-bravo","input":"please configure open clow for bravo","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for bravo","risk":"low"}
+{"id":"apply-open-clow-cider","input":"please configure open clow for cider","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for cider","risk":"low"}
+{"id":"apply-open-clow-delta","input":"please configure open clow for delta","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for delta","risk":"low"}
+{"id":"apply-open-clow-ember","input":"please configure open clow for ember","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for ember","risk":"low"}
+{"id":"apply-open-clow-fable","input":"please configure open clow for fable","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for fable","risk":"low"}
+{"id":"apply-open-clow-gamma","input":"please configure open clow for gamma","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for gamma","risk":"low"}
+{"id":"apply-open-clow-harbor","input":"please configure open clow for harbor","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for harbor","risk":"low"}
+{"id":"apply-open-clow-island","input":"please configure open clow for island","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for island","risk":"low"}
+{"id":"apply-open-clow-jungle","input":"please configure open clow for jungle","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for jungle","risk":"low"}
+{"id":"apply-open-clow-kernel","input":"please configure open clow for kernel","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for kernel","risk":"low"}
+{"id":"apply-open-clow-lumen","input":"please configure open clow for lumen","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for lumen","risk":"low"}
+{"id":"apply-open-clow-maple","input":"please configure open clow for maple","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for maple","risk":"low"}
+{"id":"apply-open-clow-native","input":"please configure open clow for native","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for native","risk":"low"}
+{"id":"apply-open-clow-ocean","input":"please configure open clow for ocean","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for ocean","risk":"low"}
+{"id":"apply-open-clow-piano","input":"please configure open clow for piano","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for piano","risk":"low"}
+{"id":"apply-open-clow-quartz","input":"please configure open clow for quartz","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for quartz","risk":"low"}
+{"id":"apply-open-clow-river","input":"please configure open clow for river","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for river","risk":"low"}
+{"id":"apply-open-clow-solar","input":"please configure open clow for solar","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for solar","risk":"low"}
+{"id":"apply-open-clow-tiger","input":"please configure open clow for tiger","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for tiger","risk":"low"}
+{"id":"apply-open-clow-ultra","input":"please configure open clow for ultra","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for ultra","risk":"low"}
+{"id":"apply-open-clow-velvet","input":"please configure open clow for velvet","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for velvet","risk":"low"}
+{"id":"apply-open-clow-winter","input":"please configure open clow for winter","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for winter","risk":"low"}
+{"id":"apply-open-clow-xenon","input":"please configure open clow for xenon","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for xenon","risk":"low"}
+{"id":"apply-open-clow-yellow","input":"please configure open clow for yellow","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"please configure OpenClaw for yellow","risk":"low"}
+{"id":"apply-work-body-alpha","input":"open work body for alpha","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for alpha","risk":"low"}
+{"id":"apply-work-body-bravo","input":"open work body for bravo","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for bravo","risk":"low"}
+{"id":"apply-work-body-cider","input":"open work body for cider","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for cider","risk":"low"}
+{"id":"apply-work-body-delta","input":"open work body for delta","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for delta","risk":"low"}
+{"id":"apply-work-body-ember","input":"open work body for ember","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for ember","risk":"low"}
+{"id":"apply-work-body-fable","input":"open work body for fable","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for fable","risk":"low"}
+{"id":"apply-work-body-gamma","input":"open work body for gamma","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for gamma","risk":"low"}
+{"id":"apply-work-body-harbor","input":"open work body for harbor","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for harbor","risk":"low"}
+{"id":"apply-work-body-island","input":"open work body for island","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for island","risk":"low"}
+{"id":"apply-work-body-jungle","input":"open work body for jungle","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for jungle","risk":"low"}
+{"id":"apply-work-body-kernel","input":"open work body for kernel","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for kernel","risk":"low"}
+{"id":"apply-work-body-lumen","input":"open work body for lumen","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for lumen","risk":"low"}
+{"id":"apply-work-body-maple","input":"open work body for maple","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for maple","risk":"low"}
+{"id":"apply-work-body-native","input":"open work body for native","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for native","risk":"low"}
+{"id":"apply-work-body-ocean","input":"open work body for ocean","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for ocean","risk":"low"}
+{"id":"apply-work-body-piano","input":"open work body for piano","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for piano","risk":"low"}
+{"id":"apply-work-body-quartz","input":"open work body for quartz","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for quartz","risk":"low"}
+{"id":"apply-work-body-river","input":"open work body for river","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for river","risk":"low"}
+{"id":"apply-work-body-solar","input":"open work body for solar","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for solar","risk":"low"}
+{"id":"apply-work-body-tiger","input":"open work body for tiger","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for tiger","risk":"low"}
+{"id":"apply-work-body-ultra","input":"open work body for ultra","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for ultra","risk":"low"}
+{"id":"apply-work-body-velvet","input":"open work body for velvet","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for velvet","risk":"low"}
+{"id":"apply-work-body-winter","input":"open work body for winter","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for winter","risk":"low"}
+{"id":"apply-work-body-xenon","input":"open work body for xenon","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for xenon","risk":"low"}
+{"id":"apply-work-body-yellow","input":"open work body for yellow","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"open WorkBuddy for yellow","risk":"low"}
+{"id":"apply-code-x-alpha","input":"use code X for alpha","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for alpha","risk":"low"}
+{"id":"apply-code-x-bravo","input":"use code X for bravo","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for bravo","risk":"low"}
+{"id":"apply-code-x-cider","input":"use code X for cider","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for cider","risk":"low"}
+{"id":"apply-code-x-delta","input":"use code X for delta","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for delta","risk":"low"}
+{"id":"apply-code-x-ember","input":"use code X for ember","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for ember","risk":"low"}
+{"id":"apply-code-x-fable","input":"use code X for fable","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for fable","risk":"low"}
+{"id":"apply-code-x-gamma","input":"use code X for gamma","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for gamma","risk":"low"}
+{"id":"apply-code-x-harbor","input":"use code X for harbor","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for harbor","risk":"low"}
+{"id":"apply-code-x-island","input":"use code X for island","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for island","risk":"low"}
+{"id":"apply-code-x-jungle","input":"use code X for jungle","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for jungle","risk":"low"}
+{"id":"apply-code-x-kernel","input":"use code X for kernel","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for kernel","risk":"low"}
+{"id":"apply-code-x-lumen","input":"use code X for lumen","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for lumen","risk":"low"}
+{"id":"apply-code-x-maple","input":"use code X for maple","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for maple","risk":"low"}
+{"id":"apply-code-x-native","input":"use code X for native","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for native","risk":"low"}
+{"id":"apply-code-x-ocean","input":"use code X for ocean","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for ocean","risk":"low"}
+{"id":"apply-code-x-piano","input":"use code X for piano","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for piano","risk":"low"}
+{"id":"apply-code-x-quartz","input":"use code X for quartz","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for quartz","risk":"low"}
+{"id":"apply-code-x-river","input":"use code X for river","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for river","risk":"low"}
+{"id":"apply-code-x-solar","input":"use code X for solar","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for solar","risk":"low"}
+{"id":"apply-code-x-tiger","input":"use code X for tiger","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for tiger","risk":"low"}
+{"id":"apply-code-x-ultra","input":"use code X for ultra","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for ultra","risk":"low"}
+{"id":"apply-code-x-velvet","input":"use code X for velvet","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for velvet","risk":"low"}
+{"id":"apply-code-x-winter","input":"use code X for winter","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for winter","risk":"low"}
+{"id":"apply-code-x-xenon","input":"use code X for xenon","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for xenon","risk":"low"}
+{"id":"apply-code-x-yellow","input":"use code X for yellow","domains":["ai"],"project_terms":[],"expected_action":"apply","expected_text":"use Codex for yellow","risk":"low"}
+{"id":"keep-path-alpha","input":"read /tmp/nebula-file alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"read /tmp/nebula-file alpha","risk":"control"}
+{"id":"keep-path-bravo","input":"read /tmp/nebula-file bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"read /tmp/nebula-file bravo","risk":"control"}
+{"id":"keep-path-cider","input":"read /tmp/nebula-file cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"read /tmp/nebula-file cider","risk":"control"}
+{"id":"keep-path-delta","input":"read /tmp/nebula-file delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"read /tmp/nebula-file delta","risk":"control"}
+{"id":"keep-path-ember","input":"read /tmp/nebula-file ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"read /tmp/nebula-file ember","risk":"control"}
+{"id":"keep-command-alpha","input":"npm install nebula-package alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"npm install nebula-package alpha","risk":"control"}
+{"id":"keep-command-bravo","input":"npm install nebula-package bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"npm install nebula-package bravo","risk":"control"}
+{"id":"keep-command-cider","input":"npm install nebula-package cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"npm install nebula-package cider","risk":"control"}
+{"id":"keep-command-delta","input":"npm install nebula-package delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"npm install nebula-package delta","risk":"control"}
+{"id":"keep-command-ember","input":"npm install nebula-package ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"npm install nebula-package ember","risk":"control"}
+{"id":"keep-number-alpha","input":"build one hundred alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"build one hundred alpha","risk":"control"}
+{"id":"keep-number-bravo","input":"build one hundred bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"build one hundred bravo","risk":"control"}
+{"id":"keep-number-cider","input":"build one hundred cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"build one hundred cider","risk":"control"}
+{"id":"keep-number-delta","input":"build one hundred delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"build one hundred delta","risk":"control"}
+{"id":"keep-number-ember","input":"build one hundred ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"build one hundred ember","risk":"control"}
+{"id":"keep-date-alpha","input":"meeting on august fourteenth alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"meeting on august fourteenth alpha","risk":"control"}
+{"id":"keep-date-bravo","input":"meeting on august fourteenth bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"meeting on august fourteenth bravo","risk":"control"}
+{"id":"keep-date-cider","input":"meeting on august fourteenth cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"meeting on august fourteenth cider","risk":"control"}
+{"id":"keep-date-delta","input":"meeting on august fourteenth delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"meeting on august fourteenth delta","risk":"control"}
+{"id":"keep-date-ember","input":"meeting on august fourteenth ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"meeting on august fourteenth ember","risk":"control"}
+{"id":"keep-money-alpha","input":"budget five hundred dollars alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"budget five hundred dollars alpha","risk":"control"}
+{"id":"keep-money-bravo","input":"budget five hundred dollars bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"budget five hundred dollars bravo","risk":"control"}
+{"id":"keep-money-cider","input":"budget five hundred dollars cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"budget five hundred dollars cider","risk":"control"}
+{"id":"keep-money-delta","input":"budget five hundred dollars delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"budget five hundred dollars delta","risk":"control"}
+{"id":"keep-money-ember","input":"budget five hundred dollars ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"budget five hundred dollars ember","risk":"control"}
+{"id":"keep-delete-alpha","input":"delete old drafts alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"delete old drafts alpha","risk":"control"}
+{"id":"keep-delete-bravo","input":"delete old drafts bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"delete old drafts bravo","risk":"control"}
+{"id":"keep-delete-cider","input":"delete old drafts cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"delete old drafts cider","risk":"control"}
+{"id":"keep-delete-delta","input":"delete old drafts delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"delete old drafts delta","risk":"control"}
+{"id":"keep-delete-ember","input":"delete old drafts ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"delete old drafts ember","risk":"control"}
+{"id":"keep-publish-alpha","input":"publish the release alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"publish the release alpha","risk":"control"}
+{"id":"keep-publish-bravo","input":"publish the release bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"publish the release bravo","risk":"control"}
+{"id":"keep-publish-cider","input":"publish the release cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"publish the release cider","risk":"control"}
+{"id":"keep-publish-delta","input":"publish the release delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"publish the release delta","risk":"control"}
+{"id":"keep-publish-ember","input":"publish the release ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"publish the release ember","risk":"control"}
+{"id":"keep-deploy-alpha","input":"deploy staging alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"deploy staging alpha","risk":"control"}
+{"id":"keep-deploy-bravo","input":"deploy staging bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"deploy staging bravo","risk":"control"}
+{"id":"keep-deploy-cider","input":"deploy staging cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"deploy staging cider","risk":"control"}
+{"id":"keep-deploy-delta","input":"deploy staging delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"deploy staging delta","risk":"control"}
+{"id":"keep-deploy-ember","input":"deploy staging ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"deploy staging ember","risk":"control"}
+{"id":"keep-project-alpha","input":"nebula project notes alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"nebula project notes alpha","risk":"control"}
+{"id":"keep-project-bravo","input":"nebula project notes bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"nebula project notes bravo","risk":"control"}
+{"id":"keep-project-cider","input":"nebula project notes cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"nebula project notes cider","risk":"control"}
+{"id":"keep-project-delta","input":"nebula project notes delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"nebula project notes delta","risk":"control"}
+{"id":"keep-project-ember","input":"nebula project notes ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"nebula project notes ember","risk":"control"}
+{"id":"keep-mixed-alpha","input":"send api documentation alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"send api documentation alpha","risk":"control"}
+{"id":"keep-mixed-bravo","input":"send api documentation bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"send api documentation bravo","risk":"control"}
+{"id":"keep-mixed-cider","input":"send api documentation cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"send api documentation cider","risk":"control"}
+{"id":"keep-mixed-delta","input":"send api documentation delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"send api documentation delta","risk":"control"}
+{"id":"keep-mixed-ember","input":"send api documentation ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"send api documentation ember","risk":"control"}
+{"id":"keep-explicit-alpha","input":"remember alpha as Alpha alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"remember alpha as Alpha alpha","risk":"control"}
+{"id":"keep-explicit-bravo","input":"remember alpha as Alpha bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"remember alpha as Alpha bravo","risk":"control"}
+{"id":"keep-explicit-cider","input":"remember alpha as Alpha cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"remember alpha as Alpha cider","risk":"control"}
+{"id":"keep-explicit-delta","input":"remember alpha as Alpha delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"remember alpha as Alpha delta","risk":"control"}
+{"id":"keep-explicit-ember","input":"remember alpha as Alpha ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"remember alpha as Alpha ember","risk":"control"}
+{"id":"keep-ordinary-alpha","input":"lobster recipe alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"lobster recipe alpha","risk":"control"}
+{"id":"keep-ordinary-bravo","input":"lobster recipe bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"lobster recipe bravo","risk":"control"}
+{"id":"keep-ordinary-cider","input":"lobster recipe cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"lobster recipe cider","risk":"control"}
+{"id":"keep-ordinary-delta","input":"lobster recipe delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"lobster recipe delta","risk":"control"}
+{"id":"keep-ordinary-ember","input":"lobster recipe ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"lobster recipe ember","risk":"control"}
+{"id":"keep-git-alpha","input":"git push origin main alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"git push origin main alpha","risk":"control"}
+{"id":"keep-git-bravo","input":"git push origin main bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"git push origin main bravo","risk":"control"}
+{"id":"keep-git-cider","input":"git push origin main cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"git push origin main cider","risk":"control"}
+{"id":"keep-git-delta","input":"git push origin main delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"git push origin main delta","risk":"control"}
+{"id":"keep-git-ember","input":"git push origin main ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"git push origin main ember","risk":"control"}
+{"id":"keep-version-alpha","input":"release version one two three alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"release version one two three alpha","risk":"control"}
+{"id":"keep-version-bravo","input":"release version one two three bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"release version one two three bravo","risk":"control"}
+{"id":"keep-version-cider","input":"release version one two three cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"release version one two three cider","risk":"control"}
+{"id":"keep-version-delta","input":"release version one two three delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"release version one two three delta","risk":"control"}
+{"id":"keep-version-ember","input":"release version one two three ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"release version one two three ember","risk":"control"}
+{"id":"keep-percent-alpha","input":"growth ten percent alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"growth ten percent alpha","risk":"control"}
+{"id":"keep-percent-bravo","input":"growth ten percent bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"growth ten percent bravo","risk":"control"}
+{"id":"keep-percent-cider","input":"growth ten percent cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"growth ten percent cider","risk":"control"}
+{"id":"keep-percent-delta","input":"growth ten percent delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"growth ten percent delta","risk":"control"}
+{"id":"keep-percent-ember","input":"growth ten percent ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"growth ten percent ember","risk":"control"}
+{"id":"keep-plain-alpha","input":"discuss product experience alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"discuss product experience alpha","risk":"control"}
+{"id":"keep-plain-bravo","input":"discuss product experience bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"discuss product experience bravo","risk":"control"}
+{"id":"keep-plain-cider","input":"discuss product experience cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"discuss product experience cider","risk":"control"}
+{"id":"keep-plain-delta","input":"discuss product experience delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"discuss product experience delta","risk":"control"}
+{"id":"keep-plain-ember","input":"discuss product experience ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"discuss product experience ember","risk":"control"}
+{"id":"keep-upper-alpha","input":"open source notes alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"open source notes alpha","risk":"control"}
+{"id":"keep-upper-bravo","input":"open source notes bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"open source notes bravo","risk":"control"}
+{"id":"keep-upper-cider","input":"open source notes cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"open source notes cider","risk":"control"}
+{"id":"keep-upper-delta","input":"open source notes delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"open source notes delta","risk":"control"}
+{"id":"keep-upper-ember","input":"open source notes ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"open source notes ember","risk":"control"}
+{"id":"keep-lower-alpha","input":"normal sentence alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"normal sentence alpha","risk":"control"}
+{"id":"keep-lower-bravo","input":"normal sentence bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"normal sentence bravo","risk":"control"}
+{"id":"keep-lower-cider","input":"normal sentence cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"normal sentence cider","risk":"control"}
+{"id":"keep-lower-delta","input":"normal sentence delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"normal sentence delta","risk":"control"}
+{"id":"keep-lower-ember","input":"normal sentence ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"normal sentence ember","risk":"control"}
+{"id":"keep-spaces-alpha","input":"multiple words here alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"multiple words here alpha","risk":"control"}
+{"id":"keep-spaces-bravo","input":"multiple words here bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"multiple words here bravo","risk":"control"}
+{"id":"keep-spaces-cider","input":"multiple words here cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"multiple words here cider","risk":"control"}
+{"id":"keep-spaces-delta","input":"multiple words here delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"multiple words here delta","risk":"control"}
+{"id":"keep-spaces-ember","input":"multiple words here ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"multiple words here ember","risk":"control"}
+{"id":"keep-punctuation-alpha","input":"hello world alpha","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"hello world alpha","risk":"control"}
+{"id":"keep-punctuation-bravo","input":"hello world bravo","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"hello world bravo","risk":"control"}
+{"id":"keep-punctuation-cider","input":"hello world cider","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"hello world cider","risk":"control"}
+{"id":"keep-punctuation-delta","input":"hello world delta","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"hello world delta","risk":"control"}
+{"id":"keep-punctuation-ember","input":"hello world ember","domains":[],"project_terms":[],"expected_action":"keep","expected_text":"hello world ember","risk":"control"}
+{"id":"ask-delete-ambiguity","input":"\u5220\u9664 open cloud \u914d\u7f6e","domains":["ai"],"project_terms":[],"expected_action":"ask","expected_text":"\u5220\u9664 open cloud \u914d\u7f6e","risk":"high-ambiguity"}
+{"id":"ask-publish-ambiguity","input":"\u53d1\u5e03 open cloud \u6280\u80fd","domains":["ai"],"project_terms":[],"expected_action":"ask","expected_text":"\u53d1\u5e03 open cloud \u6280\u80fd","risk":"high-ambiguity"}
+{"id":"ask-deploy-ambiguity","input":"\u90e8\u7f72 work body \u670d\u52a1","domains":["ai"],"project_terms":[],"expected_action":"ask","expected_text":"\u90e8\u7f72 work body \u670d\u52a1","risk":"high-ambiguity"}
+{"id":"ask-command-ambiguity","input":"npm publish code x","domains":["ai"],"project_terms":[],"expected_action":"ask","expected_text":"npm publish code x","risk":"high-ambiguity"}

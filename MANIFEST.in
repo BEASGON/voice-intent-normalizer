@@ -10,3 +10,4 @@ include adapters/codex/AGENTS.snippet.md
 include adapters/codex/hooks.template.json
 include adapters/openclaw/README.zh-CN.md
 include adapters/workbuddy/README.zh-CN.md
+prune tests

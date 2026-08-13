@@ -1096,6 +1096,63 @@ def test_human_management_commands_explain_their_result(tmp_path):
     assert str(tmp_path) in stdout
 
 
+def test_default_installer_registers_every_supported_platform(tmp_path):
+    from voice_intent_normalizer import cli
+
+    installer = cli.default_installer(
+        cli.StatePaths(root=tmp_path / "voice-intent-state")
+    )
+
+    assert installer.platforms == ("codex", "openclaw", "workbuddy", "generic")
+
+
+def test_default_installer_reports_openclaw_unavailable_without_its_cli(
+    monkeypatch, tmp_path
+):
+    from voice_intent_normalizer import cli
+
+    monkeypatch.setattr(cli, "_runtime_repository", lambda: ROOT)
+    installer = cli.default_installer(
+        cli.StatePaths(root=tmp_path / "voice-intent-state")
+    )
+
+    result = installer.doctor(("openclaw",))[0]
+
+    assert result.status == "unavailable"
+
+
+def test_cli_install_and_doctor_support_workbuddy(tmp_path, monkeypatch):
+    from voice_intent_normalizer import cli
+
+    monkeypatch.setattr(cli, "_runtime_repository", lambda: ROOT)
+    service = SimpleNamespace(paths=cli.StatePaths(root=tmp_path / "state"))
+
+    code, stdout, stderr = run_cli(
+        [
+            "install",
+            "--platform",
+            "workbuddy",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--no-auto-update",
+            "--json",
+        ],
+        service,
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert json.loads(stdout)[0]["status"] == "package-created"
+
+    code, stdout, stderr = run_cli(
+        ["doctor", "--platform", "workbuddy", "--json"], service
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert json.loads(stdout)[0]["status"] == "manual-action-required"
+
+
 def test_human_scan_project_prints_a_concise_summary(tmp_path, monkeypatch):
     from voice_intent_normalizer import cli
 

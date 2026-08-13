@@ -15,9 +15,12 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .adapters.base import AdapterResult, InstallOptions, UninstallOptions
+from .adapters.codex import CodexAdapter
 from .adapters.generic import GenericAdapter
 from .adapters.generic_contract import canonical_json_bytes, validate_manifest
 from .adapters.generic_layout import generation_source_files
+from .adapters.openclaw import OpenClawAdapter
+from .adapters.workbuddy import WorkBuddyAdapter
 from .installer import Installer
 from .models import Candidate, CorrectionDecision, Scope
 from .paths import StatePaths, guard_project_root
@@ -101,11 +104,21 @@ def default_service() -> NormalizerService:
 
 
 def default_installer(paths: StatePaths | None = None) -> Installer:
-    """Return only adapters implemented by this build stage."""
+    """Return adapters whose public capabilities this build can verify."""
     repository = _runtime_repository()
     state = StatePaths.resolve() if paths is None else paths
     generic = GenericAdapter(repository, state)
-    return Installer({generic.platform: generic})
+    codex = CodexAdapter(repository, state)
+    openclaw = OpenClawAdapter(repository, state)
+    workbuddy = WorkBuddyAdapter(repository, state)
+    return Installer(
+        {
+            codex.platform: codex,
+            openclaw.platform: openclaw,
+            workbuddy.platform: workbuddy,
+            generic.platform: generic,
+        }
+    )
 
 
 def _runtime_repository() -> Path:

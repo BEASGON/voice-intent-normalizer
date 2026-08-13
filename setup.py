@@ -24,6 +24,7 @@ _BUNDLE_FILES = (
     "references/correction-policy.md",
     "references/domain-packs.md",
     "references/lexicon-schema.md",
+    "references/platform-compatibility.md",
     "scripts/voice_intent.py",
     "src/voice_intent_normalizer/__init__.py",
     "src/voice_intent_normalizer/cli.py",
