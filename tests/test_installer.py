@@ -3017,6 +3017,50 @@ def test_final_name_reappearance_before_cleanup_preserves_both_and_journal(
     assert layout.transaction.read_bytes() == journal_bytes
 
 
+def test_final_name_reappearance_at_retirement_preserves_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Recovery rechecks the public name after cleanup, before retirement."""
+    scenario = _materialize_journal_state(tmp_path, "initial-final")
+    layout = generic_layout_paths(scenario.state_paths)
+    final = layout.generations / scenario.candidate_id
+    stage = layout.staging / scenario.candidate_id
+    journal_bytes = layout.transaction.read_bytes()
+    original_read = StateRootLease.read_bytes
+    injected = False
+
+    def replace_after_journal_validation(lease, relative, limit, label):
+        nonlocal injected
+        data = original_read(lease, relative, limit, label)
+        if (
+            Path(relative) == Path("adapters/generic/transaction.json")
+            and not stage.exists()
+            and not final.exists()
+            and not injected
+        ):
+            final.mkdir()
+            (final / "replacement.txt").write_bytes(b"replacement")
+            injected = True
+        return data
+
+    monkeypatch.setattr(
+        StateRootLease,
+        "read_bytes",
+        replace_after_journal_validation,
+    )
+
+    result = GenericAdapter(scenario.repository, scenario.state_paths).doctor()
+
+    assert injected
+    assert result.status in {"failed", "degraded"}
+    assert not stage.exists()
+    assert (final / "replacement.txt").read_bytes() == b"replacement"
+    assert layout.transaction.read_bytes() == journal_bytes
+    assert not layout.status.exists()
+    assert not (scenario.skill_root / "voice-intent-normalizer").exists()
+
+
 @pytest.mark.parametrize(
     "fault",
     (

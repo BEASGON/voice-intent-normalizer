@@ -901,6 +901,10 @@ class GenericAdapter:
         )
         if current != journal_bytes:
             raise ValueError("adapter ownership journal changed during cleanup")
+        if lease.exists(final_relative):
+            raise StateRootBoundaryError(
+                "public final name replaced before journal retirement"
+            )
         self._remove_ownership_journal(missing_ok=False)
 
     def _validate_journal_status(
