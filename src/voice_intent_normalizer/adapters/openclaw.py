@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -152,17 +151,6 @@ class OpenClawAdapter:
                     CapabilityLevel.UNAVAILABLE,
                     ("shared personal and project data were preserved",),
                 )
-            if skill is not None and self._remove_verified_target(receipt, skill):
-                self._remove_receipt()
-                return AdapterResult(
-                    self.platform,
-                    "uninstalled",
-                    CapabilityLevel.UNAVAILABLE,
-                    (
-                        "OpenClaw has no official uninstall command; removed the "
-                        "verified managed target",
-                    ),
-                )
             return AdapterResult(
                 self.platform,
                 "not-installed" if skill is None else "degraded",
@@ -298,7 +286,7 @@ class OpenClawAdapter:
         while pending:
             directory = pending.pop()
             self._require_direct_directory(directory, "OpenClaw skill source")
-            for entry in os.scandir(directory):
+            for entry in sorted(os.scandir(directory), key=lambda item: item.name):
                 path = Path(entry.path)
                 if path == self.state_paths.root:
                     continue
@@ -408,19 +396,6 @@ class OpenClawAdapter:
         expected = "global" if options.workspace is None else "workspace"
         return receipt["scope"] == expected
 
-    def _remove_verified_target(
-        self, receipt: Mapping[str, object], skill: Mapping[str, object]
-    ) -> bool:
-        target = receipt.get("target")
-        if not isinstance(target, str) or target != self._skill_target(skill):
-            return False
-        path = Path(target)
-        self._require_direct_directory(path, "OpenClaw managed target")
-        if self._same_path(path, self.repository):
-            return False
-        self._remove_direct_tree(path)
-        return True
-
     @staticmethod
     def _write_bytes_atomic(path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -439,32 +414,6 @@ class OpenClawAdapter:
             except FileNotFoundError:
                 pass
             raise
-
-    @classmethod
-    def _remove_direct_tree(cls, root: Path) -> None:
-        cls._tree_bytes(root)
-        shutil.rmtree(root)
-
-    @classmethod
-    def _tree_bytes(cls, root: Path) -> dict[str, bytes]:
-        cls._require_direct_directory(root, "OpenClaw managed target")
-        result: dict[str, bytes] = {}
-        pending = [root]
-        while pending:
-            directory = pending.pop()
-            cls._require_direct_directory(directory, "OpenClaw managed target")
-            for entry in os.scandir(directory):
-                path = Path(entry.path)
-                info = path.lstat()
-                if cls._is_alias(info):
-                    raise ValueError("OpenClaw managed target contains an alias")
-                if stat.S_ISDIR(info.st_mode):
-                    pending.append(path)
-                elif stat.S_ISREG(info.st_mode):
-                    result[path.relative_to(root).as_posix()] = path.read_bytes()
-                else:
-                    raise ValueError("OpenClaw managed target contains an unsafe entry")
-        return result
 
     @staticmethod
     def _require_direct_directory(path: Path, label: str) -> None:

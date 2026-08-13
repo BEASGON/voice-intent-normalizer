@@ -164,3 +164,65 @@ def test_openclaw_upgrade_backs_up_the_previous_receipt(tmp_path: Path):
 
     assert result.status == "upgraded"
     assert (tmp_path / ".state" / "adapters" / "openclaw.json.bak").exists()
+
+
+def test_openclaw_source_digest_is_stable_when_directory_order_reverses(
+    tmp_path: Path, monkeypatch
+):
+    from voice_intent_normalizer.adapters import openclaw
+
+    adapter = _adapter(tmp_path, [], {})
+    (tmp_path / "a-skill-file").write_text("a", encoding="utf-8")
+    (tmp_path / "z-skill-file").write_text("z", encoding="utf-8")
+    original = adapter._source_digest(tmp_path)
+    native_scandir = openclaw.os.scandir
+
+    def reverse_scandir(path):
+        return iter(reversed(tuple(native_scandir(path))))
+
+    monkeypatch.setattr(openclaw.os, "scandir", reverse_scandir)
+
+    assert adapter._source_digest(tmp_path) == original
+
+
+def test_openclaw_manual_fallback_preserves_a_verified_target(tmp_path: Path):
+    calls: list[tuple[str, ...]] = []
+    check = ("openclaw", "skills", "check", "--json")
+    target = tmp_path / "foreign-target"
+    target.mkdir()
+    marker = target / "keep.txt"
+    marker.write_text("do not remove", encoding="utf-8")
+    adapter = _adapter(
+        tmp_path,
+        calls,
+        {
+            check: {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "skills": [
+                            {
+                                "name": "voice-intent-normalizer",
+                                "eligible": True,
+                                "path": str(target),
+                            }
+                        ]
+                    }
+                ),
+            }
+        },
+    )
+    adapter._write_receipt(
+        adapter._receipt_payload(
+            source=tmp_path,
+            source_digest=adapter._source_digest(tmp_path),
+            workspace=None,
+            target=str(target),
+        )
+    )
+
+    result = adapter.uninstall(UninstallOptions())
+
+    assert result.status == "degraded"
+    assert marker.read_text(encoding="utf-8") == "do not remove"
+    assert any("manual fallback" in message for message in result.messages)
