@@ -5,7 +5,7 @@
 命令和用户流程保持不变：
 
 ```powershell
-python scripts/voice_intent.py install --platform generic --output-dir <技能目录> --no-auto-update --json
+python scripts/voice_intent.py install --platform generic --output-dir <技能目录> --json
 python scripts/voice_intent.py doctor --platform generic --json
 python scripts/voice_intent.py uninstall --platform generic --output-dir <技能目录> --json
 ```

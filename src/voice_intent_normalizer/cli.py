@@ -86,9 +86,6 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--workspace")
         command.add_argument("--strict", action="store_true")
     install = commands.choices["install"]
-    install.add_argument(
-        "--auto-update", action=argparse.BooleanOptionalAction, default=None
-    )
     install.add_argument("--implicit-invocation-confirmed", action="store_true")
     commands.choices["uninstall"].add_argument(
         "--remove-shared-data", action="store_true"
@@ -479,7 +476,7 @@ def _dispatch(
                 strict=args.strict,
                 output_dir=None if args.output_dir is None else Path(args.output_dir),
                 workspace=None if args.workspace is None else Path(args.workspace),
-                auto_update=bool(args.auto_update),
+                auto_update=False,
                 implicit_invocation_confirmed=args.implicit_invocation_confirmed,
             ),
         )
@@ -629,8 +626,6 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.command in {"install", "uninstall"} and args.json:
         if not args.platform and not args.all_detected:
             raise _UsageError("--platform or --all-detected is required in JSON mode")
-    if args.command == "install" and args.json and args.auto_update is None:
-        raise _UsageError("--auto-update or --no-auto-update is required in JSON mode")
 
 
 def _complete_human_install_options(
@@ -642,11 +637,6 @@ def _complete_human_install_options(
     if not args.platform and not args.all_detected:
         values = ask("Platforms (comma-separated): ")
         args.platform = [value.strip() for value in values.split(",") if value.strip()]
-    if args.auto_update is None:
-        response = (
-            ask("Enable daily public hotword updates? [Y/n]: ").strip().casefold()
-        )
-        args.auto_update = response not in {"n", "no", "false", "0"}
 
 
 def _selected_platforms(

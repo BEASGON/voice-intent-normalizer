@@ -83,7 +83,20 @@ def _is_complete_direct_checkout(source: Path) -> bool:
 
 def _installed_generation_source(capsule: Path) -> Path:
     _require_direct_tree_path(capsule)
-    state_root = _canonical_state_root()
+    shared_state_root = _canonical_state_root()
+    candidates = (
+        shared_state_root,
+        shared_state_root / "adapters" / "codex-runtime",
+    )
+    for state_root in candidates:
+        try:
+            return _installed_generation_source_at(capsule, state_root)
+        except RuntimeError:
+            continue
+    raise RuntimeError("installed capsule is not anchored by adapter status")
+
+
+def _installed_generation_source_at(capsule: Path, state_root: Path) -> Path:
     status_path = state_root / "adapters" / "generic" / "status.json"
     _require_direct_tree_path(status_path.parent, trusted_root=state_root)
     status_bytes = _read_direct_file(status_path, "adapter status")

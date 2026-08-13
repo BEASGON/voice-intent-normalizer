@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from typing import Any
 
 from ..paths import StatePaths
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
+from .generic_layout import generation_source_files
 
 _NAME = "voice-intent-normalizer"
 _STATUS_FORMAT = 1
@@ -88,6 +90,7 @@ class OpenClawAdapter:
                 and receipt["source"] == os.fspath(source)
                 and previous_digest == source_digest
                 and self._scope_matches(receipt, options)
+                and self._receipt_matches_skill(receipt, previous)
             ):
                 return AdapterResult(
                     self.platform,
@@ -137,6 +140,13 @@ class OpenClawAdapter:
                     ("manual fallback: no verified managed OpenClaw target",),
                 )
             skill = self._checked_skill()
+            if skill is None or not self._receipt_matches_skill(receipt, skill):
+                return AdapterResult(
+                    self.platform,
+                    "degraded",
+                    CapabilityLevel.UNAVAILABLE,
+                    ("manual fallback: current OpenClaw target is not owned",),
+                )
             if self._uninstall_is_available():
                 self._require_success(
                     ("openclaw", "skills", "uninstall", _NAME),
@@ -268,8 +278,33 @@ class OpenClawAdapter:
         raise ValueError(f"invalid JSON constant: {value}")
 
     def _source(self) -> Path:
-        source = self.repository
-        self._require_direct_directory(source, "OpenClaw skill source")
+        expected = generation_source_files(self.repository)
+        identity = hashlib.sha256()
+        for relative, data in expected.items():
+            identity.update(relative.encode("utf-8") + b"\0" + data)
+        source = (
+            self.state_paths.root
+            / "adapters"
+            / "openclaw-sources"
+            / identity.hexdigest()
+        )
+        source.parent.mkdir(parents=True, exist_ok=True)
+        if source.exists():
+            if self._tree_bytes(source) == expected:
+                return source
+            raise ValueError("existing OpenClaw source is not managed")
+        staging = Path(tempfile.mkdtemp(prefix=".openclaw-source-", dir=source.parent))
+        try:
+            for relative, data in expected.items():
+                destination = staging / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            if self._tree_bytes(staging) != expected:
+                raise ValueError("prepared OpenClaw source is incomplete")
+            os.replace(staging, source)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         codex_home = os.environ.get("CODEX_HOME", "").strip()
         protected = (
             Path(codex_home) if codex_home else Path.home() / ".codex"
@@ -277,6 +312,38 @@ class OpenClawAdapter:
         if self._same_path(source, protected):
             raise ValueError("Codex native skills directory is not an OpenClaw root")
         return source
+
+    def _tree_bytes(self, root: Path) -> dict[str, bytes]:
+        self._require_direct_directory(root, "OpenClaw skill source")
+        result: dict[str, bytes] = {}
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            self._require_direct_directory(directory, "OpenClaw skill source")
+            for entry in os.scandir(directory):
+                path = Path(entry.path)
+                info = path.lstat()
+                if self._is_alias(info):
+                    raise ValueError("OpenClaw skill source contains an alias")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
+                elif stat.S_ISREG(info.st_mode):
+                    result[path.relative_to(root).as_posix()] = path.read_bytes()
+                else:
+                    raise ValueError("OpenClaw skill source contains an unsafe entry")
+        return result
+
+    @staticmethod
+    def _receipt_matches_skill(
+        receipt: Mapping[str, object], skill: Mapping[str, object]
+    ) -> bool:
+        expected = receipt.get("target")
+        observed = OpenClawAdapter._skill_target(skill)
+        if not isinstance(expected, str) or not isinstance(observed, str):
+            return False
+        return os.path.normcase(os.path.abspath(expected)) == os.path.normcase(
+            os.path.abspath(observed)
+        )
 
     def _source_digest(self, source: Path) -> str:
         digest = hashlib.sha256()

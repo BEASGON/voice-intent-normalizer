@@ -25,12 +25,10 @@ will interpret the submitted text; it never claims the text itself changed.
 2. Install for a supported host, choosing exactly one platform:
 
    ```powershell
-   python scripts/voice_intent.py install --platform codex --no-auto-update --json
+   python scripts/voice_intent.py install --platform codex --json
    ```
 
-3. Run `doctor` for that platform and follow any returned instructions. Use
-   `--no-auto-update` unless you deliberately want verified public hotword
-   updates.
+3. Run `doctor` for that platform and follow any returned instructions.
 
 ## Platform compatibility
 
@@ -80,10 +78,8 @@ allowlist.
 
 ## Hotword updates
 
-Built-in hotwords are available offline. Optional updates are fetched only from
-the configured HTTPS endpoint and require the updater's checksum and signature
-validation before publication. Disable automatic updates with
-`--no-auto-update`.
+Built-in hotwords are available offline. Version 0.1.0 does not enable network
+hotword updates; update snapshots arrive only in reviewed project releases.
 
 ## Troubleshooting
 

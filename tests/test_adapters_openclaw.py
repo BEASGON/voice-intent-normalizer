@@ -8,6 +8,8 @@ from pathlib import Path
 from voice_intent_normalizer.adapters.base import InstallOptions, UninstallOptions
 from voice_intent_normalizer.paths import StatePaths
 
+ROOT = Path(__file__).parents[1]
+
 
 def _adapter(
     tmp_path: Path,
@@ -23,22 +25,13 @@ def _adapter(
             raise value
         return value if value is not None else {"returncode": 0, "stdout": ""}
 
-    return OpenClawAdapter(tmp_path, StatePaths(root=tmp_path / ".state"), run=run)
+    return OpenClawAdapter(ROOT, StatePaths(root=tmp_path / ".state"), run=run)
 
 
 def test_openclaw_install_uses_argument_array_global_and_eligible_check(
     tmp_path: Path,
 ):
     calls: list[tuple[str, ...]] = []
-    install = (
-        "openclaw",
-        "skills",
-        "install",
-        str(tmp_path),
-        "--as",
-        "voice-intent-normalizer",
-        "--global",
-    )
     check = ("openclaw", "skills", "check", "--json")
     adapter = _adapter(
         tmp_path,
@@ -56,7 +49,15 @@ def test_openclaw_install_uses_argument_array_global_and_eligible_check(
     result = adapter.install(InstallOptions())
 
     assert result.status == "installed"
-    assert calls == [install, check]
+    assert calls[-1] == check
+    install = calls[0]
+    assert install[:3] == ("openclaw", "skills", "install")
+    assert install[4:] == ("--as", "voice-intent-normalizer", "--global")
+    source = Path(install[3])
+    assert source != tmp_path
+    assert source.is_relative_to(tmp_path / ".state")
+    assert not (source / "tests").exists()
+    assert (source / "SKILL.md").is_file()
 
 
 def test_openclaw_workspace_install_omits_global(tmp_path: Path):
@@ -136,7 +137,17 @@ def test_openclaw_reinstall_is_idempotent_after_eligible_verification(
     check = ("openclaw", "skills", "check", "--json")
     response = {
         "returncode": 0,
-        "stdout": '{"skills":[{"name":"voice-intent-normalizer","eligible":true}]}',
+        "stdout": json.dumps(
+            {
+                "skills": [
+                    {
+                        "name": "voice-intent-normalizer",
+                        "eligible": True,
+                        "path": str(tmp_path / "managed"),
+                    }
+                ]
+            }
+        ),
     }
     adapter = _adapter(tmp_path, calls, {check: response})
 
@@ -157,8 +168,10 @@ def test_openclaw_upgrade_backs_up_the_previous_receipt(tmp_path: Path):
     }
     adapter = _adapter(tmp_path, calls, {check: eligible})
     adapter.install(InstallOptions())
-    source = tmp_path / "new-skill-file"
-    source.write_text("new", encoding="utf-8")
+    receipt = adapter._receipt_path()
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["source_digest"] = "0" * 64
+    adapter._write_receipt(payload)
 
     result = adapter.install(InstallOptions())
 
@@ -226,3 +239,105 @@ def test_openclaw_manual_fallback_preserves_a_verified_target(tmp_path: Path):
     assert result.status == "degraded"
     assert marker.read_text(encoding="utf-8") == "do not remove"
     assert any("manual fallback" in message for message in result.messages)
+
+
+def test_openclaw_official_uninstall_preserves_a_replaced_target(tmp_path: Path):
+    calls: list[tuple[str, ...]] = []
+    check = ("openclaw", "skills", "check", "--json")
+    original = tmp_path / "managed-target"
+    replacement = tmp_path / "replacement-target"
+    adapter = _adapter(
+        tmp_path,
+        calls,
+        {
+            check: {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "skills": [
+                            {
+                                "name": "voice-intent-normalizer",
+                                "eligible": True,
+                                "path": str(replacement),
+                            }
+                        ]
+                    }
+                ),
+            },
+            ("openclaw", "skills", "--help"): {
+                "returncode": 0,
+                "stdout": "install uninstall check",
+            },
+        },
+    )
+    adapter._write_receipt(
+        adapter._receipt_payload(
+            source=tmp_path,
+            source_digest=adapter._source_digest(tmp_path),
+            workspace=None,
+            target=str(original),
+        )
+    )
+
+    result = adapter.uninstall(UninstallOptions())
+
+    assert result.status == "degraded"
+    assert ("openclaw", "skills", "uninstall", "voice-intent-normalizer") not in calls
+
+
+def test_openclaw_official_uninstall_requires_a_current_owned_target(tmp_path: Path):
+    calls: list[tuple[str, ...]] = []
+    check = ("openclaw", "skills", "check", "--json")
+    adapter = _adapter(
+        tmp_path,
+        calls,
+        {
+            check: {"returncode": 0, "stdout": json.dumps({"skills": []})},
+            ("openclaw", "skills", "--help"): {
+                "returncode": 0,
+                "stdout": "install uninstall check",
+            },
+        },
+    )
+    adapter._write_receipt(
+        adapter._receipt_payload(
+            source=tmp_path,
+            source_digest=adapter._source_digest(tmp_path),
+            workspace=None,
+            target=str(tmp_path / "old-target"),
+        )
+    )
+
+    result = adapter.uninstall(UninstallOptions())
+
+    assert result.status == "degraded"
+    assert ("openclaw", "skills", "uninstall", "voice-intent-normalizer") not in calls
+
+
+def test_openclaw_idempotence_requires_the_current_owned_target(tmp_path: Path):
+    calls: list[tuple[str, ...]] = []
+    check = ("openclaw", "skills", "check", "--json")
+    current = {
+        "name": "voice-intent-normalizer",
+        "path": str(tmp_path / "managed"),
+        "eligible": True,
+    }
+    responses = {
+        check: {"returncode": 0, "stdout": json.dumps({"skills": [current]})}
+    }
+    adapter = _adapter(
+        tmp_path,
+        calls,
+        responses,
+    )
+    assert adapter.install(InstallOptions()).status == "installed"
+    current["path"] = str(tmp_path / "foreign")
+    responses[check] = {
+        "returncode": 0,
+        "stdout": json.dumps({"skills": [current]}),
+    }
+
+    result = adapter.install(InstallOptions())
+
+    assert result.status == "upgraded"
+    assert sum(call[:3] == ("openclaw", "skills", "install") for call in calls) == 2

@@ -6,7 +6,7 @@ Agent 理解已经提交的中文语音转写文本；它不会修改宿主输�
 默认使用全局范围：
 
 ```powershell
-python scripts/voice_intent.py install --platform openclaw --no-auto-update --json
+python scripts/voice_intent.py install --platform openclaw --json
 ```
 
 传入 `--workspace <工作区目录>` 时，安装仅使用该工作区范围，适合不希望影响同机

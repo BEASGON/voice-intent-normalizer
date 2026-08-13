@@ -12,7 +12,7 @@ from typing import Any
 
 from ..paths import StatePaths
 from .base import AdapterResult, CapabilityLevel, InstallOptions, UninstallOptions
-from .generic_layout import capsule_source_files
+from .generic import GenericAdapter
 
 _NAME = "voice-intent-normalizer"
 _BEGIN = "<!-- VOICE-INTENT-NORMALIZER:BEGIN -->"
@@ -57,8 +57,15 @@ class CodexAdapter:
             skill.parent.mkdir(exist_ok=True)
             self._require_direct_directory(skill.parent, "Codex skills directory")
             changed: list[Path] = []
-            if not self._ensure_skill(skill):
-                changed.append(skill)
+            runtime = self._runtime().install(
+                InstallOptions(
+                    output_dir=skill.parent,
+                    auto_update=options.auto_update,
+                )
+            )
+            if runtime.status not in {"installed", "upgraded", "already-installed"}:
+                raise ValueError("Codex runtime installation failed")
+            changed.extend(runtime.changed_paths)
             if self._ensure_agents_block(agents):
                 changed.append(agents)
             if options.strict:
@@ -88,7 +95,12 @@ class CodexAdapter:
                 return AdapterResult(
                     self.platform, "not-installed", CapabilityLevel.UNAVAILABLE
                 )
-            installed = skill.is_dir() and self._has_agents_block(agents)
+            runtime = self._runtime().doctor()
+            installed = (
+                skill.is_dir()
+                and self._has_agents_block(agents)
+                and runtime.status in {"installed", "already-installed"}
+            )
             strict = self._has_hook(home / "hooks.json")
             if not installed:
                 return AdapterResult(
@@ -124,16 +136,19 @@ class CodexAdapter:
         try:
             home = self._codex_home()
             changed: list[Path] = []
+            skill = home / "skills" / _NAME
+            runtime = self._runtime().uninstall(
+                UninstallOptions(output_dir=skill.parent)
+            )
+            if runtime.status not in {"uninstalled", "not-installed"}:
+                raise ValueError("Codex runtime ownership could not be verified")
+            changed.extend(runtime.changed_paths)
             agents = home / "AGENTS.md"
             if self._remove_agents_block(agents):
                 changed.append(agents)
             hooks = home / "hooks.json"
             if self._remove_hook(hooks, home / "skills" / _NAME):
                 changed.append(hooks)
-            skill = home / "skills" / _NAME
-            if skill.exists():
-                self._remove_direct_tree(skill)
-                changed.append(skill)
             return AdapterResult(
                 self.platform,
                 "uninstalled" if changed else "not-installed",
@@ -150,28 +165,11 @@ class CodexAdapter:
         configured = os.environ.get("CODEX_HOME", "").strip()
         return (Path(configured) if configured else Path.home() / ".codex").expanduser()
 
-    def _ensure_skill(self, destination: Path) -> bool:
-        sources = capsule_source_files(self.repository)
-        if destination.exists():
-            if not destination.is_dir():
-                raise ValueError("Codex skill destination is not a directory")
-            if self._tree_bytes(destination) != sources:
-                raise ValueError("existing Codex skill is not this managed capsule")
-            return True
-        staging = Path(tempfile.mkdtemp(prefix=f".{_NAME}-", dir=destination.parent))
-        try:
-            for relative, data in sources.items():
-                path = staging / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-            if self._tree_bytes(staging) != sources:
-                raise ValueError("prepared Codex skill does not match capsule")
-            os.replace(staging, destination)
-        except Exception:
-            if staging.exists():
-                self._remove_direct_tree(staging)
-            raise
-        return False
+    def _runtime(self) -> GenericAdapter:
+        isolated = StatePaths(
+            root=self.state_paths.root / "adapters" / "codex-runtime"
+        )
+        return GenericAdapter(self.repository, isolated)
 
     def _ensure_agents_block(self, path: Path) -> bool:
         source = self._read_optional_text(path)
@@ -312,7 +310,7 @@ class CodexAdapter:
             elif agents.exists() and agents.read_bytes() != agents_before:
                 self._write_bytes_atomic(agents, agents_before)
             if not skill_existed and skill.exists():
-                self._remove_direct_tree(skill)
+                self._runtime().uninstall(UninstallOptions(output_dir=skill.parent))
             if not skills_existed and skill.parent.exists() and not any(
                 skill.parent.iterdir()
             ):

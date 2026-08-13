@@ -4,8 +4,8 @@
 
 - **Project scan exclusions:** scanning is limited to an active direct project
   root and excludes private state, aliases, and unsafe paths.
-- **Update validation:** public hotword updates require HTTPS, checksum, and
-  signature validation before they replace local data.
+- **Update validation:** version 0.1.0 does not enable network hotword updates;
+  reviewed release snapshots are the only shipped update channel.
 - **Hook trust:** host hooks invoke the installed, owned skill path and fail
   open if the local normalization contract is unavailable or invalid.
 - **Permissions:** adapters use only documented platform capabilities. They do

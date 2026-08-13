@@ -1134,7 +1134,6 @@ def test_cli_install_and_doctor_support_workbuddy(tmp_path, monkeypatch):
             "workbuddy",
             "--output-dir",
             str(tmp_path / "output"),
-            "--no-auto-update",
             "--json",
         ],
         service,
@@ -1151,6 +1150,17 @@ def test_cli_install_and_doctor_support_workbuddy(tmp_path, monkeypatch):
     assert code == 0
     assert stderr == ""
     assert json.loads(stdout)[0]["status"] == "manual-action-required"
+
+
+def test_release_cli_does_not_advertise_unconfigured_auto_update(capsys):
+    from voice_intent_normalizer import cli
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["install", "--help"])
+    assert exited.value.code == 0
+    output = capsys.readouterr().out
+    assert "--auto-update" not in output
+    assert "--no-auto-update" not in output
 
 
 def test_human_scan_project_prints_a_concise_summary(tmp_path, monkeypatch):

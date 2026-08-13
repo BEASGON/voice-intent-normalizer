@@ -52,8 +52,8 @@ def test_ci_combines_full_coverage_from_all_supported_operating_systems():
     assert "path: .coverage*" in workflow
     assert "include-hidden-files: true" in workflow
     assert "actions/download-artifact@v4" in workflow
-    assert "merge-multiple: true" in workflow
-    assert "python -m coverage combine" in workflow
+    assert "COVERAGE_FILE: .coverage.${{ matrix.os }}" in workflow
+    assert "scripts/combine_coverage.py" in workflow
     assert "python -m coverage report --fail-under=90" in workflow
     assert project["tool"]["coverage"]["run"] == {
         "parallel": True,

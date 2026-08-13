@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from voice_intent_normalizer.adapters.base import InstallOptions, UninstallOptions
@@ -235,3 +239,87 @@ def test_codex_doctor_requires_manual_hook_trust(tmp_path: Path, monkeypatch):
     assert result.capability.value == "automatic"
     assert any("/hooks" in message for message in result.messages)
     assert all("dangerously-bypass" not in message for message in result.messages)
+
+
+def test_codex_strict_install_executes_its_hook_from_a_clean_home(
+    tmp_path: Path, monkeypatch
+):
+    adapter, codex_home = _adapter(tmp_path, monkeypatch)
+
+    result = adapter.install(InstallOptions(strict=True))
+    hook = (
+        codex_home
+        / "skills"
+        / "voice-intent-normalizer"
+        / "scripts"
+        / "voice_intent.py"
+    )
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "VOICE_INTENT_HOME": str(tmp_path / ".voice-intent-normalizer"),
+    }
+    if os.name == "nt" and "SYSTEMROOT" in os.environ:
+        environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+    completed = subprocess.run(
+        [sys.executable, "-I", str(hook), "hook"],
+        input=json.dumps(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "配置 open cloud",
+            }
+        ),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env=environment,
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.status == "installed"
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {}
+
+
+def test_codex_uninstall_preserves_a_foreign_same_name_skill(
+    tmp_path: Path, monkeypatch
+):
+    adapter, codex_home = _adapter(tmp_path, monkeypatch)
+    assert adapter.install(InstallOptions()).status == "installed"
+    skill = codex_home / "skills" / "voice-intent-normalizer"
+    shutil.rmtree(skill)
+    skill.mkdir()
+    foreign = skill / "foreign.txt"
+    foreign.write_text("preserve", encoding="utf-8")
+
+    result = adapter.uninstall(UninstallOptions())
+
+    assert result.status == "failed"
+    assert foreign.read_text(encoding="utf-8") == "preserve"
+
+
+def test_codex_and_generic_runtime_state_are_isolated(tmp_path: Path, monkeypatch):
+    from voice_intent_normalizer.adapters.generic import GenericAdapter
+
+    adapter, _ = _adapter(tmp_path, monkeypatch)
+    state = adapter.state_paths
+    generic_root = tmp_path / "portable-skills"
+    generic_root.mkdir()
+
+    generic = GenericAdapter(Path(__file__).parents[1], state)
+    result = generic.install(InstallOptions(output_dir=generic_root))
+    assert result.status == "installed"
+    assert adapter.install(InstallOptions()).status == "installed"
+    assert generic.doctor().status == "installed"
+    assert adapter.doctor().status == "installed"
+    assert (state.root / "adapters" / "generic" / "status.json").is_file()
+    assert (
+        state.root
+        / "adapters"
+        / "codex-runtime"
+        / "adapters"
+        / "generic"
+        / "status.json"
+    ).is_file()

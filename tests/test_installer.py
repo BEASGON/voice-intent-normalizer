@@ -5204,7 +5204,6 @@ def test_cli_install_forwards_repeated_platforms_to_injected_installer():
             "generic",
             "--platform",
             "other",
-            "--no-auto-update",
             "--json",
         ],
         stdout=stdout,

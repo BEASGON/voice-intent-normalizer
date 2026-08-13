@@ -48,6 +48,21 @@ def test_security_and_compatibility_document_required_safety_boundaries():
         assert level in compatibility
 
 
+def test_v010_docs_do_not_claim_unconfigured_online_hotword_updates():
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            ROOT / "README.md",
+            ROOT / "SECURITY.md",
+            ROOT / "adapters" / "generic" / "README.zh-CN.md",
+            ROOT / "adapters" / "openclaw" / "README.zh-CN.md",
+        )
+    )
+    assert "--auto-update" not in combined
+    assert "--no-auto-update" not in combined
+    assert "signature validation" not in combined
+
+
 def test_release_sources_exclude_private_state_and_validate_jsonl():
     forbidden = (
         ".env",
@@ -143,7 +158,6 @@ def test_release_cli_smokes_clean_platform_homes_and_normalization(tmp_path):
         "install",
         "--platform",
         "codex",
-        "--no-auto-update",
         "--json",
     )[0]
     codex_doctor = invoke("doctor", "--platform", "codex", "--json")[0]
@@ -154,7 +168,6 @@ def test_release_cli_smokes_clean_platform_homes_and_normalization(tmp_path):
         "workbuddy",
         "--output-dir",
         str(tmp_path / "workbuddy-output"),
-        "--no-auto-update",
         "--json",
     )[0]
 
