@@ -49,6 +49,7 @@ def test_ci_combines_full_coverage_from_all_supported_operating_systems():
     assert "needs: coverage" in workflow
     assert "coverage-${{ matrix.os }}" in workflow
     assert "actions/upload-artifact@v4" in workflow
+    assert "path: .coverage*" in workflow
     assert "include-hidden-files: true" in workflow
     assert "actions/download-artifact@v4" in workflow
     assert "merge-multiple: true" in workflow
