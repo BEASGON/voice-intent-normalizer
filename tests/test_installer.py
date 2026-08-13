@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -4887,6 +4888,49 @@ def test_ownership_journal_native_first_install_completes_without_masking(
         )
 
     assert result.status == "installed"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX temporary-root alias")
+def test_generation_smoke_canonicalizes_temporary_root_alias(
+    generic_adapter: GenericAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Never serialize a system temporary-directory alias into smoke status."""
+    from contextlib import contextmanager
+
+    real = tmp_path / "real-smoke"
+    real.mkdir()
+    alias = tmp_path / "alias-smoke"
+    alias.symlink_to(real, target_is_directory=True)
+    artifacts = generic_adapter._prepare_versioned_artifacts("8" * 32)
+    observed: list[Path] = []
+
+    @contextmanager
+    def aliased_temporary_directory(*_args, **_kwargs):
+        yield os.fspath(alias)
+
+    def successful_capsule(_capsule, state, _working):
+        observed.append(state)
+        return subprocess.CompletedProcess(
+            (),
+            0,
+            stdout=json.dumps(
+                {
+                    "status": "ok",
+                    "state_root": os.fspath(state),
+                    "diagnostics": [],
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", aliased_temporary_directory)
+    monkeypatch.setattr(generic_adapter, "_run_capsule", successful_capsule)
+
+    generic_adapter._smoke_generation(artifacts.capsule, artifacts.generation)
+
+    assert observed == [real.resolve(strict=True) / "state"]
 
 
 def test_versioned_strict_mode_fails_before_any_mutation(

@@ -19,6 +19,8 @@ from ..paths import (
     StatePaths,
     StateRootBoundaryError,
     StateRootLease,
+    _plain_windows_handle_path,
+    _windows_final_path,
     guard_state_root,
     validate_state_root,
 )
@@ -2649,7 +2651,16 @@ class GenericAdapter:
         if "name: voice-intent-normalizer" not in skill_metadata:
             raise ValueError("prepared capsule metadata is invalid")
         with tempfile.TemporaryDirectory(prefix="voice-intent-smoke-") as sandbox:
-            sandbox_root = Path(sandbox)
+            sandbox_path = Path(sandbox)
+            sandbox_root = (
+                Path(
+                    _plain_windows_handle_path(
+                        os.fspath(_windows_final_path(sandbox_path))
+                    )
+                )
+                if os.name == "nt"
+                else sandbox_path.resolve(strict=True)
+            )
             state = sandbox_root / "state"
             capsule_root = sandbox_root / "skills" / _NAME
             generation_root = (
