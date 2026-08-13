@@ -72,6 +72,7 @@ PYTHON_FILES = (
     "src/voice_intent_normalizer/updater.py",
     "src/voice_intent_normalizer/adapters/__init__.py",
     "src/voice_intent_normalizer/adapters/base.py",
+    "src/voice_intent_normalizer/adapters/codex.py",
     "src/voice_intent_normalizer/adapters/generic.py",
     "src/voice_intent_normalizer/adapters/generic_contract.py",
     "src/voice_intent_normalizer/adapters/generic_layout.py",
@@ -407,6 +408,11 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
             for name in names
         )
     _assert_sdist_runtime_inventory(sdist)
+
+    with tarfile.open(sdist, "r:gz") as archive:
+        names = set(archive.getnames())
+    assert any(name.endswith("adapters/codex/AGENTS.snippet.md") for name in names)
+    assert any(name.endswith("adapters/codex/hooks.template.json") for name in names)
 
 
 @pytest.mark.parametrize(
