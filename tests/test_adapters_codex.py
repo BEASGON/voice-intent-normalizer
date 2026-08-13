@@ -99,6 +99,35 @@ def test_codex_rejects_duplicate_hook_keys_without_mutating_them(
 
     assert result.status == "failed"
     assert hooks_path.read_text(encoding="utf-8") == original
+    assert not (codex_home / "AGENTS.md").exists()
+    assert not (codex_home / "skills" / "voice-intent-normalizer").exists()
+
+
+def test_codex_strict_hook_write_failure_rolls_back_new_managed_files(
+    tmp_path: Path, monkeypatch
+):
+    adapter, codex_home = _adapter(tmp_path, monkeypatch)
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.parent.mkdir()
+    original = '{"hooks":{"SessionEnd":[]}}'
+    hooks_path.write_text(original, encoding="utf-8")
+    from voice_intent_normalizer.adapters.codex import CodexAdapter
+
+    native_write = CodexAdapter._write_json_atomic
+
+    def fail_hooks(path: Path, value: object) -> None:
+        if path == hooks_path:
+            raise OSError("injected hook write failure")
+        native_write(path, value)
+
+    monkeypatch.setattr(CodexAdapter, "_write_json_atomic", fail_hooks)
+
+    result = adapter.install(InstallOptions(strict=True))
+
+    assert result.status == "failed"
+    assert hooks_path.read_text(encoding="utf-8") == original
+    assert not (codex_home / "AGENTS.md").exists()
+    assert not (codex_home / "skills" / "voice-intent-normalizer").exists()
 
 
 def test_codex_uninstall_removes_only_managed_configuration(
@@ -162,6 +191,38 @@ def test_codex_uninstall_preserves_a_similarly_named_hook_path(
     payload = json.loads(hooks_path.read_text(encoding="utf-8"))
     assert payload["hooks"]["UserPromptSubmit"] == [
         {"hooks": [{"type": "command", "command": similar}]}
+    ]
+
+
+def test_codex_uninstall_preserves_same_name_hook_at_another_absolute_path(
+    tmp_path: Path, monkeypatch
+):
+    adapter, codex_home = _adapter(tmp_path, monkeypatch)
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.parent.mkdir()
+    same_name = (
+        'python3 "/opt/skills/voice-intent-normalizer/scripts/'
+        'voice_intent.py" hook'
+    )
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": same_name}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter.install(InstallOptions(strict=True))
+
+    adapter.uninstall(UninstallOptions())
+
+    payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert payload["hooks"]["UserPromptSubmit"] == [
+        {"hooks": [{"type": "command", "command": same_name}]}
     ]
 
 

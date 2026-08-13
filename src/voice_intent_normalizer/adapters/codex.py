@@ -45,18 +45,25 @@ class CodexAdapter:
             home.mkdir(parents=True, exist_ok=True)
             self._require_direct_directory(home, "Codex home")
             skill = home / "skills" / _NAME
+            hooks_path = home / "hooks.json"
+            if options.strict:
+                self._read_hooks(hooks_path)
+            agents = home / "AGENTS.md"
+            rollback = (
+                agents.read_bytes() if agents.exists() else None,
+                skill.exists(),
+                skill.parent.exists(),
+            )
             skill.parent.mkdir(exist_ok=True)
             self._require_direct_directory(skill.parent, "Codex skills directory")
             changed: list[Path] = []
             if not self._ensure_skill(skill):
                 changed.append(skill)
-            agents = home / "AGENTS.md"
             if self._ensure_agents_block(agents):
                 changed.append(agents)
             if options.strict:
-                hooks = home / "hooks.json"
-                if self._ensure_hook(hooks, skill):
-                    changed.append(hooks)
+                if self._ensure_hook(hooks_path, skill):
+                    changed.append(hooks_path)
             return AdapterResult(
                 self.platform,
                 "installed" if changed else "already-installed",
@@ -69,6 +76,7 @@ class CodexAdapter:
                 tuple(changed),
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            self._rollback_install(locals().get("rollback"))
             return self._failed("Codex installation was not completed")
 
     def doctor(self) -> AdapterResult:
@@ -120,7 +128,7 @@ class CodexAdapter:
             if self._remove_agents_block(agents):
                 changed.append(agents)
             hooks = home / "hooks.json"
-            if self._remove_hook(hooks):
+            if self._remove_hook(hooks, home / "skills" / _NAME):
                 changed.append(hooks)
             skill = home / "skills" / _NAME
             if skill.exists():
@@ -205,13 +213,13 @@ class CodexAdapter:
         groups = hooks.setdefault(_HOOK_EVENT, [])
         if not isinstance(groups, list):
             raise ValueError("Codex hook event is invalid")
-        if any(self._is_managed_group(group) for group in groups):
+        if any(self._is_managed_group(group, skill) for group in groups):
             return False
         groups.append({"hooks": [self._hook_handler(skill)]})
         self._write_json_atomic(path, payload)
         return True
 
-    def _remove_hook(self, path: Path) -> bool:
+    def _remove_hook(self, path: Path, skill: Path) -> bool:
         if not path.exists():
             return False
         payload = self._read_hooks(path)
@@ -227,7 +235,9 @@ class CodexAdapter:
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                 raise ValueError("Codex hook group is invalid")
             retained = [
-                hook for hook in group["hooks"] if not self._is_managed_hook(hook)
+                hook
+                for hook in group["hooks"]
+                if not self._is_managed_hook(hook, skill)
             ]
             changed |= len(retained) != len(group["hooks"])
             if retained:
@@ -247,7 +257,8 @@ class CodexAdapter:
         payload = self._read_hooks(path)
         groups = self._hooks_mapping(payload).get(_HOOK_EVENT, [])
         return isinstance(groups, list) and any(
-            self._is_managed_group(group) for group in groups
+            self._is_managed_group(group, self._codex_home() / "skills" / _NAME)
+            for group in groups
         )
 
     @staticmethod
@@ -263,19 +274,51 @@ class CodexAdapter:
         return hooks
 
     @staticmethod
-    def _is_managed_hook(hook: object) -> bool:
+    def _is_managed_hook(hook: object, skill: Path) -> bool:
         if not isinstance(hook, dict):
             return False
-        command = str(hook.get("command", "")).replace("\\", "/")
-        marker = f"/{_NAME}/scripts/voice_intent.py"
-        return marker in command and command.rstrip().endswith(" hook")
+        expected = CodexAdapter._hook_handler(skill)
+        return (
+            hook.get("command") == expected["command"]
+            and hook.get("commandWindows") == expected["commandWindows"]
+        )
 
-    def _is_managed_group(self, group: object) -> bool:
+    def _is_managed_group(self, group: object, skill: Path) -> bool:
         return (
             isinstance(group, dict)
             and isinstance(group.get("hooks"), list)
-            and any(self._is_managed_hook(hook) for hook in group["hooks"])
+            and any(
+                self._is_managed_hook(hook, skill) for hook in group["hooks"]
+            )
         )
+
+    def _rollback_install(self, rollback: object) -> None:
+        if (
+            not isinstance(rollback, tuple)
+            or len(rollback) != 3
+            or not isinstance(rollback[0], (bytes, type(None)))
+            or not isinstance(rollback[1], bool)
+            or not isinstance(rollback[2], bool)
+        ):
+            return
+        home = self._codex_home()
+        agents = home / "AGENTS.md"
+        skill = home / "skills" / _NAME
+        agents_before, skill_existed, skills_existed = rollback
+        try:
+            if agents_before is None:
+                if agents.exists():
+                    agents.unlink()
+            elif agents.exists() and agents.read_bytes() != agents_before:
+                self._write_bytes_atomic(agents, agents_before)
+            if not skill_existed and skill.exists():
+                self._remove_direct_tree(skill)
+            if not skills_existed and skill.parent.exists() and not any(
+                skill.parent.iterdir()
+            ):
+                skill.parent.rmdir()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
 
     @staticmethod
     def _hook_handler(skill: Path) -> dict[str, object]:
