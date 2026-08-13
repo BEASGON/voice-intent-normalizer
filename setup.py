@@ -42,6 +42,7 @@ _BUNDLE_FILES = (
     "src/voice_intent_normalizer/adapters/base.py",
     "src/voice_intent_normalizer/adapters/codex.py",
     "src/voice_intent_normalizer/adapters/openclaw.py",
+    "src/voice_intent_normalizer/adapters/workbuddy.py",
     "src/voice_intent_normalizer/adapters/generic.py",
     "src/voice_intent_normalizer/adapters/generic_contract.py",
     "src/voice_intent_normalizer/adapters/generic_layout.py",
