@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Run Ruff
+        run: python -m ruff check src tests setup.py scripts/voice_intent.py
+      - name: Run full test suite
+        run: python -m pytest -q -p no:cacheprovider --basetemp "${{ runner.temp }}/vin-quality"
+      - name: Build distributions
+        run: python -m build --no-isolation
+      - name: Check out official skill validator
+        uses: actions/checkout@v6
+        with:
+          repository: openai/skills
+          path: .ci/openai-skills
+      - name: Validate root skill
+        run: |
+          python -m pip install PyYAML==6.0.2
+          python -X utf8 .ci/openai-skills/skills/.system/skill-creator/scripts/quick_validate.py .
+
+  python310:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Run full test suite
+        run: python -m pytest -q -p no:cacheprovider --basetemp "${{ runner.temp }}/vin-python310"
+
+  native-adapter:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Run native adapter publication and journal tests
+        run: >-
+          python -m pytest
+          tests/test_paths.py
+          tests/test_installer.py
+          tests/test_generic_layout.py
+          -q
+          -p no:cacheprovider
+          --basetemp "${{ runner.temp }}/vin-native-adapter"
+          -k "test_publish_directory_no_replace or
+          test_publish_file_no_replace_exact or
+          private_cleanup or
+          exact_directory_move or
+          posix_exact_publication or
+          ownership_journal"
+
+  fresh-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Build distributions
+        run: python -m build --no-isolation
+      - name: Run isolated fresh-wheel lifecycle
+        run: >-
+          python -m pytest
+          tests/test_distribution_bundle.py::test_installed_wheel_default_installer_and_bootstrap_are_runnable
+          -q
+          -p no:cacheprovider
+          --basetemp "${{ runner.temp }}/vin-fresh-wheel"

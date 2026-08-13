@@ -20,6 +20,20 @@ import setuptools
 from voice_intent_normalizer.adapters import generic_layout
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_ci_runs_native_adapter_contract_on_all_supported_operating_systems():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    for runner in ("windows-latest", "ubuntu-latest", "macos-latest"):
+        assert runner in workflow
+    assert "python-version: '3.10'" in workflow
+    assert "python -m pytest -q" in workflow
+    assert "test_publish_directory_no_replace" in workflow
+    assert "ownership_journal" in workflow
+    assert "python -m ruff check" in workflow
+    assert "python -m build --no-isolation" in workflow
+
+
 BUNDLE_FILES = (
     "SKILL.md",
     "LICENSE",
@@ -645,12 +659,25 @@ pyproject.write_bytes(
     pyproject.read_bytes().replace(b'version = "0.1.0"', b'version = "0.2.0"', 1)
 )
 upgraded = GenericAdapter(upgrade, state)
-original_write = upgraded._write_transaction_status
+original_advance = upgraded._advance_transaction_status
 interrupted = {{"activation": False, "rollback": False}}
 
-def stop_activation(root_path, payload):
-    original_write(root_path, payload)
-    transaction = payload.get("transaction")
+def stop_activation(
+    root_path,
+    *,
+    journal,
+    before_payload,
+    after_payload,
+    terminal=False,
+):
+    result = original_advance(
+        root_path,
+        journal=journal,
+        before_payload=before_payload,
+        after_payload=after_payload,
+        terminal=terminal,
+    )
+    transaction = after_payload.get("transaction")
     if (
         not interrupted["activation"]
         and isinstance(transaction, dict)
@@ -658,10 +685,11 @@ def stop_activation(root_path, payload):
     ):
         interrupted["activation"] = True
         raise OSError("injected activation interruption")
+    return result
 
-upgraded._write_transaction_status = stop_activation
+upgraded._advance_transaction_status = stop_activation
 failed_upgrade = upgraded.install(options)
-upgraded._write_transaction_status = original_write
+upgraded._advance_transaction_status = original_advance
 pending = validate_status_v5(
     layout.status.read_bytes(),
     skill_root=root,
@@ -672,13 +700,25 @@ candidate = next(
     for reference in (pending.active, pending.previous)
     if reference is not None and reference.package_version == "0.2.0"
 )
-(layout.generations / candidate.generation_id / "LICENSE").write_bytes(
-    b"tampered candidate"
-)
+candidate_file = layout.generations / candidate.generation_id / "LICENSE"
+candidate_file.write_bytes(b"tampered candidate")
 
-def stop_rollback(root_path, payload):
-    original_write(root_path, payload)
-    transaction = payload.get("transaction")
+def stop_rollback(
+    root_path,
+    *,
+    journal,
+    before_payload,
+    after_payload,
+    terminal=False,
+):
+    result = original_advance(
+        root_path,
+        journal=journal,
+        before_payload=before_payload,
+        after_payload=after_payload,
+        terminal=terminal,
+    )
+    transaction = after_payload.get("transaction")
     if (
         not interrupted["rollback"]
         and isinstance(transaction, dict)
@@ -686,29 +726,60 @@ def stop_rollback(root_path, payload):
     ):
         interrupted["rollback"] = True
         raise OSError("injected rollback interruption")
+    return result
 
-upgraded._write_transaction_status = stop_rollback
+upgraded._advance_transaction_status = stop_rollback
 rollback_interrupted = upgraded.doctor()
-upgraded._write_transaction_status = original_write
+upgraded._advance_transaction_status = original_advance
 rollback_recovered = upgraded.doctor()
 rolled_back = validate_status_v5(
     layout.status.read_bytes(),
     skill_root=root,
     generations_root=layout.generations,
 )
-clean_upgrade = upgraded.install(options)
-activated = validate_status_v5(
-    layout.status.read_bytes(),
-    skill_root=root,
-    generations_root=layout.generations,
-)
-capsule_after = {{
+conflict_capsule_after = {{
     path.relative_to(capsule).as_posix(): path.read_bytes()
     for path in capsule.rglob("*")
     if path.is_file()
 }}
-uninstalled = default_installer().uninstall(
-    ("generic",), UninstallOptions(output_dir=root)
+
+clean_root = Path({json.dumps(str(tmp_path / "clean-skills"))})
+clean_root.mkdir()
+clean_state = StatePaths(root=Path({json.dumps(str(tmp_path / "clean-state"))}))
+clean_options = InstallOptions(output_dir=clean_root)
+clean_install = default_installer(clean_state).install(("generic",), clean_options)[0]
+clean_shared = {{
+    clean_state.personal_file: b'{{"fixture":"clean-personal"}}\\n',
+    clean_state.preferences_file: b'{{"fixture":"clean-preferences"}}',
+    clean_state.hotwords_file: b'{{"fixture":"clean-hotwords"}}\\n',
+    (
+        clean_state.root / "projects/project-b/lexicon.jsonl"
+    ): b'{{"fixture":"clean-project"}}\\n',
+}}
+for path, data in clean_shared.items():
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+clean_capsule = clean_root / "voice-intent-normalizer"
+clean_capsule_before = {{
+    path.relative_to(clean_capsule).as_posix(): path.read_bytes()
+    for path in clean_capsule.rglob("*")
+    if path.is_file()
+}}
+clean_upgraded = GenericAdapter(upgrade, clean_state)
+clean_upgrade = clean_upgraded.install(clean_options)
+clean_layout = generic_layout_paths(clean_state)
+activated = validate_status_v5(
+    clean_layout.status.read_bytes(),
+    skill_root=clean_root,
+    generations_root=clean_layout.generations,
+)
+clean_capsule_after = {{
+    path.relative_to(clean_capsule).as_posix(): path.read_bytes()
+    for path in clean_capsule.rglob("*")
+    if path.is_file()
+}}
+uninstalled = default_installer(clean_state).uninstall(
+    ("generic",), UninstallOptions(output_dir=clean_root)
 )[0]
 print(json.dumps({{
     "noop": noop.status,
@@ -718,12 +789,21 @@ print(json.dumps({{
     "rollback_interrupted": interrupted["rollback"],
     "rollback_recovered": rollback_recovered.status,
     "rolled_back_version": rolled_back.active.package_version,
+    "tampered_candidate_preserved": (
+        candidate_file.read_bytes() == b"tampered candidate"
+    ),
+    "journal_preserved": layout.transaction.is_file(),
+    "conflict_capsule_unchanged": capsule_before == conflict_capsule_after,
+    "clean_install": clean_install.status,
     "clean_upgrade": clean_upgrade.status,
     "activated_version": activated.active.package_version,
-    "capsule_unchanged": capsule_before == capsule_after,
+    "capsule_unchanged": clean_capsule_before == clean_capsule_after,
     "uninstalled": uninstalled.status,
-    "capsule_removed": not capsule.exists(),
-    "shared_survived": all(path.read_bytes() == data for path, data in shared.items()),
+    "capsule_removed": not clean_capsule.exists(),
+    "shared_survived": (
+        all(path.read_bytes() == data for path, data in shared.items())
+        and all(path.read_bytes() == data for path, data in clean_shared.items())
+    ),
 }}, ensure_ascii=False))
 """
     completed = _run_isolated(
@@ -736,8 +816,12 @@ print(json.dumps({{
         "activation_interrupted": True,
         "rollback_interrupted_status": "degraded",
         "rollback_interrupted": True,
-        "rollback_recovered": "installed",
+        "rollback_recovered": "degraded",
         "rolled_back_version": "0.1.0",
+        "tampered_candidate_preserved": True,
+        "journal_preserved": True,
+        "conflict_capsule_unchanged": True,
+        "clean_install": "installed",
         "clean_upgrade": "upgraded",
         "activated_version": "0.2.0",
         "capsule_unchanged": True,
