@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import uuid
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -672,6 +675,165 @@ def test_learning_store_empty_undo_and_list_are_stable(tmp_path):
     assert store.list_recent(0) == ()
 
 
+def _learning_event(**changes):
+    event = {
+        "action": "confirm",
+        "alias": "open cloud",
+        "baseline": None,
+        "canonical": "OpenClaw",
+        "event_id": str(uuid.uuid4()),
+        "generation_id": str(uuid.uuid4()),
+        "project_id": None,
+        "schema_version": 1,
+        "scope": "personal",
+        "source": None,
+        "status": "confirmed",
+        "timestamp": "2026-08-14T00:00:00Z",
+    }
+    event.update(changes)
+    return event
+
+
+def _write_learning_events(root, *events):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "learning-events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"schema_version": True}, "schema_version"),
+        ({"action": "publish"}, "action"),
+        ({"event_id": 3}, "UUID"),
+        ({"event_id": "not-a-uuid"}, "UUID"),
+        ({"event_id": str(uuid.uuid1())}, "UUID4"),
+        ({"timestamp": "2026-08-14"}, "timestamp"),
+        ({"timestamp": "not-a-timeZ"}, "timestamp"),
+        ({"alias": ""}, "alias"),
+        ({"canonical": 3}, "canonical"),
+        ({"status": "candidate"}, "status"),
+        ({"scope": "base"}, "scope"),
+        ({"project_id": "CON"}, "project_id"),
+        ({"source": "manual"}, "source"),
+        ({"generation_id": "bad"}, "generation_id"),
+        ({"baseline": "bad"}, "baseline"),
+        ({"baseline": {}}, "baseline"),
+    ],
+)
+def test_learning_journal_rejects_malformed_mapping_events(
+    tmp_path, changes, message
+):
+    from voice_intent_normalizer.learning import LearningStore
+
+    root = tmp_path / "state"
+    _write_learning_events(root, _learning_event(**changes))
+
+    with pytest.raises(ValueError, match=message):
+        LearningStore(root).list_recent()
+
+
+@pytest.mark.parametrize(
+    ("event", "message"),
+    [
+        (
+            _learning_event(
+                action="observe",
+                baseline=None,
+                generation_id=None,
+                scope="personal",
+                source="conversation",
+                status="candidate",
+            ),
+            "scope",
+        ),
+        (
+            _learning_event(
+                action="observe",
+                baseline=None,
+                generation_id=None,
+                scope=None,
+                source=None,
+                status="candidate",
+            ),
+            "source",
+        ),
+        (
+            _learning_event(
+                action="reject",
+                scope="project",
+                project_id="project",
+                status="rejected",
+            ),
+            "reject scope",
+        ),
+        (
+            _learning_event(scope="personal", project_id="project"),
+            "personal scope",
+        ),
+    ],
+)
+def test_learning_journal_rejects_invalid_action_semantics(tmp_path, event, message):
+    from voice_intent_normalizer.learning import LearningStore
+
+    event = {
+        key: value
+        for key, value in event.items()
+        if not (
+            event["action"] == "observe"
+            and key in {"baseline", "generation_id"}
+        )
+    }
+    root = tmp_path / "state"
+    _write_learning_events(root, event)
+
+    with pytest.raises(ValueError, match=message):
+        LearningStore(root).list_recent()
+
+
+def test_learning_journal_rejects_duplicate_ids_and_bad_references(tmp_path):
+    from voice_intent_normalizer.learning import LearningStore
+
+    root = tmp_path / "state"
+    first = _learning_event()
+    duplicate = _learning_event(event_id=first["event_id"], alias="other")
+    _write_learning_events(root, first, duplicate)
+    with pytest.raises(ValueError, match="unique"):
+        LearningStore(root).list_recent()
+
+    delete = {
+        key: value
+        for key, value in _learning_event(
+            action="delete",
+            alias="OpenClaw",
+            canonical="OpenClaw",
+            generation_id=None,
+            baseline=None,
+            target_event_ids=["missing", "missing"],
+        ).items()
+        if key not in {"baseline", "generation_id"}
+    }
+    _write_learning_events(root, first, delete)
+    with pytest.raises(ValueError, match="target_event_ids"):
+        LearningStore(root).list_recent()
+
+    undo = {
+        key: value
+        for key, value in _learning_event(
+            action="undo",
+            generation_id=None,
+            baseline=None,
+            target_event_id="missing",
+        ).items()
+        if key not in {"baseline", "generation_id"}
+    }
+    _write_learning_events(root, first, undo)
+    with pytest.raises(ValueError, match="undo target"):
+        LearningStore(root).list_recent()
+
+
 def test_service_reports_update_scanner_and_layer_failures_without_stopping(
     tmp_path, monkeypatch
 ):
@@ -781,6 +943,75 @@ def test_codex_rejects_oversized_or_nonfile_configuration(tmp_path):
         adapter._read_hooks(directory)
 
 
+def test_codex_configuration_contract_rejects_malformed_groups(tmp_path):
+    adapter = CodexAdapter(ROOT, StatePaths(root=tmp_path / "state"))
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("<!-- VOICE-INTENT-NORMALIZER:BEGIN -->", encoding="utf-8")
+    with pytest.raises(ValueError, match="markers"):
+        adapter._remove_agents_block(agents)
+
+    hooks = tmp_path / "hooks.json"
+    skill = tmp_path / "skill"
+    hooks.write_text('{"hooks":{"UserPromptSubmit":{}}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="event"):
+        adapter._remove_hook(hooks, skill)
+    hooks.write_text(
+        '{"hooks":{"UserPromptSubmit":[{"hooks":{}}]}}', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="group"):
+        adapter._remove_hook(hooks, skill)
+    assert adapter._is_managed_hook("not-a-hook", skill) is False
+    with pytest.raises(ValueError, match="document"):
+        adapter._hooks_mapping([])
+    with pytest.raises(ValueError, match="document"):
+        adapter._hooks_mapping({"hooks": []})
+
+
+def test_codex_direct_tree_and_atomic_write_failure_contracts(tmp_path, monkeypatch):
+    adapter = CodexAdapter(ROOT, StatePaths(root=tmp_path / "state"))
+    tree = tmp_path / "tree"
+    (tree / "nested").mkdir(parents=True)
+    (tree / "one.txt").write_bytes(b"one")
+    (tree / "nested" / "two.txt").write_bytes(b"two")
+    assert adapter._tree_bytes(tree) == {
+        "one.txt": b"one",
+        "nested/two.txt": b"two",
+    }
+    adapter._remove_direct_tree(tree)
+    assert not tree.exists()
+    file_path = tmp_path / "not-a-directory"
+    file_path.write_bytes(b"x")
+    with pytest.raises(ValueError, match="direct directory"):
+        adapter._require_direct_directory(file_path, "test")
+
+    destination = tmp_path / "atomic.txt"
+    original_replace = os.replace
+
+    def fail_replace(source, target):
+        if target == destination:
+            raise OSError("injected replace failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace"):
+        adapter._write_bytes_atomic(destination, b"data")
+    assert not tuple(tmp_path.glob(".atomic.txt-*"))
+
+
+def test_codex_detect_and_noop_hook_paths(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    adapter = CodexAdapter(ROOT, StatePaths(root=tmp_path / "state"))
+    assert adapter.detect().status == "not-installed"
+    codex_home.mkdir()
+    assert adapter.detect().status == "detected"
+    assert adapter._remove_hook(codex_home / "missing.json", tmp_path) is False
+
+    hooks = codex_home / "hooks.json"
+    hooks.write_text('{"hooks":{}}', encoding="utf-8")
+    assert adapter._remove_hook(hooks, tmp_path) is False
+
+
 def test_openclaw_source_and_receipt_helpers_are_idempotent(tmp_path):
     adapter = OpenClawAdapter(ROOT, StatePaths(root=tmp_path / "state"))
     first = adapter._source()
@@ -802,6 +1033,97 @@ def test_openclaw_source_and_receipt_helpers_are_idempotent(tmp_path):
     assert adapter._receipt_path().with_name("openclaw.json.bak").is_file()
     adapter._remove_receipt()
     assert adapter._read_receipt() is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "oversized",
+        b"{}",
+        b'{"format":2,"scope":"global","source":"x",'
+        b'"source_digest":"0000000000000000000000000000000000000000000000000000000000000000",'
+        b'"target":null}',
+        b'{"format":1,"scope":"bad","source":"x",'
+        b'"source_digest":"0000000000000000000000000000000000000000000000000000000000000000",'
+        b'"target":null}',
+        b'{"format":1,"scope":"global","source":3,'
+        b'"source_digest":"0000000000000000000000000000000000000000000000000000000000000000",'
+        b'"target":null}',
+        b'{"format":1,"scope":"global","source":"x",'
+        b'"source_digest":"bad","target":null}',
+        b'{"format":1,"scope":"global","source":"x",'
+        b'"source_digest":"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",'
+        b'"target":null}',
+        b'{"format":1,"scope":"global","source":"x",'
+        b'"source_digest":"0000000000000000000000000000000000000000000000000000000000000000",'
+        b'"target":3}',
+    ],
+)
+def test_openclaw_receipt_rejects_untrusted_shapes(tmp_path, payload):
+    adapter = OpenClawAdapter(ROOT, StatePaths(root=tmp_path / "state"))
+    if payload == "oversized":
+        payload = b"x" * (1024 * 1024 + 1)
+    with pytest.raises(ValueError):
+        adapter._validate_receipt(payload)
+
+
+def test_openclaw_cli_result_helpers_reject_invalid_protocol(tmp_path):
+    adapter = OpenClawAdapter(
+        ROOT,
+        StatePaths(root=tmp_path / "state"),
+        run=lambda _args: None,
+    )
+    with pytest.raises(ValueError, match="no result"):
+        adapter._command(("openclaw",))
+    with pytest.raises(ValueError, match="result"):
+        adapter._returncode({"returncode": True})
+    with pytest.raises(ValueError, match="failed"):
+        adapter._require_returncode({"returncode": 2}, "command")
+    with pytest.raises(ValueError, match="stdout"):
+        adapter._stdout({"stdout": 3})
+    with pytest.raises(ValueError, match="large"):
+        adapter._json_stdout(
+            {"returncode": 0, "stdout": "x" * (1024 * 1024 + 1)}, "command"
+        )
+    with pytest.raises(ValueError, match="constant"):
+        adapter._reject_json_constant("NaN")
+
+
+def test_openclaw_source_and_receipt_files_fail_closed(tmp_path, monkeypatch):
+    adapter = OpenClawAdapter(ROOT, StatePaths(root=tmp_path / "state"))
+    source = adapter._source()
+    (source / "foreign.txt").write_bytes(b"foreign")
+    with pytest.raises(ValueError, match="not managed"):
+        adapter._source()
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.write_bytes(b"x")
+    with pytest.raises(ValueError, match="direct directory"):
+        adapter._require_direct_directory(unsafe, "source")
+
+    receipt = adapter._receipt_path()
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.mkdir()
+    with pytest.raises(ValueError, match="unsafe"):
+        adapter._read_receipt()
+    shutil.rmtree(receipt)
+    receipt.mkdir()
+    with pytest.raises(ValueError, match="unsafe"):
+        adapter._remove_receipt()
+    shutil.rmtree(receipt)
+
+    destination = tmp_path / "atomic.json"
+    original_replace = os.replace
+
+    def fail_replace(source_path, target_path):
+        if target_path == destination:
+            raise OSError("injected replace failure")
+        return original_replace(source_path, target_path)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace"):
+        adapter._write_bytes_atomic(destination, b"{}")
+    assert not tuple(tmp_path.glob(".atomic.json-*"))
 
 
 @pytest.mark.parametrize(
