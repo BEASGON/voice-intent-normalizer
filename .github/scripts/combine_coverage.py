@@ -7,9 +7,26 @@ from pathlib import Path
 
 from coverage import CoverageData
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_PREFIX = "src/voice_intent_normalizer/"
+
 
 def _portable_source(path: str) -> str:
     return path.replace("\\", "/")
+
+
+def _canonical_source(path: str) -> str:
+    portable = _portable_source(path)
+    if portable.startswith(SOURCE_PREFIX):
+        return portable
+    marker = f"/{SOURCE_PREFIX}"
+    marker_index = portable.rfind(marker)
+    if marker_index < 0:
+        raise RuntimeError(f"unexpected coverage source: {path}")
+    candidate = portable[marker_index + 1 :]
+    if not (REPOSITORY_ROOT / candidate).is_file():
+        raise RuntimeError(f"unexpected coverage source: {path}")
+    return candidate
 
 
 def combine_coverage(source: Path, output: Path) -> None:
@@ -25,10 +42,8 @@ def combine_coverage(source: Path, output: Path) -> None:
         data = CoverageData(basename=str(path))
         data.read()
         for measured in data.measured_files():
-            portable = _portable_source(measured)
-            if not portable.startswith("src/voice_intent_normalizer/"):
-                raise RuntimeError(f"unexpected coverage source: {measured}")
-            merged.setdefault(portable, set()).update(data.lines(measured) or ())
+            canonical = _canonical_source(measured)
+            merged.setdefault(canonical, set()).update(data.lines(measured) or ())
     if not merged:
         raise RuntimeError("coverage databases contain no measured source")
     combined = CoverageData(basename=str(output))
