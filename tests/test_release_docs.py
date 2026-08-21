@@ -16,6 +16,23 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_readme_follows_the_public_release_journey():
     text = (ROOT / "README.md").read_text("utf-8").casefold()
     headings = (
+        "## 你可能遇到过这些情况",
+        "## 真正的问题，不只是识别错了一个字",
+        "## 谐音狐补上的一层",
+        "## 60 秒快速开始",
+        "## 支持的平台",
+        "## 创建自己的词语映射",
+        "## 隐私与安全",
+        "## 常见问题",
+        "## 开发",
+    )
+    positions = [text.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+
+
+def test_english_readme_preserves_the_release_journey():
+    text = (ROOT / "README.en.md").read_text("utf-8").casefold()
+    headings = (
         "## the problem",
         "## post-submission boundary",
         "## 60-second quick start",

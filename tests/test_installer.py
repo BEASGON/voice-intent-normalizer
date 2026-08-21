@@ -5590,7 +5590,7 @@ def test_two_real_process_installs_are_serialized_and_idempotent(tmp_path: Path)
     assert all(
         result["status"] in {"installed", "already-installed", "repaired"}
         for result in results
-    )
+    ), results
     state = StatePaths.resolve(environ={"VOICE_INTENT_HOME": str(state_root)})
     capsule, generation, _ = _validated_installed_layout(
         GenericAdapter(repository, state), root
