@@ -80,8 +80,9 @@ allowlist.
 
 ## Hotword updates
 
-Built-in hotwords are available offline. Version 0.1.0 does not enable network
-hotword updates; update snapshots arrive only in reviewed project releases.
+Built-in hotwords are available offline. The current release does not enable
+network hotword updates; update snapshots arrive only in reviewed project
+releases.
 
 ## Troubleshooting
 
