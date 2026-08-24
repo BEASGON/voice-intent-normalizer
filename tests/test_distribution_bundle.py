@@ -25,6 +25,10 @@ else:
 from voice_intent_normalizer.adapters import generic_layout
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))[
+    "project"
+]["version"]
+PACKAGE_ARCHIVE_ROOT = f"voice_intent_normalizer-{PACKAGE_VERSION}"
 
 
 def test_ci_runs_native_adapter_contract_on_all_supported_operating_systems():
@@ -444,34 +448,34 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
     ("archive_root", "invalid_member"),
     [
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
+            PACKAGE_ARCHIVE_ROOT,
             "second-root/PKG-INFO",
             id="second-top-level-root",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/SKILL.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/SKILL.md",
             id="duplicate-required-member",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/misplaced/SKILL.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/misplaced/SKILL.md",
             id="misplaced-required-member",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/"
-            "src/voice_intent_normalizer/_skill_bundle/SKILL.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/src/voice_intent_normalizer/"
+            "_skill_bundle/SKILL.md",
             id="generated-package-bundle",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/_skill_bundle/stale.txt",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/_skill_bundle/stale.txt",
             id="stale-root-bundle",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/skill.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/skill.md",
             id="casefold-collision",
         ),
         pytest.param("C:", "C:/README.md", id="drive-style-root"),
@@ -479,38 +483,38 @@ def test_distribution_contains_synced_runtime_skill_bundle(tmp_path: Path):
             "/absolute-root", "/absolute-root/README.md", id="absolute-root"
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs/./README.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs/./README.md",
             id="dot-component",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs/../README.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs/../README.md",
             id="dotdot-component",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs\\README.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs\\README.md",
             id="backslash-component",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs/README.md:stream",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs/README.md:stream",
             id="ads-colon-component",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs/NUL.txt",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs/NUL.txt",
             id="device-component",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs./README.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs./README.md",
             id="trailing-dot-component",
         ),
         pytest.param(
-            "voice_intent_normalizer-0.1.0",
-            "voice_intent_normalizer-0.1.0/docs /README.md",
+            PACKAGE_ARCHIVE_ROOT,
+            f"{PACKAGE_ARCHIVE_ROOT}/docs /README.md",
             id="trailing-space-component",
         ),
     ],
@@ -694,7 +698,9 @@ shutil.copytree(
 )
 pyproject = upgrade / "pyproject.toml"
 pyproject.write_bytes(
-    pyproject.read_bytes().replace(b'version = "0.1.0"', b'version = "0.2.0"', 1)
+    pyproject.read_bytes().replace(
+        f'version = "{PACKAGE_VERSION}"'.encode(), b'version = "0.2.0"', 1
+    )
 )
 upgraded = GenericAdapter(upgrade, state)
 original_advance = upgraded._advance_transaction_status
@@ -855,7 +861,7 @@ print(json.dumps({{
         "rollback_interrupted_status": "degraded",
         "rollback_interrupted": True,
         "rollback_recovered": "degraded",
-        "rolled_back_version": "0.1.0",
+        "rolled_back_version": PACKAGE_VERSION,
         "tampered_candidate_preserved": True,
         "journal_preserved": True,
         "conflict_capsule_unchanged": True,

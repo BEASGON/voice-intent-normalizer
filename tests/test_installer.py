@@ -18,6 +18,11 @@ from pathlib import Path
 
 import pytest
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
 import voice_intent_normalizer.paths as paths_module
 from voice_intent_normalizer.adapters.base import (
     AdapterResult,
@@ -44,6 +49,12 @@ from voice_intent_normalizer.paths import (
     StateRootLease,
     guard_state_root,
 )
+
+
+PACKAGE_VERSION = tomllib.loads(
+    (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text("utf-8")
+)["project"]["version"]
+PACKAGE_VERSION_BYTES = f'version = "{PACKAGE_VERSION}"'.encode()
 
 
 class _Adapter:
@@ -94,9 +105,9 @@ def repository_v2(tmp_path: Path) -> Path:
     )
     pyproject = repository / "pyproject.toml"
     original = pyproject.read_bytes()
-    assert b'version = "0.1.0"' in original
+    assert PACKAGE_VERSION_BYTES in original
     pyproject.write_bytes(
-        original.replace(b'version = "0.1.0"', b'version = "0.2.0"', 1)
+        original.replace(PACKAGE_VERSION_BYTES, b'version = "0.2.0"', 1)
     )
     return repository
 
@@ -3934,7 +3945,7 @@ def test_upgrade_switches_complete_generation_and_keeps_previous(
     assert result.status == "upgraded"
     assert status.active.package_version == "0.2.0"
     assert status.previous is not None
-    assert status.previous.package_version == "0.1.0"
+    assert status.previous.package_version == PACKAGE_VERSION
     assert status.previous.generation_id == before.active.generation_id
     assert status.transaction_id is None
     assert (layout.generations / status.active.generation_id).is_dir()
@@ -4012,7 +4023,7 @@ def test_failed_upgrade_activation_leaves_previous_generation_selected(
 
     assert result.status == "failed"
     assert interrupted.active.generation_id == before.active.generation_id
-    assert interrupted.active.package_version == "0.1.0"
+    assert interrupted.active.package_version == PACKAGE_VERSION
     assert interrupted.previous is not None
     assert interrupted.previous.package_version == "0.2.0"
     assert interrupted.transaction_phase == "activation-pending"
@@ -4605,7 +4616,7 @@ def test_first_install_recovery_is_idempotent_after_each_activation_phase(
         generations_root=layout.generations,
     )
     assert recovered.status in {"installed", "already-installed"}
-    assert status.active.package_version == "0.1.0"
+    assert status.active.package_version == PACKAGE_VERSION
     assert status.transaction_id is None
     assert generic_adapter.doctor().status == "installed"
 
@@ -4669,7 +4680,7 @@ def test_upgrade_recovery_completes_only_a_fully_anchored_candidate(
     )
     assert status.active.package_version == "0.2.0"
     assert status.previous is not None
-    assert status.previous.package_version == "0.1.0"
+    assert status.previous.package_version == PACKAGE_VERSION
     assert status.transaction_id is None
 
 

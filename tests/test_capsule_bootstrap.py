@@ -14,6 +14,11 @@ from pathlib import Path
 
 import pytest
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
 from voice_intent_normalizer.adapters import generic_layout
 from voice_intent_normalizer.adapters.generic_contract import (
     build_manifest,
@@ -22,6 +27,9 @@ from voice_intent_normalizer.adapters.generic_contract import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))[
+    "project"
+]["version"]
 
 
 @dataclass(frozen=True)
@@ -61,7 +69,7 @@ def built_runtime(tmp_path: Path) -> BuiltRuntime:
     _write_files(capsule, capsule_files)
 
     generation_files = generation_builder(ROOT)
-    package_version = "0.1.0"
+    package_version = PACKAGE_VERSION
     nonce = "1" * 32
     provisional = build_manifest(
         "generation", f"g-{'0' * 64}-{nonce}", package_version, generation_files
@@ -267,7 +275,7 @@ def test_capsule_bootstrap_rejects_future_selector_before_loading_helper(
         for relative in capsule_manifest["files"]
     }
     substituted_manifest = build_manifest(
-        "capsule", "voice-intent-normalizer", "0.1.0", capsule_files
+        "capsule", "voice-intent-normalizer", PACKAGE_VERSION, capsule_files
     )
     (built_runtime.capsule / "capsule.json").write_bytes(
         canonical_json_bytes(substituted_manifest)

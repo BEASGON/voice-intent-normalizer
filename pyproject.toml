@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-intent-normalizer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Validated lexicon models for Chinese voice-intent normalization."
 requires-python = ">=3.10"
 license = "Apache-2.0"
